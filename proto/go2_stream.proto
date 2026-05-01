@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package go2_stream;
+
+// --- Utility Types ---
+message TimeSpec_ {
+    int32 sec = 1;
+    uint32 nanosec = 2;
+}
+
+// --- 1. Sensors & Mapping ---
+message PointCloud2_ {
+    uint32 point_step = 1;
+    bytes data = 2;             // Zlib compressed raw bytes
+}
+
+message VoxelMapCompressed_ {
+    bytes data = 1;             // Compressed octree/voxel data
+}
+
+message HeightMap_ {
+    double stamp = 1;
+    string frame_id = 2;
+    float resolution = 3;
+    uint32 width = 4;
+    uint32 height = 5;
+    repeated float origin = 6;  // [x, y]
+    repeated float data = 7;
+}
+
+message LidarState_ {
+    double stamp = 1;
+    uint32 error_state = 2;
+    float sys_rotation_speed = 3;
+    float com_rotation_speed = 4;
+    float cloud_frequency = 5;
+}
+
+// --- 2. Low Level Kinematics & Hardware ---
+message MotorState_ {
+    uint32 mode = 1;
+    float q = 2;
+    float dq = 3;
+    float ddq = 4;
+    float tau_est = 5;
+    float q_raw = 6;
+    float dq_raw = 7;
+    float ddq_raw = 8;
+    uint32 temperature = 9;
+    uint32 lost = 10;
+}
+
+message IMUState_ {
+    repeated float quaternion = 1;      // [x, y, z, w]
+    repeated float gyroscope = 2;       // [x, y, z]
+    repeated float accelerometer = 3;   // [x, y, z]
+    repeated float rpy = 4;             // [roll, pitch, yaw]
+    uint32 temperature = 5;
+}
+
+message BmsState_ {
+    uint32 status = 1;
+    uint32 soc = 2;                     // State of Charge (%)
+    int32 current = 3;
+    uint32 cycle = 4;
+    repeated uint32 cell_vol = 5;       // Array of cell voltages
+}
+
+message LowState_ {
+    IMUState_ imu_state = 1;
+    repeated MotorState_ motor_state = 2; // Up to 20 (includes wheels)
+    BmsState_ bms_state = 3;
+    repeated int32 foot_force = 4;
+    repeated int32 foot_force_est = 5;
+    uint32 tick = 6;
+}
+
+// --- 3. High Level State & Planning ---
+message PathPoint_ {
+    float t_from_start = 1;
+    float x = 2;
+    float y = 3;
+    float yaw = 4;
+    float vx = 5;
+    float vy = 6;
+    float vyaw = 7;
+}
+
+message SportModeState_ {
+    TimeSpec_ stamp = 1;
+    uint32 error_code = 2;
+    IMUState_ imu_state = 3;
+    uint32 mode = 4;
+    uint32 gait_type = 5;
+    repeated float position = 6;
+    float body_height = 7;
+    repeated float velocity = 8;
+    float yaw_speed = 9;
+    repeated float range_obstacle = 10;
+    repeated int32 foot_force = 11;
+    repeated float foot_position_body = 12;
+    repeated float foot_speed_body = 13;
+    repeated PathPoint_ path_point = 14;
+}
+
+// --- 4. User Inputs & Global Pose ---
+message WirelessController_ {
+    float lx = 1;
+    float ly = 2;
+    float rx = 3;
+    float ry = 4;
+    uint32 keys = 5;
+}
+
+message PoseStamped_ {
+    repeated float position = 1;    // [x, y, z]
+    repeated float orientation = 2; // [x, y, z, w]
+}
+
+// --- MASTER ENVELOPE ---
+message Go2StreamFrame {
+    uint32 version = 1;             // Schema version indicator
+    uint64 frame_idx = 2;           // Monotonically increasing ID
+    
+    // Optional sub-messages. If not populated, they cost 0 bytes.
+    PointCloud2_ lidar_cloud = 3;
+    VoxelMapCompressed_ voxel_map = 4;
+    HeightMap_ height_map = 5;
+    
+    LowState_ low_state = 6;
+    SportModeState_ sport_mode_state = 7;
+    
+    LidarState_ lidar_state = 8;
+    WirelessController_ wireless_controller = 9;
+    PoseStamped_ robot_pose = 10;
+}

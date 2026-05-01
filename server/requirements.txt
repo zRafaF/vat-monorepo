@@ -1,0 +1,5 @@
+amqtt
+fastapi
+uvicorn
+protobuf
+paho-mqtt
