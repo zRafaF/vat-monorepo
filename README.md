@@ -83,3 +83,44 @@ Always wrap internet-facing connections in **TLS**.
 *   **ACLs:** Define policies so robots can only publish to their own specific namespaces.
 
 ---
+
+## 🤖 Jetson Nano: The Multi-Process "Team" Approach
+
+On the Jetson Nano, Zenoh operates as a layered "team" of processes. This architecture maximizes the hardware capabilities of the Nano (ARM64 + NVENC) while maintaining fault tolerance.
+
+### 1. Layered Architecture
+Instead of one massive script, the robot runs three distinct layers:
+
+*   **Layer A: ROS 2 Nodes (DDS):** Your standard navigation and sensor nodes. They communicate locally using DDS.
+*   **Layer B: Zenoh Bridge (`zenoh-bridge-ros2dds`):** A standalone Rust binary that "listens" to the local DDS chatter and mirrors selected topics (telemetry, point clouds) to the cloud via QUIC.
+*   **Layer C: Video Encoder (Python + GStreamer):** A dedicated script that captures camera frames and uses the Jetson’s **NVENC** hardware encoder to compress video before sending it via the Zenoh Python API.
+
+
+
+### 2. Hardware Acceleration with GStreamer
+To keep CPU usage low on the Jetson Nano, the Video Encoder script should leverage the onboard hardware. 
+
+**Recommended GStreamer Pipeline:**
+```text
+nvarguscamerasrc ! nvv4l2h264enc ! h264parse ! video/x-h264,stream-format=byte-stream ! appsink
+```
+The resulting byte-stream is then pushed to Zenoh using:
+```python
+# Minimal example within your video script
+pub_video = session.declare_publisher("robot/video/h264")
+pub_video.put(frame_bytes)
+```
+
+### 3. Why Multi-Process?
+1.  **Fault Tolerance:** If the video script crashes due to a camera error, the Zenoh Bridge remains active, ensuring you never lose telemetry or the ability to send emergency stop commands.
+2.  **Concurrency:** Each process manages its own resources. Zenoh efficiently multiplexes these different streams over a single QUIC connection to your cloud router.
+3.  **Isolation:** You can update your video processing logic without touching the stable ROS-to-DDS bridge.
+
+---
+
+### A Quick Tip for the Jetson Nano:
+Since the Nano's CPU can be a bottleneck, always run the Zenoh Bridge with an **allow list**. This prevents the bridge from "intercepting" internal ROS 2 chatter that you don't need in the cloud, keeping the overhead minimal.
+
+```bash
+./zenoh-bridge-ros2dds -e quic/<CLOUD_IP>:7447 --allow "/robot/telemetry|/robot/pc"
+```
