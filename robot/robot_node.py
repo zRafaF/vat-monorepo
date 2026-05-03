@@ -1,38 +1,34 @@
 import zenoh
 import time
-import random
-
-# For the PoC, we'll simulate a 1MB Point Cloud
-def get_fake_pointcloud():
-    return bytearray(random.getrandbits(8) for _ in range(1024 * 1024))
+import cv2
 
 conf = zenoh.Config()
-# Replace with your server's actual IP
 conf.insert_json5("connect/endpoints", '["tcp/192.168.1.10:7447"]')
 
 if __name__ == "__main__":
+    cap = cv2.VideoCapture(0)
+    # Set webcam to 30 FPS (if hardware supports it)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    
     with zenoh.open(conf) as session:
-        # Define our two keys
-        key_telemetry = 'robot/telemetry'
-        key_pc = 'robot/pc'
+        pub_video = session.declare_publisher('robot/video')
+        pub_telemetry = session.declare_publisher('robot/telemetry')
         
-        pub_telemetry = session.declare_publisher(key_telemetry)
-        pub_pc = session.declare_publisher(key_pc)
-        
-        print(f"Robot online. Publishing to {key_telemetry} and {key_pc}...")
+        print("Robot streaming...")
         
         count = 0
         while True:
-            # 1. Telemetry (String/JSON)
-            temp = random.randint(20, 30)
-            telemetry_buf = f"temp={temp}, battery=85%"
-            pub_telemetry.put(telemetry_buf)
-            
-            # 2. Point Cloud (Raw Bytes) - every 2 seconds
-            if count % 20 == 0:
-                print("Sending Point Cloud data...")
-                pc_buf = get_fake_pointcloud()
-                pub_pc.put(pc_buf)
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 1. Video (Full Speed)
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            pub_video.put(buffer.tobytes())
+
+            # 2. Telemetry (Throttle to ~10Hz by sending every 3rd frame)
+            if count % 3 == 0:
+                pub_telemetry.put("temp=24, battery=80%")
             
             count += 1
-            time.sleep(0.1) # 10Hz loop
+            # We remove the sleep(0.1) entirely to let the camera clock drive the loop[cite: 3]
