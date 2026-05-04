@@ -1,0 +1,12 @@
+services:
+  zenoh-bridge:
+    image: eclipse/zenoh-bridge-ros2dds:latest
+    container_name: zenoh-bridge-ros2dds
+    restart: unless-stopped
+    # Using host network is critical for DDS discovery to work with your robot's nodes
+    network_mode: host
+    environment:
+      - ROS_DOMAIN_ID=0  # Ensure this matches your robot's Domain ID
+    # Optional: Pass arguments directly to the bridge
+    # For example, to connect to a remote bridge at <IP>:
+    # command: ["-e", "tcp/<remote-ip>:7447"]

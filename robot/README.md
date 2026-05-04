@@ -134,3 +134,20 @@ source ~/ros2_ws/install/setup.bash
 # Launch the camera driver
 ros2 launch insta360_ros_driver bringup.launch.xml
 ```
+
+
+# Seting up Zenoh ROS bridge for Cloud Connectivity
+
+This section provides a detailed guide for configuring the Zenoh ROS bridge to enable cloud connectivity for your robot. The Zenoh bridge allows you to seamlessly connect your robot's ROS 2 topics to a cloud-based router using the QUIC protocol. More info can be found in the [Zenoh ROS 2 DDS Plugin](https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds).
+
+
+> As we are using an older version of ubuntu (20.04) on the Jetson Nano, we will need to build the `zenoh-bridge-ros2dds` plugin from source, as the pre-built binaries may not be compatible with our system.
+
+``` bash
+cd ~/ros2_ws/src
+git clone https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds
+
+cd ..
+rosdep install --from-paths . --ignore-src -r -y
+colcon build --packages-select zenoh_bridge_ros2dds --cmake-args -DCMAKE_BUILD_TYPE=Release
+```
