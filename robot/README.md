@@ -1,72 +1,138 @@
+```bash
+# Launch the camera driver
+ros2 launch insta360_# Setting up the Insta360 ROS 2 Driver (In-Depth Guide)
 
+This guide provides a comprehensive walkthrough for setting up the Insta360 ROS 2 driver on a Unitree Go2 robot (Ubuntu 20.04 / ROS 2 Foxy) using a standard workspace.
 
+---
 
-## Setting up the insta360 ros driver
-
-
-For detailed instructions on setting up the Insta360 ROS driver, please refer to the [Insta360 ROS Driver Repository](https://github.com/ai4ce/insta360_ros_driver). The repository contains comprehensive documentation and step-by-step guides to help you get started with the Insta360 camera in your ROS environment.
-
-First you will need to have the ros system enabled, on the go2 you can do this by running the following command:
-
-``` bash
+## 1. Environment and Workspace Setup
+First, enable the robot's base ROS 2 system and create a clean development workspace.
+```bash
+# Enable the Unitree ROS 2 environment
 source ~/unitree_ros2/setup.sh
+
+# Create the standard workspace structure
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
 ```
 
-> For more info please check the official documentation [here](https://support.unitree.com/home/en/developer/ROS2_service)
+---
 
+## 2. Install Dependencies (Foxy Source Build)
+On Ubuntu 20.04, ROS 2 Foxy binaries are often missing or return 404 errors via `apt`. You must build key dependencies from source to ensure `rosdep` can resolve them.
 
-``` bash
-# do this inside the robot directory
-git clone -b humble https://github.com/ai4ce/insta360_ros_driver
+```bash
+cd ~/ros2_ws/src
 
+# 1. Clone the Foxy-compatible branch of the camera manager
+git clone [https://github.com/ros-perception/image_common.git](https://github.com/ros-perception/image_common.git) -b foxy
+
+# 2. Clone the IMU tools (required for imu_filter_madgwick)
+git clone [https://github.com/ccny-ros-pkg/imu_tools.git](https://github.com/ccny-ros-pkg/imu_tools.git) -b foxy
+
+# 3. Navigate to workspace root to install remaining system dependencies
+cd ~/ros2_ws
+rosdep update
+
+# Use --skip-keys to prevent rosdep from trying to install the packages we just cloned via apt
+rosdep install --from-paths src --ignore-src -r -y --skip-keys "imu_tools imu_filter_madgwick camera_info_manager"
 ```
 
-Then you will need your Insta360 camera's SDK, you will need an account and request access. You can download it from here: https://www.insta360.com/sdk/record
+---
 
-![alt text](assets/image.png)
+## 3. Acquire the Insta360 SDK
+You will need your Insta360 camera's SDK; you must have an account and request access from the [Insta360 SDK Portal](https://www.insta360.com/sdk/record).
 
+![Picture of the download page](assets/image.png)
 
 > [!TIP]
-> You can right click on the download button and select "Copy Link Address" to get the direct download link for the SDK, which you can use in the terminal with `wget` or `curl` to download it directly to your robot. It should look something like this: `https://wassets.insta360.com/common/<my_key>/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip`
+> You can right-click on the download button and select "Copy Link Address" to get the direct download link for the SDK, which you can use in the terminal with `wget` or `curl` to download it directly to your robot. It should look something like this: `https://wassets.insta360.com/common/<my_key>/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip`
 
-``` bash
-curl -O https://wassets.insta360.com/common/<my_key>/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
+```bash
+cd ~
+# Use your direct link here
+curl -O [https://wassets.insta360.com/common/](https://wassets.insta360.com/common/)<my_key>/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
+
+# Extract and clean up zip
 unzip Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
 rm Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
 
 cd Linux_CameraSDK-2.1.1_MediaSDK-3.1.1
 
-# The Linux_CameraSDK-2.1.1_MediaSDK-3.1.1 directory should contain the following
-# CameraSDK-2.1.1-gcc-arm-11.2-2022.02-x86_64-aarch64-none-linux-gnu.tar.gz
-# CameraSDK-2.1.1-gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.gz
-# CameraSDK-2.1.1-gcc-linaro-5.4.1-2017.01-rc1-x86_64_aarch64-linux-gnu.tar.gz
-# CameraSDK-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu.tar.gz
-# CameraSDK-2.1.1-Linux.tar.gz
-# libMediaSDK-dev-3.1.1.0-amd64.tar_1758540334111.xz
-# README.txt
-
-# Pick the appropriate SDK for your system, for example if you are using a Jetson Nano with Ubuntu 20.04, you would use the `CameraSDK-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu.tar.gz` file.
-
+# Pick the appropriate SDK for your system. 
+# For Unitree Go2 (ARM64), use the jetson-linux tarball:
 tar -xzf CameraSDK-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu.tar.gz
+```
 
-cd ..
+---
 
-# Copying the files 
+## 4. Install the Driver Source
+Clone the driver and move the SDK files into the workspace directories.
 
-cp -r Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/CameraSDK-20251105_112855-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu/include/* insta360_ros_driver/include/
+```bash
+# Clone the driver into your workspace
+cd ~/ros2_ws/src
+git clone -b humble [https://github.com/ai4ce/insta360_ros_driver](https://github.com/ai4ce/insta360_ros_driver)
 
-cp Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/CameraSDK-20251105_112855-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu/lib/libCameraSDK.so insta360_ros_driver/lib/
+# Copy SDK Headers (Note: directory names may vary slightly based on SDK version)
+cp -r ~/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/CameraSDK-20251105_112855-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu/include/* ~/ros2_ws/src/insta360_ros_driver/include/
 
+# Copy SDK Libraries
+cp ~/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/CameraSDK-20251105_112855-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu/lib/libCameraSDK.so ~/ros2_ws/src/insta360_ros_driver/lib/
 
-# Clean up the SDK files
-rm -rf __MACOSX/
+# Clean up temp SDK files
+cd ~
 rm -rf Linux_CameraSDK-2.1.1_MediaSDK-3.1.1
 ```
 
+---
 
-You will then need to unzip the SDK and follow the instructions in the `README.md` file in the `insta360_ros_driver` repository to build and run the ROS driver for the Insta360 camera. This will allow you to stream video data from the camera into your ROS ecosystem, where you can process it using Zenoh for efficient data handling and communication.
+## 5. Build the Final Driver
+Compile the workspace. We use a CMake policy fix to ensure compatibility between Foxy and modern build tools.
 
+```bash
+cd ~/ros2_ws
+colcon build --symlink-install --cmake-args -DCMAKE_POLICY_VERSION_MINIMUM=3.5 --allow-overriding image_transport
+source install/setup.bash
+```
 
+> **Verification:** Run `ros2 pkg prefix camera_info_manager`. It should return a path inside `~/ros2_ws/install`.
 
+---
 
-    
+## 6. Hardware Configuration
+Before launching, the camera and system permissions must be configured.
+
+### Camera Settings
+1. **USB Mode:** Swipe down on the camera screen, go to **Settings > General**, and set USB Mode to **Android**.
+2. **Lens Mode:** Ensure the camera is set to **Dual-Lens** mode.
+
+### System Permissions (Udev Rules)
+Run the automated setup script or apply the rules manually to grant the driver USB access. (Note: Remember to have the camera on and connected when applying these rules, as the device node must be created for permissions to apply correctly.)
+
+```bash
+cd ~/ros2_ws/src/insta360_ros_driver
+./setup.sh
+
+# Manual fallback if setup.sh fails:
+echo SUBSYSTEM=='"usb"', ATTR{manufacturer}=='"Arashi Vision"', SYMLINK+='"insta"', MODE='"0777"' | sudo tee /etc/udev/rules.d/99-insta.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+sudo chmod 777 /dev/insta
+```
+
+---
+
+## 7. Usage
+You can now bring up the camera and decoder nodes.
+
+```bash
+# Launch the camera driver
+ros2 launch insta360_ros_driver bringup.launch.xml
+
+# In a separate terminal, activate image decoding
+ros2 run insta360_ros_driver decoder
+```
+
+```s
