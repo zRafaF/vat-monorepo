@@ -141,13 +141,50 @@ ros2 launch insta360_ros_driver bringup.launch.xml
 This section provides a detailed guide for configuring the Zenoh ROS bridge to enable cloud connectivity for your robot. The Zenoh bridge allows you to seamlessly connect your robot's ROS 2 topics to a cloud-based router using the QUIC protocol. More info can be found in the [Zenoh ROS 2 DDS Plugin](https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds).
 
 
-> As we are using an older version of ubuntu (20.04) on the Jetson Nano, we will need to build the `zenoh-bridge-ros2dds` plugin from source, as the pre-built binaries may not be compatible with our system.
+We will be using the docker version of the Zenoh bridge for ease of deployment and isolation. The bridge will run as a separate container on the robot, connecting to the local ROS 2 topics and forwarding them to the cloud router.
 
-``` bash
-cd ~/ros2_ws/src
-git clone https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds
+```bash
 
-cd ..
-rosdep install --from-paths . --ignore-src -r -y
-colcon build --packages-select zenoh_bridge_ros2dds --cmake-args -DCMAKE_BUILD_TYPE=Release
+docker pull eclipse/zenoh-bridge-ros2dds:latest 
+
+sudo docker run -d \
+  --name zenoh-bridge-ros2dds \
+  --network host \
+  -e ROS_DISTRO=foxy \
+  -e CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>' \
+  eclipse/zenoh-bridge-ros2dds:latest \
+  -e tcp/192.168.123.122:7447
+```
+
+> Replace with your server IP
+
+
+> If already started you can remove with `sudo docker stop zenoh-bridge-ros2dds && sudo docker remove zenoh-bridge-ros2dds`
+> Check if any other process is using port 7447 `sudo lsof -i :7447`. If the port is in use, you will need to stop the process that is using it before starting the Zenoh bridge.
+
+> To check logs: `sudo docker logs zenoh-bridge-ros2dds`
+
+## Known Issues:
+For some reason my unity came with the wrong port configured for ros2.
+
+```bash
+unitree@ubuntu:~$ echo $CYCLONEDDS_URI
+<CycloneDDS><Domain><General><Interfaces> <NetworkInterface name="eth1" priority="default" multicast="default" /> </Interfaces></General></Domain></CycloneDDS>
+```
+
+so runing the topic list command would fail
+```bash
+ros2 topic list
+```
+
+even though we dont have an eth1 interface. This causes the ros2 bridge to fail to connect to the local ROS 2 topics. To fix this, we need to set the `CYCLONEDDS_URI` environment variable to use the correct interface (eth0) and port (7447).
+
+```bash
+export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>'
+```
+
+So now running the topic list command should work and the bridge should be able to connect to the local ROS 2 topics.
+
+```bash
+ros2 topic list
 ```
