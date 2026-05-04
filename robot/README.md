@@ -122,15 +122,15 @@ sudo chmod 777 /dev/insta
 
 ---
 
+
 ## 7. Usage
-You can now bring up the camera and decoder nodes.
+**IMPORTANT:** Every time you open a new terminal, you must source both the Unitree environment and your local workspace.
+
 
 ```bash
+source ~/unitree_ros2/setup.sh
+source ~/ros2_ws/install/setup.bash
+
 # Launch the camera driver
 ros2 launch insta360_ros_driver bringup.launch.xml
-
-# In a separate terminal, activate image decoding
-ros2 run insta360_ros_driver decoder
 ```
-
-```s
