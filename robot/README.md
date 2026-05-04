@@ -1,8 +1,6 @@
-```bash
-# Launch the camera driver
-ros2 launch insta360_# Setting up the Insta360 ROS 2 Driver (In-Depth Guide)
+# Setting up the Insta360 ROS 2 Driver (In-Depth Guide)
 
-This guide provides a comprehensive walkthrough for setting up the Insta360 ROS 2 driver on a Unitree Go2 robot (Ubuntu 20.04 / ROS 2 Foxy) using a standard workspace.
+This guide provides a comprehensive walkthrough for setting up the Insta360 ROS 2 driver on a Unitree Go2 robot (Ubuntu 20.04 / ROS 2 Foxy) using a standard workspace
 
 ---
 
