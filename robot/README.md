@@ -29,6 +29,40 @@ Then you will need your Insta360 camera's SDK, you will need an account and requ
 > [!TIP]
 > You can right click on the download button and select "Copy Link Address" to get the direct download link for the SDK, which you can use in the terminal with `wget` or `curl` to download it directly to your robot. It should look something like this: `https://wassets.insta360.com/common/<my_key>/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip`
 
+``` bash
+curl -O https://wassets.insta360.com/common/<my_key>/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
+unzip Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
+rm Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
+
+cd Linux_CameraSDK-2.1.1_MediaSDK-3.1.1
+
+# The Linux_CameraSDK-2.1.1_MediaSDK-3.1.1 directory should contain the following
+# CameraSDK-2.1.1-gcc-arm-11.2-2022.02-x86_64-aarch64-none-linux-gnu.tar.gz
+# CameraSDK-2.1.1-gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.gz
+# CameraSDK-2.1.1-gcc-linaro-5.4.1-2017.01-rc1-x86_64_aarch64-linux-gnu.tar.gz
+# CameraSDK-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu.tar.gz
+# CameraSDK-2.1.1-Linux.tar.gz
+# libMediaSDK-dev-3.1.1.0-amd64.tar_1758540334111.xz
+# README.txt
+
+# Pick the appropriate SDK for your system, for example if you are using a Jetson Nano with Ubuntu 20.04, you would use the `CameraSDK-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu.tar.gz` file.
+
+tar -xzf CameraSDK-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu.tar.gz
+
+cd ..
+
+# Copying the files 
+
+cp -r Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/CameraSDK-20251105_112855-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu/include/* insta360_ros_driver/include/
+
+cp Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/CameraSDK-20251105_112855-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu/lib/libCameraSDK.so insta360_ros_driver/lib/
+
+
+# Clean up the SDK files
+rm -rf __MACOSX/
+rm -rf Linux_CameraSDK-2.1.1_MediaSDK-3.1.1
+```
+
 
 You will then need to unzip the SDK and follow the instructions in the `README.md` file in the `insta360_ros_driver` repository to build and run the ROS driver for the Insta360 camera. This will allow you to stream video data from the camera into your ROS ecosystem, where you can process it using Zenoh for efficient data handling and communication.
 
