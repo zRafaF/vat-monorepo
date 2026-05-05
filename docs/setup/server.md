@@ -26,16 +26,10 @@ sudo apt install zenoh
 Then you can start the Zenoh router with this command:
 
 ```bash
-zenohd
+zenohd --listen tcp/0.0.0.0:7447 --rest-http-port 8000
 ```
 
 !!! Note
     We are not using docker because the documentation states that "Docker doesn’t support UDP multicast between a container and its host" so a bare metal installation is recommended.
 
 
-### Bridge plugin
-As we now have the repository added to the source list installing other zenoh plugins is as easy as installing any other package. For the ROS 2 bridge plugin you can run:
-
-```bash
-sudo apt install zenoh-plugin-ros2dds
-```
