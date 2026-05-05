@@ -1,0 +1,91 @@
+site_name: VAT Documentation
+site_url: https://github.com/ZrafaF/vat-monorepo
+site_author: Rafael Farias Meneses
+site_description: >-
+  Documentation for the Volumetric Asynchronous Teleoperation (VAT) project, which includes 
+  a robot, server, and client components. This documentation provides setup instructions, 
+  usage guidelines, and development information for the VAT project.
+
+# Repository
+repo_name: zrafaf/vat-monorepo
+repo_url: https://github.com/zrafaf/vat-monorepo
+
+# Copyright
+copyright: Copyright &copy; 2026 Rafael F. Meneses
+theme:
+  name: material
+  logo: resources/LogoBolinho512.png
+  favicon: resources/LogoBolinho512.png
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/link
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/toggle-switch
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue grey
+      accent: indigo
+      toggle:
+        icon: material/toggle-switch-off
+        name: Switch to system preference
+  font:
+    text: Roboto
+    code: Roboto Mono
+  features:
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky #Faz com que a navigation tab esteja sempre visivel
+    - navigation.top
+    - navigation.tracking
+    - navigation.path
+    - navigation.indexes
+    - navigation.footer
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.follow
+    - content.code.copy
+    - content.code.annotate
+
+plugins:
+  - blog
+  - search:
+      separator: '[\s\u200b\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  - minify:
+      minify_html: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      use_pygments: true
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Setup:
+      - setup/index.md
+      - Robot: setup/robot.md
+      - Server: setup/server.md
+      - Client: setup/client.md
+      - Development: 
+        - setup/development/index.md
+        - Documentation: setup/development/documentation.md

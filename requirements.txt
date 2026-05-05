@@ -1,0 +1,4 @@
+# Documentation requirements
+mkdocs-material
+mkdocs-material-extensions
+mkdocs-minify-plugin
