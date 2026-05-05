@@ -1,1 +1,1 @@
-eclipse-zenoh
+eclipse-zenoh==1.7.2
