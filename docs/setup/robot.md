@@ -4,6 +4,7 @@
 
 ## Zenoh ROS 2 bridge
 
+<!-->
 One problem with the compiled binaries of the Zenoh ROS 2 bridge plugin is that they are not using shared memory transport, which is required for the robot component to work. To solve this issue, we need to compile the plugin from source.
 
 Installing dependencies:
@@ -34,3 +35,8 @@ sudo apt install libacl1-dev libncurses5-dev
 
     ROS_DISTRO=foxy cargo build --release -p zenoh-bridge-ros2dds --features dds_shm
     ```
+-->
+
+```bash
+sudo ROS_DISTRO=foxy zenoh-bridge-ros2dds -c ./DEFAULT_CONFIG.json5 -r 8001
+```
