@@ -1,32 +1,30 @@
 import zenoh
 import time
 
-def listener(sample):
-    # This will print the raw byte size of the incoming data
-    # Once you see 'lowstate' here, you are successful!
-    print(f">> Data on '{sample.key_expr}' | Size: {len(sample.payload)} bytes")
+def listener_callback(sample):
+    # sample.payload contains the raw binary CDR bytes sent from the robot
+    payload_size = len(sample.payload)
+    print(f"[Zenoh] Received {payload_size} bytes on key: {sample.key_expr}")
 
-if __name__ == "__main__":
-    # Your Dell Server Tailscale IP
-    router_endpoint = "tcp/100.125.156.19:7447" 
+if __name__ == '__main__':
+    # 1. Connect to the Zenoh Router
+    conf = zenoh.Config()
+    conf.insert_json5("connect/endpoints", '["tcp/100.125.156.19:7447"]')
     
-    conf = zenoh.Config.from_json5(
-        f'{{"connect": {{"endpoints": ["{router_endpoint}"]}}}}'
-    )
-    
-    print(f"Connecting to Zenoh router at {router_endpoint}...")
+    print("Connecting to Zenoh Router...")
     session = zenoh.open(conf)
     
-    # We use '**' to listen to everything the bridge finds.
-    # Based on your curl, it will catch 'imu/data', 'tf', etc.
-    print("Subscribing to ALL topics ('**')...")
-    sub = session.declare_subscriber("**", listener)
+    # 2. Subscribe to the exact key the robot is publishing
+    zenoh_key = "my_robot/rt/utlidar/cloud"
+    print(f"Subscribing to {zenoh_key}...")
     
-    print("Listening... (Press Ctrl+C to exit)")
+    sub = session.declare_subscriber(zenoh_key, listener_callback)
     
     try:
+        print("Listening for Lidar data... (Press Ctrl+C to quit)")
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nClosing session...")
+        print("\nShutting down client...")
+    finally:
         session.close()

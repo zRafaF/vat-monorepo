@@ -1,6 +1,20 @@
 # Robot setup
 
 
+## Python virtual environment
+You will need a venv with `python>=3.9`, the unitree go 2 comes native with `3.8` and `3.9`.
+
+To start a new venv and install the dependencies, run the following commands:
+```bash
+# Ensure you are on the robot directory
+cd robot
+
+/usr/bin/python3.9 -m venv venv
+
+source venv/bin/activate
+
+pip install -r requirements.txt
+```
 
 ## Zenoh ROS 2 bridge
 
