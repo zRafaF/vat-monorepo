@@ -124,3 +124,11 @@ Since the Nano's CPU can be a bottleneck, always run the Zenoh Bridge with an **
 ```bash
 ./zenoh-bridge-ros2dds -e quic/<CLOUD_IP>:7447 --allow "/robot/telemetry|/robot/pc"
 ```
+
+# Documentation
+
+To run the Mkdocs documentation server, use the following command in the root of the repository:
+
+```bash
+mkdocs serve
+```

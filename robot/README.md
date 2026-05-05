@@ -24,10 +24,10 @@ On Ubuntu 20.04, ROS 2 Foxy binaries are often missing or return 404 errors via 
 cd ~/ros2_ws/src
 
 # 1. Clone the Foxy-compatible branch of the camera manager
-git clone [https://github.com/ros-perception/image_common.git](https://github.com/ros-perception/image_common.git) -b foxy
+git clone https://github.com/ros-perception/image_common.git -b foxy
 
 # 2. Clone the IMU tools (required for imu_filter_madgwick)
-git clone [https://github.com/ccny-ros-pkg/imu_tools.git](https://github.com/ccny-ros-pkg/imu_tools.git) -b foxy
+git clone https://github.com/ccny-ros-pkg/imu_tools.git -b foxy
 
 # 3. Navigate to workspace root to install remaining system dependencies
 cd ~/ros2_ws
@@ -153,7 +153,7 @@ sudo docker run -d \
   -e ROS_DISTRO=foxy \
   -e CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>' \
   eclipse/zenoh-bridge-ros2dds:latest \
-  -e tcp/192.168.123.122:7447
+  -e tcp/100.125.156.19:7447
 ```
 
 > Replace with your server IP
@@ -187,4 +187,64 @@ So now running the topic list command should work and the bridge should be able 
 
 ```bash
 ros2 topic list
+```
+
+## Bridge help
+```bash
+2026-05-05T18:25:10.023254Z  INFO main ThreadId(01) zenoh_bridge_ros2dds: zenoh-bridge-ros2dds v1.9.0
+Zenoh bridge for ROS 2 with a DDS RMW
+
+Usage: zenoh-bridge-ros2dds [OPTIONS] [MODE]
+
+Arguments:
+  [MODE]  The Zenoh session mode [default: router] [possible values: peer, client, router]
+
+Options:
+  -c, --config <CONFIG>
+          A configuration file
+  -i, --id <ID>
+          The Zenoh identifier (as an hexadecimal string, in lowercase - e.g.: a0b23...) that this bridge must use. If not set, a random unsigned 128bit integer will be used. Leading zeros are not accepted. WARNING: this id must be unique in the system and must be 32 chars maximum (128 bits)!
+  -e, --connect <CONNECT>
+          Endpoints to connect to
+  -l, --listen <LISTEN>
+          Endpoints to listen on
+      --no-multicast-scouting
+          Disable the multicast-based scouting mechanism
+      --enable-shm
+          Enable the shared memory mechanism
+  -n, --namespace <NAMESPACE>
+          A ROS 2 namespace to be used by the "zenoh_bridge_dds" node'
+  -d, --domain <DOMAIN>
+          The DDS Domain ID. Default to $ROS_DOMAIN_ID environment variable if defined, or to 0 otherwise [env: ROS_DOMAIN_ID=]
+      --ros-localhost-only
+          Configure CycloneDDS to use only the localhost interface. If not set, a $ROS_LOCALHOST_ONLY=1 environment variable activates this option.
+          When this flag is not active, CycloneDDS will pick the interface defined in "$CYCLONEDDS_URI" configuration, or automatically choose one. [env: ROS_LOCALHOST_ONLY=0]
+      --ros-automatic-discovery-range <ROS_AUTOMATIC_DISCOVERY_RANGE>
+          Configure CycloneDDS to apply ROS_AUTOMATIC_DISCOVREY_RANGE. The argument only takes effect after ROS 2 Iron [env: ROS_AUTOMATIC_DISCOVERY_RANGE=]
+      --ros-static-peers <ROS_STATIC_PEERS>
+          Configure CycloneDDS to apply ROS_STATIC_PEERS. The argument only takes effect after ROS 2 Iron [env: ROS_STATIC_PEERS=]
+      --pub-max-frequency <REGEX=FLOAT>
+          Specifies a maximum frequency of publications routing over zenoh for a set of Publishers.
+          The string must have the format "<regex>=<float>":
+            - "regex" is a regular expression matching a Publisher interface name
+            - "float" is the maximum frequency in Hertz; if publication rate is higher, downsampling will occur when routing.
+      --queries-timeout-default <FLOAT>
+          A float in seconds that will be used as a timeout when the bridge queries any other remote bridge
+          for discovery information and for historical data for TRANSIENT_LOCAL DDS Readers it serves
+          (i.e. if the query to the remote bridge exceed the timeout, some historical samples might be not routed to the Readers, but the route will not be blocked forever).
+          This value overwrites the value possibly set in configuration file under 'plugins/ros2dds/queries_timeout/default' key [default: 5.0].
+  -r, --rest-http-port <PORT | IP:PORT>
+          Configures HTTP interface for the REST API (disabled by default, setting this option enables it). Accepted values:
+           - a port number
+           - a string with format `<local_ip>:<port_number>` (to bind the HTTP server to a specific interface).
+  -w, --watchdog [<FLOAT>]
+          Experimental!! Run a watchdog thread that monitors the bridge's async executor and reports as error log any stalled status during the specified period [default: 1.0 second]
+      --ros-args < list of ROS args until '--' >
+          ROS command line arguments as specified in https://design.ros2.org/articles/ros_command_line_arguments.html
+          Supported capabilities:
+            -r, --remap <from:=to> : remapping is supported only for '__ns' and '__node'
+  -h, --help
+          Print help (see more with '--help')
+  -V, --version
+          Print version
 ```

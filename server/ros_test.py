@@ -1,30 +1,32 @@
 import zenoh
 import time
 
-conf = zenoh.Config()
-conf.insert_json5("listen/endpoints", '["tcp/0.0.0.0:7447"]')
-
-def data_callback(sample):
-    print(f"\n[DATA ARRIVED] Topic: {sample.key_expr} | Bytes: {len(sample.payload.to_bytes())}")
-
-def start_server():
-    print("PC Server started. Listening for Robot...")
-    with zenoh.open(conf) as session:
-        # Subscribe to all topics to see what the bridge sends
-        session.declare_subscriber("**", data_callback)
-        
-        while True:
-            routers = session.info.routers_zid()
-            if routers:
-                print(f"Connected to Bridge: {routers}. Waiting for topics...", end="\r")
-                
-                # Check what the bridge has discovered in its own memory
-                replies = session.get("@/*/ros2/route/pub/**")
-                for reply in replies:
-                    print(f"\n[BRIDGE ROUTE DETECTED] {reply.sample.key_expr}")
-            else:
-                print("Waiting for bridge connection...", end="\r")
-            time.sleep(2)
+def listener(sample):
+    # This will print the raw byte size of the incoming data
+    # Once you see 'lowstate' here, you are successful!
+    print(f">> Data on '{sample.key_expr}' | Size: {len(sample.payload)} bytes")
 
 if __name__ == "__main__":
-    start_server()
+    # Your Dell Server Tailscale IP
+    router_endpoint = "tcp/100.125.156.19:7447" 
+    
+    conf = zenoh.Config.from_json5(
+        f'{{"connect": {{"endpoints": ["{router_endpoint}"]}}}}'
+    )
+    
+    print(f"Connecting to Zenoh router at {router_endpoint}...")
+    session = zenoh.open(conf)
+    
+    # We use '**' to listen to everything the bridge finds.
+    # Based on your curl, it will catch 'imu/data', 'tf', etc.
+    print("Subscribing to ALL topics ('**')...")
+    sub = session.declare_subscriber("**", listener)
+    
+    print("Listening... (Press Ctrl+C to exit)")
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nClosing session...")
+        session.close()
