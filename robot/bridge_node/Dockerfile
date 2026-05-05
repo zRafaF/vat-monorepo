@@ -1,19 +1,22 @@
-# Use ROS 2 Humble which natively uses Python 3.10
+# Use ROS 2 Humble for native Python 3.10 support
 FROM ros:humble-ros-base
 
-# Set the working directory
 WORKDIR /app
 
-# Install Python pip and any necessary build tools
+# Install pip and clean up to keep the image slim
 RUN apt-get update && apt-get install -y \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the latest Zenoh Python library (works perfectly on Python 3.10)
-RUN pip3 install eclipse-zenoh
+# Copy requirements first to leverage Docker cache
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copy your bridge script into the container
-COPY robot_bridge.py /app/robot_bridge.py
+# Copy the rest of the source code
+COPY . .
 
-# When the container starts, source the ROS environment and run the script
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && python3 /app/robot_bridge.py"]
+# Default log level can be overridden at runtime via docker run -e LOG_LEVEL=DEBUG
+ENV LOG_LEVEL=INFO
+ENV ENABLE_PER_MESSAGE_DEBUG=false
+
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && python3 dynamic_bridge.py"]
