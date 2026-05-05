@@ -53,6 +53,9 @@ theme:
     - toc.follow
     - content.code.copy
     - content.code.annotate
+    - content.footnote.tooltips
+    - content.tooltips
+    - navigation.instant.preview
 
 plugins:
   - blog

@@ -24,5 +24,19 @@ sudo tailscale up --ssh
     sudo systemctl is-enabled tailscaled
     ```
 
-## My setup
-O
+After the installation and authentication you should see the new device in the Tailscale admin console.
+
+For quick reference, see [my setup](./vpn.md#my-setup) for the IP addresses of the devices on my network.
+
+---
+
+## My Setup
+**Rafael's Note**
+
+On my network I have the following devices:
+
+| Name      | Description                          | IP Address                          |
+| ----------- | ------------------------------------ | ------------------------------------ |
+| `caramelo`       | My laptop  | `100.87.118.34` |
+| `ubuntu-unitree-go2`       | The robot | `100.106.128.63` |
+| `lab-dell-g16-7630`    | Laptop server I'm using for testing | `100.125.156.19` |
