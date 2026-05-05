@@ -62,7 +62,9 @@ plugins:
       minify_html: true
   - macros:
       module_name: docs/main  
-    
+
+extra_css:
+  - stylesheets/pygments.css
 
 markdown_extensions:
   - pymdownx.highlight:

@@ -16,3 +16,13 @@ To access via ssh use
 ```bash
 sudo tailscale up --ssh
 ```
+
+!!! tip
+
+    After the first authentication the vpn is supposed to start automatically on boot. To double check you can run:
+    ```bash
+    sudo systemctl is-enabled tailscaled
+    ```
+
+## My setup
+O
