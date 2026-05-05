@@ -63,7 +63,7 @@
       ////              Requires the bridge to be built with the 'dds_shm' feature for this option to valid.
       ////              By default set to false.
       ////
-      shm_enabled: false,
+      // shm_enabled: false,
 
       ////
       //// allow / deny: Specify the lists of ROS 2 interfaces that are allowed or denied to be routed over Zenoh.
