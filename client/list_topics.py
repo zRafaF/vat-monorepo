@@ -1,46 +1,76 @@
 import zenoh
 import json
 import os
+import time
+import argparse
 
-# Connect to the same router the robot is using
-ZENOH_ROUTER = os.environ.get('ZENOH_ROUTER', 'tcp/100.125.156.19:7447')
-ROBOT_NAME = "jetson_robot"
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--topic', type=str, default=None, help="ROS topic to subscribe to (e.g., /chatter)")
+    args = parser.parse_args()
 
-conf = zenoh.Config()
-conf.insert_json5("connect/endpoints", f'["{ZENOH_ROUTER}"]')
+    ZENOH_ROUTER = os.environ.get('ZENOH_ROUTER', 'tcp/100.125.156.19:7447')
+    ROBOT_NAME = "jetson_robot"
 
-try:
-    # Try to open a session
+    zenoh.init_log_from_env_or("error")
+    conf = zenoh.Config()
+    conf.insert_json5("connect/endpoints", f'["{ZENOH_ROUTER}"]')
     session = zenoh.open(conf)
-    print(f"✅ Successfully connected to Zenoh router at {ZENOH_ROUTER}")
-except Exception as e:
-    print(f"❌ Failed to connect to Zenoh router at {ZENOH_ROUTER}")
-    print(f"Error: {e}")
-    exit(1)  # Exit the script if connection fails
 
-print(f"Querying topics for {ROBOT_NAME}...")
+    print(f"Connected to Zenoh. Monitoring {ROBOT_NAME}...")
 
-try:
-    # Query the bridge's queryable
+    # 1. Setup Liveliness Monitor
+    liveliness_key = f"{ROBOT_NAME}/system/liveliness"
+    
+    def liveliness_callback(sample):
+        if sample.kind == zenoh.SampleKind.PUT:
+            print(f"\n[HEALTH] 🟢 Robot is ONLINE! ('{sample.key_expr}')")
+        elif sample.kind == zenoh.SampleKind.DELETE:
+            print(f"\n[HEALTH] 🔴 Robot went OFFLINE! Connection lost. ('{sample.key_expr}')")
+
+    liveliness_sub = session.liveliness().declare_subscriber(liveliness_key, liveliness_callback)
+    
+    time.sleep(1) # Give it a second to detect the robot
+
+    # 2. Query available topics
+    print("\nQuerying available topics...")
     replies = session.get(f"{ROBOT_NAME}/system/get_topics")
-except Exception as e:
-    print(f"❌ Failed to query topics from {ROBOT_NAME}")
-    print(f"Error: {e}")
-    session.close()
-    exit(1)
+    
+    available_topics = {}
+    for reply in replies:
+        try:
+            available_topics = json.loads(reply.ok.payload.decode('utf-8'))
+            print("--- Available ROS 2 Topics ---")
+            for topic, msg_type in available_topics.items():
+                print(f" - {topic:30} ({msg_type})")
+            print("------------------------------")
+        except Exception as e:
+            print(f"Error parsing topics: {e}")
 
-found = False
-for reply in replies:
-    found = True
+    # 3. Dynamic Subscription
+    target_topic = args.topic
+    if target_topic:
+        zenoh_data_key = f"{ROBOT_NAME}/rt{target_topic}"
+        
+        def data_callback(sample):
+            print(f"[DATA] Received {len(sample.payload)} bytes on {sample.key_expr}")
+
+        print(f"\nSubscribing to Zenoh Key: {zenoh_data_key}")
+        print("This will automatically trigger the robot to start the ROS subscription.")
+        
+        # Declaring this subscriber triggers the MatchingListener on the Jetson!
+        data_sub = session.declare_subscriber(zenoh_data_key, data_callback)
+
     try:
-        topics = json.loads(reply.ok.payload.decode('utf-8'))
-        print("\n--- Available ROS 2 Topics on Robot ---")
-        for topic, types in topics.items():
-            print(f" Topic: {topic:30} | Type: {types[0]}")
-    except Exception as e:
-        print(f"Error decoding reply: {e}")
+        print("\nListening... Press Ctrl+C to stop.")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down client...")
+        # When session.close() happens, the Jetson's MatchingListener will see the disconnect
+        # and automatically destroy the ROS subscription.
+    finally:
+        session.close()
 
-if not found:
-    print("⚠️ No response from robot. Is the bridge running and connected to the router?")
-
-session.close()
+if __name__ == '__main__':
+    main()
