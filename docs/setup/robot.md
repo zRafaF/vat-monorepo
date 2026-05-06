@@ -1,98 +1,100 @@
 # Robot setup
 
-
 ## Bridge node
 
-To get the ros topics from the robot to be available on the Zenoh network we have created a bridge node that uses the Zenoh Python API to forward the topics.
+To bridge ROS 2 topics from the robot to the remote Zenoh network, we utilize a dynamic bridge script. Because the latest Zenoh features require Python 3.10+ and our robot is locked to ROS Foxy (Python 3.8), we encapsulate the bridge inside a **ROS Humble Docker container**. This allows the bridge to run in a modern environment while communicating with the host robot via the shared network stack.
 
-!!! note
-    This is probably a temporary solution, there are two other easy options:
-    1. Use a docker environment with a newer version of ros that supports python 10 (in this case humble) and then connect the forwarder from it.
-    2. Utilize the Zenoh c version and create a ros node in c that forwards the topics to the Zenoh network. This would be more efficient and would not require a separate python environment, but it would require more development time.
+### Key Features
 
-    > There is also a third option which is to use the Zenoh ROS 2 bridge plugin, but it is currently not working with the robot setup. More details on that can be found in the failure section below. 
+* **Dynamic Discovery:** The bridge automatically polls the ROS graph every 2 seconds to find new topics.
+* **Smart Routing (`MatchingListener`):** To save bandwidth, the bridge only creates ROS subscriptions when a remote Zenoh client is actively listening. It automatically stops ROS subscriptions when clients disconnect.
+* **Liveliness Monitoring:** The bridge broadcasts a "heartbeat" token. If the robot loses connection, the server can detect the drop immediately via a Zenoh Liveliness Subscriber.
 
+---
 
-The current bridge architecture is composed of two parts in two different python version:
+### Deployment Instructions
 
-### Python 3.8
-This is the script that connects to the ros topics, the communication to the other script that does the forwarding is done via a tcp socket. This script is using python 3.8 because that is the version that is compatible with ros foxy, which is the version we are using for the robot component.
+#### 1. Build the Image
 
-As it doesnt use external libraries it can be run with:
+Run this command on the Jetson board to build the bridge container. It includes the official Zenoh library and the necessary ROS Humble components.
 
 ```bash
-python ros_to_tcp.py
+docker build -t zenoh-ros-bridge:latest .
 ```
 
+#### 2. Run the Container
 
-### Python 3.9
-
-This is the script that connects to the Zenoh network and forwards the topics received from the other script. This script is using python 3.9 because that is the version that comes with the unitree go 2 robot but can easily be changed to a newer python version that is compatible with the zenoh python api.
-
-#### Python virtual environment
-To start a new venv and install the dependencies, run the following commands:
+The container requires `--net=host` to "see" the Foxy nodes on the robot. Use the `-e` flags to configure your specific environment.
 
 ```bash
-# Ensure you are on the robot directory
-cd robot
-
-/usr/bin/python3.9 -m venv venv
-
-source venv/bin/activate
-
-pip install -r requirements.txt
+docker run -d \
+  --name zenoh_bridge \
+  --net=host \
+  --restart unless-stopped \
+  -e ROBOT_NAME="jetson_robot" \
+  -e ZENOH_CONNECT="tcp/100.125.156.19:7447" \
+  -e LOG_LEVEL="INFO" \
+  zenoh-ros-bridge:latest
 ```
 
-To run the script, make sure to activate the virtual environment and then run:
+#### 3. Monitoring
+
+To verify the bridge is discovering topics and activating routes based on demand, use the logs:
 
 ```bash
-source venv/bin/activate
-
-python tcp_to_zenoh.py
+docker logs -f zenoh_bridge
 ```
 
 ---
 
+### Technical Details
 
+#### Configuration Variables
 
-??? failure "[failure] Zenoh ROS 2 bridge plugin"
-    The Zenoh ROS 2 bridge plugin is currently not working with the robot setup. The external ros nodes are getting discovered and forwarded to the bridge, but the robot component is not able to be detected. It is still unsure if that is a shared memory problem or something else.
+| Variable        | Description                                                         | Default              |
+| :-------------- | :------------------------------------------------------------------ | :------------------- |
+| `ROBOT_NAME`    | The prefix used for all Zenoh keys (e.g., `jetson_robot/rt/topic`). | `my_robot`           |
+| `ZENOH_CONNECT` | The endpoint of the remote Zenoh router.                            | `tcp/127.0.0.1:7447` |
+| `LOG_LEVEL`     | Verbosity of the ROS 2 and Zenoh logs (`DEBUG`, `INFO`, `WARN`).    | `INFO`               |
 
-    Trying building it from source with the shared memory transport enabled caused many problems with the cmake version and the dependencies. Thus the current version of the bridge described above can be seen as a workaround to get the robot component working, but it is not ideal. The ideal solution would be to have the bridge plugin supplying the topics in a transparent manner.
+---
 
-    ??? note "Previous version of the documentatin"
-        One problem with the compiled binaries of the Zenoh ROS 2 bridge plugin is that they are not using shared memory transport, which is required for the robot component to work. To solve this issue, we need to compile the plugin from source.
+### Experimental History: Attempted Bridge Solutions
 
-        Installing dependencies:
-        ```bash
-        sudo apt install libacl1-dev libncurses5-dev
-        ```
+??? failure "[Experimental History] Attempted Bridge Solutions"
+    We explored several official Zenoh-ROS 2 integration paths before settling on the current Python implementation. Below is a summary of what was attempted and the outcomes observed.
+    
+    ---
 
-        !!! Tip
-            If using the unitree go 2 robot you might encounter problems with the default version of cmake that comes with ubuntu 20.04. To circumvent this issue you can try and install a newer version side by side just for the build process.
+    **Attempt 1: Official Standalone Bridge (`zenoh-bridge-ros2dds`)**
 
-            ```bash
-            pip3 install cmake==3.26.4
-            ```
+    We attempted to run the pre-compiled `eclipse/zenoh-bridge-ros2dds` container. 
+    *   **Setup:** Pointed the bridge to the remote router using the `-e` flag.
+    *   **Result:** The bridge successfully connected to the Zenoh network, but the "No topics found" error persisted during discovery.
+    *   **Observed Behavior:** The bridge was unable to detect active ROS Foxy nodes despite sharing the host network.
 
-            Point the Build to the New CMake
+    ---
 
-            ```bash
+    **Attempt 2: Middleware & Loopback Configurations**
+    
+    We attempted to resolve the discovery issues by adjusting the DDS middleware environment.
+    *   **Configurations tried:** 
+        *   Forcing `RMW_IMPLEMENTATION=rmw_fastrtps_cpp` inside the container.
+        *   Setting `ROS_LOCALHOST_ONLY=1` to force local discovery.
+        *   Manually enabling multicast on the loopback interface (`lo`).
+    *   **Result:** Even with these configurations, the bridge could not reliably maintain a ROS graph of the Foxy nodes.
 
-            # Add the pip binary folder to the start of your PATH
-            export PATH=$HOME/.local/bin:$PATH
+    ---
 
-            # Verify the version (it should now say 3.26.4)
-            cmake --version
-            ```
+    **Attempt 3: Building from Source with Shared Memory**
+    
+    We attempted to build the `zenoh-plugin-ros2dds` from source to enable the `dds_shm` feature.
+    *   **Setup:** Attempted to use the robot's native environment to ensure direct shared memory access.
+    *   **Result:** This led to significant dependency conflicts with the robot's default `cmake` version and ROS Foxy build tools, making the maintenance of a source-built bridge impractical for this hardware.
 
-            ```bash
-            # If needed, clean previous build artifacts with `cargo clean` before rebuilding
+    ---
 
-            ROS_DISTRO=foxy cargo build --release -p zenoh-bridge-ros2dds --features dds_shm
-            ```
+    **Conclusion**
+    
+    The current **Humble Docker + Python Bridge** was chosen because it successfully bypassed these discovery issues. Since it utilizes the standard `rclpy` library, it maintains native compatibility with the robot's ROS graph while still leveraging Zenoh for long-distance transport.
 
-
-        ```bash
-        sudo ROS_DISTRO=foxy zenoh-bridge-ros2dds -c ./DEFAULT_CONFIG.json5 -r 8001
-        ```
