@@ -1,76 +1,56 @@
 import zenoh
 import json
 import os
-import time
-import argparse
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--topic', type=str, default=None, help="ROS topic to subscribe to (e.g., /chatter)")
-    args = parser.parse_args()
-
+    # Connect to your server's Zenoh Router
     ZENOH_ROUTER = os.environ.get('ZENOH_ROUTER', 'tcp/100.125.156.19:7447')
-    ROBOT_NAME = "jetson_robot"
 
     zenoh.init_log_from_env_or("error")
     conf = zenoh.Config()
     conf.insert_json5("connect/endpoints", f'["{ZENOH_ROUTER}"]')
     session = zenoh.open(conf)
 
-    print(f"Connected to Zenoh. Monitoring {ROBOT_NAME}...")
+    print(f"Connected to Router: {ZENOH_ROUTER}")
+    print("Querying the Zenoh Admin Space for bridged ROS 2 topics...\n")
 
-    # 1. Setup Liveliness Monitor
-    liveliness_key = f"{ROBOT_NAME}/system/liveliness"
-    
-    def liveliness_callback(sample):
-        if sample.kind == zenoh.SampleKind.PUT:
-            print(f"\n[HEALTH] 🟢 Robot is ONLINE! ('{sample.key_expr}')")
-        elif sample.kind == zenoh.SampleKind.DELETE:
-            print(f"\n[HEALTH] 🔴 Robot went OFFLINE! Connection lost. ('{sample.key_expr}')")
+    # The official bridge exposes its discovered routes under the Admin Space[cite: 14]
+    # @/*/ros2/route/** gets the routes from ALL connected bridges[cite: 14]
+    replies = session.get("@/*/ros2/route/**")
 
-    liveliness_sub = session.liveliness().declare_subscriber(liveliness_key, liveliness_callback)
+    found_topics = False
     
-    time.sleep(1) # Give it a second to detect the robot
+    print(f"{'ROS 2 Topic':<40} | {'Zenoh Key'}")
+    print("-" * 80)
 
-    # 2. Query available topics
-    print("\nQuerying available topics...")
-    replies = session.get(f"{ROBOT_NAME}/system/get_topics")
-    
-    available_topics = {}
     for reply in replies:
+        found_topics = True
         try:
-            available_topics = json.loads(reply.ok.payload.decode('utf-8'))
-            print("--- Available ROS 2 Topics ---")
-            for topic, msg_type in available_topics.items():
-                print(f" - {topic:30} ({msg_type})")
-            print("------------------------------")
+            # The payload contains a JSON configuration of the route
+            payload_bytes = bytes(reply.ok.payload)
+            route_info = json.loads(payload_bytes.decode('utf-8'))
+            
+            # The Admin Space key looks like: @/<bridge_id>/ros2/route/<type>/<topic>
+            admin_key = str(reply.ok.key_expr)
+            
+            # Extract standard fields the bridge provides
+            ros_topic = route_info.get('ros2_name', 'Unknown')
+            zenoh_key = route_info.get('zenoh_key_expr', 'Unknown')
+            
+            # Print cleanly
+            print(f"{ros_topic:<40} | {zenoh_key}")
+            
         except Exception as e:
-            print(f"Error parsing topics: {e}")
+            print(f"Error parsing route data: {e}")
 
-    # 3. Dynamic Subscription
-    target_topic = args.topic
-    if target_topic:
-        zenoh_data_key = f"{ROBOT_NAME}/rt{target_topic}"
-        
-        def data_callback(sample):
-            print(f"[DATA] Received {len(sample.payload)} bytes on {sample.key_expr}")
+    if not found_topics:
+        print("No topics found!")
+        print("Troubleshooting:")
+        print(" 1. Is the bridge container running on the Jetson?")
+        print(" 2. Are the Foxy nodes running on the Jetson?")
+        print(" 3. Does the ROS_DOMAIN_ID match between the container and the host?")
 
-        print(f"\nSubscribing to Zenoh Key: {zenoh_data_key}")
-        print("This will automatically trigger the robot to start the ROS subscription.")
-        
-        # Declaring this subscriber triggers the MatchingListener on the Jetson!
-        data_sub = session.declare_subscriber(zenoh_data_key, data_callback)
-
-    try:
-        print("\nListening... Press Ctrl+C to stop.")
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nShutting down client...")
-        # When session.close() happens, the Jetson's MatchingListener will see the disconnect
-        # and automatically destroy the ROS subscription.
-    finally:
-        session.close()
+    session.close()
 
 if __name__ == '__main__':
     main()
