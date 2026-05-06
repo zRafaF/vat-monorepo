@@ -1,2 +1,1 @@
 eclipse-zenoh==1.9.0
-rosidl_runtime_py
