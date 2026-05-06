@@ -1,0 +1,4 @@
+eclipse-zenoh
+rerun-sdk
+numpy
+rosbags

@@ -58,7 +58,10 @@ class DynamicZenohBridge(Node):
                     zenoh_key = f"{self.robot_prefix}/rt{topic_name}"
                     
                     # Declare Zenoh Publisher[cite: 11]
-                    z_pub = self.z_session.declare_publisher(zenoh_key)
+                    z_pub = self.z_session.declare_publisher(
+                        zenoh_key,
+                        congestion_control=zenoh.CongestionControl.DROP
+                    )
                     
                     self.zenoh_map[topic_name] = {
                         "z_pub": z_pub,
