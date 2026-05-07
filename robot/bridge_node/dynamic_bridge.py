@@ -24,6 +24,7 @@ class DynamicZenohBridge(Node):
         zenoh.init_log_from_env_or(log_level_str)
         conf = zenoh.Config()
         conf.insert_json5("connect/endpoints", f'["{zenoh_endpoint}"]')
+        conf.insert_json5("mode", '"client"')
         
         self.get_logger().info(f"Connecting to Zenoh endpoint: {zenoh_endpoint}")
         self.z_session = zenoh.open(conf)
