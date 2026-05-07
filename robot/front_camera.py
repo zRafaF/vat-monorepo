@@ -1,3 +1,9 @@
+# python front_camera.py eth0
+
+import os
+# FORCE ROS 2 to use FastRTPS to avoid colliding with the Unitree SDK's CycloneDDS
+os.environ['RMW_IMPLEMENTATION'] = 'rmw_fastrtps_cpp'
+
 import sys
 import rclpy
 from rclpy.node import Node
