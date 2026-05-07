@@ -5,43 +5,40 @@ from rclpy.serialization import serialize_message
 from rosidl_runtime_py.utilities import get_message
 import zenoh
 import json
+import time
 
 class DynamicZenohBridge(Node):
     def __init__(self):
-        # Initialize ROS 2 Node
         super().__init__('dynamic_zenoh_bridge')
         
-        # 1. Configuration from Environment Variables[cite: 3]
+        # Configuration
         self.robot_prefix = os.environ.get('ROBOT_NAME', 'my_robot')
         zenoh_endpoint = os.environ.get('ZENOH_CONNECT', 'tcp/127.0.0.1:7447')
         log_level_str = os.environ.get('LOG_LEVEL', 'info').lower()
         
-        # Set ROS logger level[cite: 3]
-        numeric_level = getattr(rclpy.logging.LoggingSeverity, log_level_str.upper(), rclpy.logging.LoggingSeverity.INFO)
-        self.get_logger().set_level(numeric_level)
-
-        # 2. Connect to Zenoh and Initialize Native Logging[cite: 3, 6]
-        zenoh.init_log_from_env_or(log_level_str)
         conf = zenoh.Config()
         conf.insert_json5("connect/endpoints", f'["{zenoh_endpoint}"]')
-        conf.insert_json5("mode", '"client"')
-        
-        self.get_logger().info(f"Connecting to Zenoh endpoint: {zenoh_endpoint}")
-        self.z_session = zenoh.open(conf)
-        
-        # 3. State Management
-        # Renamed to zenoh_map to avoid AttributeError with ROS Node.publishers[cite: 3]
+        conf.insert_json5("mode", '"client"') # Force client mode for stability 
+
+        # Retry Loop for Zenoh Connection
+        self.z_session = None
+        while self.z_session is None:
+            try:
+                self.get_logger().info(f"Attempting to connect to Zenoh: {zenoh_endpoint}...")
+                self.z_session = zenoh.open(conf)
+            except Exception as e:
+                self.get_logger().warn(f"Server unreachable: {e}. Retrying in 5 seconds...")
+                time.sleep(5)
+
+        self.get_logger().info("Successfully connected to Zenoh server!")
+
+        # State Management and Liveliness 
         self.zenoh_map = {} 
-        
-        # 4. Declare Liveliness Token (Heartbeat for the robot)[cite: 6]
         liveliness_key = f"{self.robot_prefix}/system/liveliness"
         self.liveliness_token = self.z_session.liveliness().declare_token(liveliness_key)
-        self.get_logger().info(f"Broadcasting Liveliness on: {liveliness_key}")
 
-        # 5. Setup Discovery Queryable[cite: 3, 9]
+        # Setup Discovery and Timers 
         self.z_session.declare_queryable(f"{self.robot_prefix}/system/get_topics", self.handle_topic_query)
-        
-        # 6. Start ROS Topic Polling (Checks for new topics every 2 seconds)[cite: 3]
         self.discovery_timer = self.create_timer(2.0, self.discover_topics)
         
         self.get_logger().info(f"Smart Dynamic Bridge [{self.robot_prefix}] Ready.")
