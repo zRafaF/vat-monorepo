@@ -1,4 +1,4 @@
-# --mode flag (full, quads, pairs
+# --mode flag (full, quads, pairs)
 # python step2_generate_pcd.py --mode quads
 
 import os
@@ -74,7 +74,7 @@ def process_elastic_node(kf_dir, model, device, mode):
         node_colors.append(c)
         node_poses.append(res['camera_poses'][0].cpu().numpy())
         
-    return np.concatenate(node_points), np.concatenate(node_colors), np.concatenate(node_poses), None
+    return node_points, node_colors, node_poses, None
 
 def run_pipeline(input_dir, output_dir, mode):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -98,7 +98,14 @@ def run_pipeline(input_dir, output_dir, mode):
         print(f"⏱️ Time: {time.time()-start:.2f}s | Points: {len(pts)}")
         
         out_file = os.path.join(output_dir, f"{kf_name}_reconstruction.npz")
-        np.savez_compressed(out_file, points=pts, colors=cols, poses=poses)
+        
+        save_dict = {}
+        for i in range(len(pts)):
+            save_dict[f'points_{i}'] = pts[i]
+            save_dict[f'colors_{i}'] = cols[i]
+            save_dict[f'poses_{i}'] = poses[i]
+        np.savez_compressed(out_file, **save_dict)
+    
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
