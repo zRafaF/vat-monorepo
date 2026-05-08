@@ -83,8 +83,8 @@ def build_global_map(input_dir, output_dir, voxel_size=0.03):
     print(f"\n💾 Saved Map and Trajectory to {output_dir}")
 
     # Interactive Visualization
-    print("🎥 Opening 3D Visualizer... (Press Q to close)")
-    o3d.visualization.draw_geometries([global_pcd], window_name="Equi-360 Final Reconstruction")
+    # print("🎥 Opening 3D Visualizer... (Press Q to close)")
+    # o3d.visualization.draw_geometries([global_pcd], window_name="Equi-360 Final Reconstruction")
 
 if __name__ == "__main__":
     # Ensure directories match your setup
