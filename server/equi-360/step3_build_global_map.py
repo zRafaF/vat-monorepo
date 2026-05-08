@@ -4,100 +4,79 @@ import numpy as np
 import open3d as o3d
 import time
 
-def load_point_cloud(npz_path, voxel_size=0.05):
-    """Loads point cloud from .npz and downsamples it for faster processing."""
+def assemble_spatial_node(npz_path, voxel_size):
+    """Phase 1: Intra-Node Assembly. Snaps the 3 'quad' rings into a perfect 360 bubble."""
     data = np.load(npz_path)
+    assembled_pcd = o3d.geometry.PointCloud()
     
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(data['points'])
-    # Open3D expects colors in [0, 1] range
-    pcd.colors = o3d.utility.Vector3dVector(data['colors'] / 255.0)
+    # Count how many chunks (rings) are in the file
+    num_chunks = sum(1 for k in data.files if k.startswith('points_'))
     
-    # Downsample to speed up ICP and normalize density
-    pcd_down = pcd.voxel_down_sample(voxel_size)
-    
-    # Estimate normals (required for robust ICP)
-    pcd_down.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
-    )
-    return pcd_down
+    for i in range(num_chunks):
+        chunk = o3d.geometry.PointCloud()
+        chunk.points = o3d.utility.Vector3dVector(data[f'points_{i}'])
+        chunk.colors = o3d.utility.Vector3dVector(data[f'colors_{i}'] / 255.0)
+        chunk = chunk.voxel_down_sample(voxel_size)
+        chunk.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size*2, max_nn=30))
+        
+        if i == 0:
+            assembled_pcd = chunk # The Horizon ring acts as the local anchor
+        else:
+            # ICP Snap the Ceiling/Floor rings to the Horizon ring
+            reg = o3d.pipelines.registration.registration_icp(
+                chunk, assembled_pcd, max_correspondence_distance=voxel_size * 5,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane()
+            )
+            chunk.transform(reg.transformation)
+            assembled_pcd += chunk
+            
+    return assembled_pcd.voxel_down_sample(voxel_size)
 
-def register_point_clouds(source, target, voxel_size):
-    """Aligns the source point cloud to the target using ICP."""
-    # We assume the movement between consecutive 360 frames is relatively small
-    # so we can use an Identity matrix as our initial guess.
-    trans_init = np.asarray([[1.0, 0.0, 0.0, 0.0],
-                             [0.0, 1.0, 0.0, 0.0],
-                             [0.0, 0.0, 1.0, 0.0],
-                             [0.0, 0.0, 0.0, 1.0]])
-
-    # Point-to-Plane ICP is much faster and more accurate than Point-to-Point for indoor spaces
-    distance_threshold = voxel_size * 10
-    reg_p2p = o3d.pipelines.registration.registration_icp(
-        source, target, distance_threshold, trans_init,
-        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100)
-    )
-    return reg_p2p.transformation
-
-def build_global_map(input_dir, output_file, voxel_size=0.05):
+def build_global_map(input_dir, output_dir, voxel_size=0.03):
     npz_files = sorted(glob.glob(os.path.join(input_dir, "*.npz")))
-    if not npz_files:
-        print(f"No .npz files found in {input_dir}")
-        return
-
-    print(f"Found {len(npz_files)} spatial nodes. Starting global stitching...")
     
-    # 1. Initialize the global map with the first node (The Anchor)
-    print(f"Loading Anchor Node: {os.path.basename(npz_files[0])}")
-    global_map = load_point_cloud(npz_files[0], voxel_size)
+    print(f"🌐 Equi-360: Two-Stage Assembly & Stitching ({len(npz_files)} nodes)...")
     
-    # The transformation of the current node relative to the global origin
-    current_global_transform = np.identity(4)
-
-    # 2. Iterate through the sequence and stitch
+    # Initialize Map and Trajectory Tracker
+    global_pcd = assemble_spatial_node(npz_files[0], voxel_size)
+    trajectory = [np.eye(4)] # Frame 0 is at the Origin (Identity Matrix)
+    
     for i in range(1, len(npz_files)):
         start_time = time.time()
-        file_name = os.path.basename(npz_files[i])
-        print(f"\nStitching Node {i}/{len(npz_files)-1}: {file_name}")
+        node_name = os.path.basename(npz_files[i])
         
-        # Load the new node
-        source_pcd = load_point_cloud(npz_files[i], voxel_size)
+        # Phase 1: Assemble the shattered 360 node
+        source_pcd = assemble_spatial_node(npz_files[i], voxel_size)
         
-        # Register the new node to the CURRENT state of the global map
-        # (We align against the whole map to prevent pairwise drift)
-        transformation = register_point_clouds(source_pcd, global_map, voxel_size)
+        # Phase 2: Inter-Node SLAM (Snap the assembled bubble to the global map)
+        reg = o3d.pipelines.registration.registration_icp(
+            source_pcd, global_pcd, max_correspondence_distance=voxel_size * 10,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        )
         
-        # Apply the transformation to move the source into the global coordinate system
-        source_pcd.transform(transformation)
+        # Apply transformation and track the camera trajectory
+        source_pcd.transform(reg.transformation)
         
-        # Merge the aligned source into the global map
-        global_map += source_pcd
+        # Calculate global pose by multiplying local transform with previous global pose
+        current_global_pose = reg.transformation @ trajectory[-1]
+        trajectory.append(current_global_pose)
         
-        # Re-downsample the global map to prevent RAM explosion over long videos
-        global_map = global_map.voxel_down_sample(voxel_size)
+        # Merge and downsample
+        global_pcd += source_pcd
+        global_pcd = global_pcd.voxel_down_sample(voxel_size)
         
-        print(f"✅ Stitched in {time.time() - start_time:.2f} seconds. Map size: {len(global_map.points)} points.")
+        print(f"✅ Stitched {node_name} | Points: {len(global_pcd.points)} | Time: {time.time()-start_time:.2f}s")
 
-    # 3. Save the final global point cloud
-    print("\n" + "="*40)
-    print("💾 Saving Global Map...")
-    o3d.io.write_point_cloud(output_file, global_map)
-    print(f"🎉 Success! Saved to {output_file}")
-    print("="*40)
-
-    # 4. Open interactive visualizer
-    print("Opening 3D Visualizer... (Press 'Q' or Esc to close)")
-    o3d.visualization.draw_geometries([global_map], window_name="Equi-360 Global Map")
-
-if __name__ == '__main__':
-    # Define directories
-    input_directory = "output/pcd_nodes"
-    output_ply = "output/FINAL_global_map.ply"
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Resolution of the map (0.05 = 5cm voxels). 
-    # Decrease this number (e.g. 0.02) for a sharper map, increase for faster processing.
-    resolution = 0.05 
+    # Save the Map
+    ply_path = os.path.join(output_dir, "FINAL_global_map.ply")
+    o3d.io.write_point_cloud(ply_path, global_pcd)
     
-    os.makedirs("output", exist_ok=True)
-    build_global_map(input_directory, output_ply, resolution)
+    # Save the Trajectory Data for Step 4
+    traj_path = os.path.join(output_dir, "FINAL_trajectory.npy")
+    np.save(traj_path, np.array(trajectory))
+    print(f"\n💾 Saved Map and Trajectory to {output_dir}")
+
+if __name__ == "__main__":
+    build_global_map("output/pcd_nodes", "output", voxel_size=0.03)
