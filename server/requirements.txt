@@ -1,5 +1,2 @@
-amqtt
-fastapi
-uvicorn
-protobuf
-paho-mqtt
+opencv-python
+numpy
