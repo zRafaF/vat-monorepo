@@ -7,10 +7,17 @@ def debug_single_node(npz_path):
     print(f"🔍 Loading Single Spatial Node: {npz_path}")
     data = np.load(npz_path)
     
-    # Pi3X outputs a single points/colors array in 'full' mode
-    points = data['points']
-    colors = data['colors']
-    poses = data['poses']
+    # Handle both 'full' mode (single array) and 'quads' mode (chunked arrays)
+    if 'points' in data:
+        points = data['points']
+        colors = data['colors']
+        poses = data['poses']
+    else:
+        print("Detected chunked geometry. Assembling...")
+        # Concatenate all chunks dynamically
+        points = np.concatenate([data[k] for k in sorted(data.files) if k.startswith('points_')])
+        colors = np.concatenate([data[k] for k in sorted(data.files) if k.startswith('colors_')])
+        poses = np.concatenate([data[k] for k in sorted(data.files) if k.startswith('poses_')])
     
     print("🚀 Initializing Rerun Visualizer...")
     rr.init("Pi3X_Single_Node_Debug", spawn=True)

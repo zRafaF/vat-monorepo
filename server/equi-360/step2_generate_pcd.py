@@ -80,8 +80,8 @@ if __name__ == '__main__':
     parser.add_argument("--output_dir", type=str, default="output/pcd_nodes")
     
     # Restored to the original high-res targets
-    parser.add_argument("--width", type=int, default=644, help="Must be a multiple of 14")
-    parser.add_argument("--height", type=int, default=476, help="Must be a multiple of 14")
+    parser.add_argument("--width", type=int, default=504, help="Must be a multiple of 14")
+    parser.add_argument("--height", type=int, default=504, help="Must be a multiple of 14")
     
     args = parser.parse_args()
     
