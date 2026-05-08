@@ -14,21 +14,27 @@ from Pi3.pi3.models.pi3x import Pi3X
 from Pi3.pi3.utils.geometry import depth_edge
 
 def load_spatial_node(kf_dir, device):
-    """Loads the 12 interlocking views of a single 360 spatial node."""
+    """Loads and resizes the 12 views of a node to be compatible with DINOv2 patches."""
     image_paths = sorted(glob.glob(os.path.join(kf_dir, "*.jpg")))
     if len(image_paths) == 0:
         return None
+        
+    # Pi3X (DINOv2) requires dimensions to be multiples of 14
+    TARGET_W, TARGET_H = 644, 476 
         
     imgs = []
     for p in image_paths:
         img = cv2.imread(p)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Resize to the nearest multiples of 14
+        img = cv2.resize(img, (TARGET_W, TARGET_H), interpolation=cv2.INTER_AREA)
         imgs.append(img)
     
-    # Stack and convert to PyTorch tensor format: (B, N, C, H, W), range [0, 1]
     imgs_np = np.stack(imgs, axis=0)
     imgs_tensor = torch.from_numpy(imgs_np).permute(0, 3, 1, 2).float() / 255.0
     return imgs_tensor.unsqueeze(0).to(device)
+
 
 def process_keyframes(input_dir, output_dir, device_name='cuda'):
     device = torch.device(device_name)
