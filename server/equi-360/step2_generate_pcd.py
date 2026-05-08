@@ -1,5 +1,5 @@
 # --mode flag (full, quads, pairs)
-# python step2_generate_pcd.py --mode quads
+# python step2_generate_pcd.py --mode full --device cpu
 
 import os
 import sys
@@ -25,7 +25,7 @@ def process_elastic_node(kf_dir, model, device, mode):
     if mode == 'full':
         window_size = 12
         step_size = 12
-        target_w, target_h = 336, 224 # Lowest resolution to try to survive 8GB
+        target_w, target_h = 546, 392 # Lowest resolution to try to survive 8GB
     elif mode == 'quads':
         window_size = 4
         step_size = 3 # 1 frame overlap between chunks
@@ -58,9 +58,13 @@ def process_elastic_node(kf_dir, model, device, mode):
         imgs_batch = imgs_tensor.unsqueeze(0).to(device)
 
         with torch.no_grad():
-            with torch.amp.autocast('cuda'):
+            if device.type == 'cuda':
+                with torch.amp.autocast('cuda'):
+                    res = model(imgs_batch)
+            else:
+                # Run on CPU in standard float32
                 res = model(imgs_batch)
-
+                
         # Filtering logic
         conf_mask = torch.sigmoid(res['conf'][0, ..., 0]) > 0.1
         edge_mask = ~depth_edge(res['local_points'][0, ..., 2], rtol=0.03)
