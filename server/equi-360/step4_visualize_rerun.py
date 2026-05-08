@@ -23,7 +23,7 @@ def visualize_slam_reconstruction(map_path, trajectory_path):
         print(f"Logging {len(points)} points to Rerun...")
         rr.log(
             "world/global_map", 
-            rr.Points3D(positions=points, colors=colors, radii=0.02) # Adjust radii if points look too sparse/thick
+            rr.Points3D(positions=points, colors=colors, radii=0.01) # Adjust radii if points look too sparse/thick
         )
     else:
         print(f"❌ Could not find global map PLY at {map_path}")

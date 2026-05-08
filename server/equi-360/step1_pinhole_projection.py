@@ -46,9 +46,14 @@ def process_360_spatial_nodes(video_path, output_dir, flow_threshold=12.0):
     keyframe_count = 0
     
     camera_rig = [
-        (0, 45, "up_N"), (90, 45, "up_E"), (180, 45, "up_S"), (270, 45, "up_W"),
-        (45, 0, "mid_NE"), (135, 0, "mid_SE"), (225, 0, "mid_SW"), (315, 0, "mid_NW"),
-        (0, -30, "down_N"), (90, -30, "down_E"), (180, -30, "down_S"), (270, -30, "down_W")
+        (0, 0, "mid_front"), 
+        (60, 0, "mid_front_right"), 
+        (120, 0, "mid_back_right"), 
+        (180, 0, "mid_back"),
+        (240, 0, "mid_back_left"), 
+        (300, 0, "mid_front_left"),
+        (0, 60, "up_ceiling"), 
+        (0, -45, "down_floor") # -45 instead of -90 to avoid seeing the robot body
     ]
 
     if not os.path.exists(output_dir):
@@ -100,4 +105,4 @@ def process_360_spatial_nodes(video_path, output_dir, flow_threshold=12.0):
     print("Processing complete.")
 
 # Run the pipeline
-process_360_spatial_nodes("input/robot_path.mp4", "output/keyframes", flow_threshold=12.0)
+process_360_spatial_nodes("input/robot_path.mp4", "output/keyframes", flow_threshold=3.0)
