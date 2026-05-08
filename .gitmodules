@@ -1,0 +1,3 @@
+[submodule "server/equi-360/Pi3"]
+	path = server/equi-360/Pi3
+	url = https://github.com/yyfz/Pi3
