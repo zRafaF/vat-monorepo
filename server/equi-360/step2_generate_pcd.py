@@ -1,7 +1,3 @@
-# PRE-REQUISITE: 
-# Run this in your terminal BEFORE running the script to prevent memory fragmentation:
-# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
 import os
 import sys
 import glob
@@ -17,12 +13,12 @@ from pi3.models.pi3x import Pi3X
 from pi3.utils.geometry import depth_edge
 
 def process_full_node(kf_dir, model, device, width, height):
-    """Processes a 12-view node simultaneously using PyTorch 2.5 Flash Attention."""
+    """Processes a 12-view node simultaneously."""
     image_paths = sorted(glob.glob(os.path.join(kf_dir, "*.jpg")))
     if len(image_paths) == 0:
         return None, None, None
         
-    print(f"  [Mode: FULL] Views: {len(image_paths)}, Res: {width}x{height}")
+    print(f"  [Mode: FULL] Views: {len(image_paths)}, Res: {width}x{height}, Device: {device.type.upper()}")
 
     # Load and resize all 12 images
     imgs = []
@@ -36,13 +32,18 @@ def process_full_node(kf_dir, model, device, width, height):
     imgs_tensor = torch.from_numpy(np.stack(imgs)).permute(0, 3, 1, 2).float() / 255.0
     imgs_batch = imgs_tensor.unsqueeze(0).to(device)
 
-    # --- PyTorch 2.5 GPU Optimizations ---
-    with torch.no_grad():
-        # Force Flash Attention and Memory-Efficient kernels. Disable standard Math.
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
-            # Use Automatic Mixed Precision for speed and VRAM savings
-            with torch.amp.autocast('cuda'):
-                res = model(imgs_batch)
+    # --- Inference ---
+    # We use inference_mode() which is even stricter on memory savings than no_grad()
+    with torch.inference_mode():
+        if device.type == 'cuda':
+            # PyTorch 2.5+ GPU Optimizations
+            # Note: sdpa_kernel replaces sdp_kernel to clear your deprecation warning
+            with torch.nn.attention.sdpa_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                with torch.amp.autocast('cuda'):
+                    res = model(imgs_batch)
+        else:
+            # CPU Execution (Standard Float32, no autocast)
+            res = model(imgs_batch)
 
     # --- Filtering Logic ---
     conf_mask = torch.sigmoid(res['conf'][0, ..., 0]) > 0.1
@@ -56,8 +57,8 @@ def process_full_node(kf_dir, model, device, width, height):
         
     return pts, cols, poses
 
-def run_pipeline(input_dir, output_dir, width, height):
-    device = torch.device('cuda')
+def run_pipeline(input_dir, output_dir, width, height, compute_device):
+    device = torch.device(compute_device)
     print(f"Loading Pi3X model to {device}...")
     model = Pi3X.from_pretrained("yyfz233/Pi3X").to(device).eval()
     
@@ -68,16 +69,15 @@ def run_pipeline(input_dir, output_dir, width, height):
         kf_name = os.path.basename(kf_dir)
         print(f"\nProcessing {kf_name}...")
         
-        torch.cuda.synchronize()
+        if device.type == 'cuda': torch.cuda.synchronize()
         start = time.time()
         
         pts, cols, poses = process_full_node(kf_dir, model, device, width, height)
         if pts is None: continue
         
-        torch.cuda.synchronize()
+        if device.type == 'cuda': torch.cuda.synchronize()
         print(f"⏱️ Time: {time.time()-start:.2f}s | Valid Points: {len(pts)}")
         
-        # Save as a single cohesive node (no more chunks)
         out_file = os.path.join(output_dir, f"{kf_name}_reconstruction.npz")
         np.savez_compressed(out_file, points=pts, colors=cols, poses=poses)
 
@@ -86,10 +86,14 @@ if __name__ == '__main__':
     parser.add_argument("--input_dir", type=str, default="output/keyframes")
     parser.add_argument("--output_dir", type=str, default="output/pcd_nodes")
     
-    # 448x336 is the safest high-res starting point for 8GB GPUs using Flash Attention
-    parser.add_argument("--width", type=int, default=448, help="Must be a multiple of 14")
-    parser.add_argument("--height", type=int, default=336, help="Must be a multiple of 14")
+    # Resolution arguments
+    parser.add_argument("--width", type=int, default=336, help="Must be a multiple of 14")
+    parser.add_argument("--height", type=int, default=224, help="Must be a multiple of 14")
+    
+    # Device selection
+    parser.add_argument("--device", type=str, choices=['cuda', 'cpu'], default='cuda', 
+                        help="Choose 'cuda' for speed or 'cpu' for high-resolution stability.")
     
     args = parser.parse_args()
     
-    run_pipeline(args.input_dir, args.output_dir, args.width, args.height)
+    run_pipeline(args.input_dir, args.output_dir, args.width, args.height, args.device)
