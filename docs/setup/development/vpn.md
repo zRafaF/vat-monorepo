@@ -40,3 +40,8 @@ On my network I have the following devices:
 | `caramelo`       | My laptop  | `100.87.118.34` |
 | `ubuntu-unitree-go2`       | The robot | `100.106.128.63` |
 | `lab-dell-g16-7630`    | Laptop server I'm using for testing | `100.125.156.19` |
+
+
+```bash
+ssh unitree@ubuntu-unitree-go2
+```

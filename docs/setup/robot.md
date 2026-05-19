@@ -98,3 +98,39 @@ docker logs -f zenoh_bridge
     
     The current **Humble Docker + Python Bridge** was chosen because it successfully bypassed these discovery issues. Since it utilizes the standard `rclpy` library, it maintains native compatibility with the robot's ROS graph while still leveraging Zenoh for long-distance transport.
 
+## RGB-D Camera Setup
+
+To start the RGB-D camera, you can run the following command on the robot:
+
+```bash
+roslaunch realsense2_camera rs_camera.launch
+```
+
+## Known Issues
+
+For some reason on our unity of the go2 we were getting the following error when trying to first use ROS.
+
+```
+1779225848.796323 [0]       ros2: eth1: does not match an available interface.
+[ERROR] [1779225848.796435099] [rmw_cyclonedds_cpp]: rmw_create_node: failed to create domain, error Error
+
+>>> [rcutils|error_handling.c:108] rcutils_set_error_state()
+This error state is being overwritten:
+
+  'error not set, at /tmp/binarydeb/ros-foxy-rcl-1.1.14/src/rcl/node.c:276'
+
+with this new error message:
+
+  'rcl node's rmw handle is invalid, at /tmp/binarydeb/ros-foxy-rcl-1.1.14/src/rcl/node.c:428'
+
+rcutils_reset_error() should be called after error handling to avoid this.
+<<<
+[ERROR] [1779225848.796612987] [rcl]: Failed to fini publisher for node: 1
+Unknown error creating node: rcl node's rmw handle is invalid, at /tmp/binarydeb/ros-foxy-rcl-1.1.14/src/rcl/node.c:428
+```
+
+I didn't try to fix it just used a workaround by running the follwing command before running any ROS commands:
+
+```bash
+export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>'
+```
