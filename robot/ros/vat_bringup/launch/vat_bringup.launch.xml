@@ -1,0 +1,27 @@
+<launch>
+  <!-- ========================================================
+       VAT Robot ROS2 Bringup  (ROS Foxy, Jetson)
+       ========================================================
+       Starts the ROS2-side of the stack:
+         1. Insta360 camera driver (C++) → /dual_fisheye/image/compressed
+         2. H.264 decoder (C++)          → /dual_fisheye/image
+         3. Equirectangular node (GPU)   → /equirectangular/image
+         [optional] IMU Madgwick filter
+
+       Frame decimation + Zenoh bridging run separately in Docker:
+         cd robot/docker && docker compose up -d --build
+
+       Quick start:
+         source /opt/ros/foxy/setup.bash
+         source ~/vat_ws/install/setup.bash
+         ros2 launch vat_bringup vat_bringup.launch.xml
+       ======================================================== -->
+
+  <arg name="imu_filter" default="true"/>
+
+  <include file="$(find-pkg-share insta360_ros_driver)/launch/bringup.launch.xml">
+    <arg name="equirectangular" value="true"/>
+    <arg name="imu_filter"      value="$(var imu_filter)"/>
+  </include>
+
+</launch>

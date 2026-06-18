@@ -1,0 +1,6 @@
+eclipse-zenoh
+rerun-sdk
+numpy
+rosbags
+open3d
+scipy

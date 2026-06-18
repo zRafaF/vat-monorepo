@@ -1,0 +1,28 @@
+[project]
+name = "vat"
+version = "0.1.0"
+description = "Volumetric Asynchronous Teleoperation — monorepo workspace root"
+requires-python = ">=3.10"
+# The root is virtual: it carries no runtime deps of its own.
+# All actual packages live in server/ and client/.
+dependencies = []
+
+[tool.uv]
+# uv workspace — members are resolved together under a single lockfile.
+# Each member has its own pyproject.toml and can be synced independently:
+#   uv sync --package vat-server
+#   uv sync --package vat-client
+package = false
+
+[tool.uv.workspace]
+members = ["server", "client"]
+
+# ── Documentation dev-deps (shared across the workspace) ──────────────────────
+[dependency-groups]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocs-material-extensions>=1.3",
+    "mkdocs-minify-plugin>=0.8",
+    "mkdocs-macros-plugin>=1.5",
+    "Pygments==2.20.0",
+]

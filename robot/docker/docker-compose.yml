@@ -1,0 +1,18 @@
+services:
+  vat-robot-docker:
+    build: .
+    restart: unless-stopped
+    network_mode: host   # required for ROS2 DDS multicast discovery
+    ipc: host
+    environment:
+      ROBOT_NAME:    "${ROBOT_NAME:-go2}"
+      ZENOH_CONNECT: "${ZENOH_CONNECT:-tcp/127.0.0.1:7447}"
+      LOG_LEVEL:     "${LOG_LEVEL:-INFO}"
+      THROTTLE_FPS:  "${THROTTLE_FPS:-3.0}"
+      WINDOW_SIZE:   "${WINDOW_SIZE:-5}"
+      JPEG_QUALITY:  "${JPEG_QUALITY:-85}"
+      CAMERA_FPS:    "${CAMERA_FPS:-30.0}"
+    logging:
+      driver: journald
+      options:
+        tag: "vat-docker"

@@ -1,0 +1,37 @@
+<launch>
+  <!-- ========================================================
+       VAT Master Robot Bringup
+       ========================================================
+       Starts the ROS2-side of the VAT robot stack (ROS Foxy, Python 3.8):
+         1. Insta360 camera driver   (H.264 → /dual_fisheye/image/compressed)
+         2. H.264 decoder node       (/dual_fisheye/image/compressed → /dual_fisheye/image)
+         3. Equirectangular node     (/dual_fisheye/image → /equirectangular/image, GPU)
+         [optional] IMU filter
+
+       The DynamicZenohBridge + FrameDecimator run separately in Docker
+       (robot/bridge_node/) because they require Python 3.10+ for Zenoh.
+       Start that container via:
+         docker compose -f robot/bridge_node/docker-compose.yml up -d
+
+       Quick-start (on Jetson, ROS2 side only):
+         source /opt/ros/foxy/setup.bash
+         source ~/vat_ws/install/setup.bash
+         ros2 launch vat_bringup vat_bringup.launch.xml
+       ======================================================== -->
+
+  <!-- ── Camera stack arguments ─────────────────────────────────────────── -->
+  <arg name="imu_filter" default="true"
+       description="Run Madgwick IMU filter node"/>
+
+  <!-- ── 1–3. Insta360 driver + decoder + equirectangular ─────────────── -->
+  <!-- Publishes: /dual_fisheye/image/compressed, /dual_fisheye/image,
+                  /equirectangular/image, /imu/data_raw -->
+  <include file="$(find-pkg-share insta360_ros_driver)/launch/bringup.launch.xml">
+    <arg name="equirectangular" value="true"/>
+    <arg name="imu_filter"      value="$(var imu_filter)"/>
+  </include>
+
+  <!-- NOTE: Frame decimation + Zenoh bridging is handled by the Docker container.
+             DO NOT add a frame_publisher node here — that package is deprecated. -->
+
+</launch>

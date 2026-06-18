@@ -1,0 +1,48 @@
+# VAT Robot — ROS2 stack systemd service
+# ============================================================
+# Starts the ROS2 camera stack on boot (Jetson, ROS Foxy).
+# The Docker container (bridge + decimator) is managed separately:
+#   cd ~/vat/robot/docker && docker compose up -d
+# Or add a second service unit that runs docker compose.
+#
+# Install
+# -------
+#   sudo cp robot/systemd/vat-robot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable vat-robot.service
+#   sudo systemctl start  vat-robot.service
+#
+# Logs
+#   sudo journalctl -fu vat-robot
+# ============================================================
+
+[Unit]
+Description=VAT Robot — ROS2 camera stack (Insta360 + equirectangular)
+After=network-online.target systemd-udev-settle.service
+Wants=network-online.target systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=jetson
+Group=jetson
+
+Environment="HOME=/home/jetson"
+Environment="VAT_WS=/home/jetson/vat_ws"
+Environment="ROS_DOMAIN_ID=42"
+
+ExecStart=/bin/bash -c '\
+    source /opt/ros/foxy/setup.bash && \
+    source ${VAT_WS}/install/setup.bash && \
+    exec ros2 launch vat_bringup vat_bringup.launch.xml'
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=60s
+TimeoutStopSec=15s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vat-robot
+
+[Install]
+WantedBy=multi-user.target
