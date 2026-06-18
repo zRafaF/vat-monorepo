@@ -116,10 +116,14 @@ vat-monorepo/
 ├── common/
 │   └── vat_protocol.py         ← shared wire formats (robot/server/client import it)
 │
-├── server/
-│   ├── pyproject.toml          ← vat-server package (zenoh, rosbags, prism-vggt)
-│   ├── mapping_server.py         ← PRISM server + VGGT pose-correction publisher
-│   └── PRISM-VGGT/             ← git submodule  (git submodule add ... — see below)
+├── server/                     ← multiple microservices, each its own uv project
+│   ├── mapping/                ← vat-mapping (workspace member; heavy CUDA deps)
+│   │   ├── pyproject.toml
+│   │   ├── mapping_server.py   ← PRISM mapping + VGGT pose-correction publisher
+│   │   └── PRISM-VGGT/         ← git submodule (git submodule add … — see below)
+│   └── router/                 ← vat-router (ISOLATED env, excluded from workspace)
+│       ├── pyproject.toml      ← only eclipse-zenoh — no clash with the mapper
+│       └── router.py           ← pure-Python Zenoh router (no zenohd binary)
 │
 ├── client/
 │   ├── pyproject.toml          ← vat-client package (zenoh, rerun-sdk)
@@ -158,7 +162,7 @@ vat-monorepo/
     `.gitmodules` requires a manual `git` command. Run this once from the repo root:
 
 ```bash
-git submodule add https://github.com/zRafaF/PRISM-VGGT server/PRISM-VGGT
+git submodule add https://github.com/zRafaF/PRISM-VGGT server/mapping/PRISM-VGGT
 git commit -m "chore: add PRISM-VGGT submodule"
 ```
 
@@ -176,8 +180,8 @@ curl -Lsf https://astral.sh/uv/install.sh | sh
 # From the repo root — resolves the full workspace lockfile
 uv sync
 
-# Server only (on the GPU machine)
-uv sync --package vat-server
+# Mapping server only (on the GPU machine)
+uv sync --package vat-mapping
 
 # Activate venv
 source .venv/bin/activate
@@ -253,23 +257,25 @@ independently if one dies, so a transient fault doesn't take the stack down.
 
 ## Running the POC
 
-### Start the Zenoh router (cloud server)
+### Start the Zenoh router microservice (cloud server)
+
+A pure-Python router node in its own isolated env — **no `zenohd` binary, no
+Docker**.  It opens a `router`-mode session that listens and relays traffic for
+every robot/server/client (including the `dog → router → client` pose relay):
 
 ```bash
-# Install zenoh-router if not present
-cargo install zenohd          # or: pip install eclipse-zenoh[router]
-
-zenohd -l tcp/0.0.0.0:7447
+cd server/router && uv sync && uv run python router.py     # or: make router
+# listens on tcp/0.0.0.0:7447 — override with ZENOH_LISTEN, mesh with ZENOH_CONNECT
 ```
 
-### Start the PRISM server (cloud / dev machine)
+### Start the mapping server (cloud / dev machine)
 
 ```bash
 source .venv/bin/activate
 ZENOH_ROUTER=tcp/127.0.0.1:7447 \
 ROBOT_NAME=go2 \
 CAMERA_HEIGHT=0.50 \
-python server/mapping_server.py
+python server/mapping/mapping_server.py
 ```
 
 Key env vars for the server:
@@ -278,7 +284,7 @@ Key env vars for the server:
 |---|---|---|
 | `ZENOH_ROUTER` | `tcp/127.0.0.1:7447` | Zenoh router endpoint |
 | `ROBOT_NAME` | `go2` | Zenoh key prefix |
-| `WEIGHTS_PATH` | `server/PRISM-VGGT/checkpoints/model.pt` | PanoVGGT model weights |
+| `WEIGHTS_PATH` | `server/mapping/PRISM-VGGT/checkpoints/model.pt` | PanoVGGT model weights |
 | `CAMERA_HEIGHT` | `0.50` | Fixed camera height (m) for POC metric scale |
 | `WINDOW_SIZE` | `10` | Frames per PRISM sub-window |
 | `OVERLAP` | `3` | Overlapping frames between windows |
@@ -451,7 +457,7 @@ configured constant and never crashes — verify the layout against your firmwar
 
 ---
 
-## Pose & state estimation (POC) {#pose-state-estimation-poc}
+## Pose & state estimation (POC)
 
 Per the [system architecture](architecture.md#pose-state-estimation), **the robot
 owns its global pose** — the server only produces a slow correction and routes
@@ -461,10 +467,10 @@ the result. This section describes how that is realised (and faked) in the POC.
 
 | Component | Where | Role |
 |---|---|---|
-| `mapping_server.py` | cloud | Derives the latest global keyframe pose from the PRISM trajectory and publishes it on `server/prism/pose_correction` (DOWN to the dog). |
+| `server/mapping/mapping_server.py` | cloud | Derives the latest **camera** pose from the PRISM trajectory and publishes it on `server/prism/pose_correction` (DOWN to the dog). |
 | `dynamic_bridge.py` | robot (docker) | Bridges ROS odometry/IMU (`SportModeState`, etc.) to Zenoh as CDR. **No computation.** |
 | `pose_fuser.py` | robot (docker) | **NEW, placeholder.** Subscribes to the correction + bridged odometry, fuses them, publishes the authoritative pose on `go2/prism/pose` (UP). |
-| `zenohd` | cloud | Relays `go2/prism/pose` straight through to the client. |
+| `server/router/router.py` | cloud | Pure-Python Zenoh router; relays `go2/prism/pose` straight through to the client. |
 | `prism_rerun_viewer.py` | client | Subscribes to `go2/prism/pose` and dead-reckons the avatar between samples. |
 
 ### Why the fuser is pure Python in `robot/docker/`, not a ROS node
@@ -586,8 +592,9 @@ This is resolved once the true online engine mode is implemented.
 
 - [x] uv workspace root + `server/` + `client/` packages
 - [x] `common/vat_protocol.py` — shared wire formats (robot/server/client)
-- [x] PRISM-VGGT as git submodule (`server/PRISM-VGGT`)  — **manual** `git submodule add`
-- [x] `server/mapping_server.py` — frame subscriber → PRISM engine → pcd + pose-correction publisher
+- [x] PRISM-VGGT as git submodule (`server/mapping/PRISM-VGGT`)  — **manual** `git submodule add`
+- [x] `server/mapping/mapping_server.py` — frame subscriber → PRISM engine → pcd + pose-correction publisher
+- [x] `server/router/router.py` — standalone pure-Python Zenoh router (isolated uv env)
 - [x] `client/prism_rerun_viewer.py` — pcd + pose subscriber → Rerun, with `PosePredictor` + robot block
 - [x] `robot/docker/frame_decimator.py` — best-of-window sharpest + camera-height stamp
 - [x] `robot/docker/kinematics.py` — camera↔base transform + camera height + body-state tracker
@@ -630,7 +637,7 @@ This is resolved once the true online engine mode is implemented.
 → Lower `WINDOW_SIZE` (try 6) or `FACE_SIZE` (try 384).
 
 **`prism-vggt` import error on server**  
-→ Run `git submodule update --init server/PRISM-VGGT` then `uv sync --package vat-server`.
+→ Run `git submodule update --init server/mapping/PRISM-VGGT` then `uv sync --package vat-mapping`.
 
 **Robot block doesn't move / no pose in viewer**  
 → `zenoh sub --key 'go2/prism/pose'` to confirm `pose_fuser.py` publishes.  

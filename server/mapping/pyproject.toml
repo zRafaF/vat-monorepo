@@ -1,14 +1,14 @@
 [project]
-name = "vat-server"
+name = "vat-mapping"
 version = "0.1.0"
-description = "VAT server — runs the PRISM-VGGT mapping pipeline and streams point cloud deltas"
+description = "VAT mapping server — runs the PRISM-VGGT pipeline and streams point cloud deltas + pose corrections"
 requires-python = ">=3.10"
 dependencies = [
     # Transport
     "eclipse-zenoh>=1.0",
-    # Serialization — CDR for sport_mode_state body height (no protobuf needed)
+    # Serialization — CDR (no protobuf needed)
     "rosbags>=0.10",
-    # PRISM-VGGT library (local submodule — installed as editable, see tool.uv.sources)
+    # PRISM-VGGT library (local submodule — installed editable, see tool.uv.sources)
     "prism-vggt",
     # Image decoding (JPEG → numpy)
     "numpy>=1.24",
@@ -16,21 +16,16 @@ dependencies = [
     # 3D / point cloud helpers
     "open3d>=0.18",
     # NOTE: torch + nvblox_torch are pulled in transitively by prism-vggt.
-    # If you need to force a specific CUDA build, pin them here and add the
-    # pytorch index below.  Example for CUDA 12.1:
-    #   "torch>=2.3.0",
-    # and uncomment the [[tool.uv.index]] block at the bottom.
+    # To force a CUDA build, pin torch here and add the pytorch index below.
 ]
 
 # ── PRISM-VGGT as a local editable path dep ───────────────────────────────────
-# The submodule lives at server/PRISM-VGGT/.  After cloning:
-#   git submodule update --init server/PRISM-VGGT
+# The submodule now lives at server/mapping/PRISM-VGGT.  After cloning:
+#   git submodule update --init server/mapping/PRISM-VGGT
 [tool.uv.sources]
 prism-vggt = { path = "PRISM-VGGT", editable = true }
 
 # ── PyTorch CUDA index (uncomment + adjust for your CUDA version) ─────────────
-# uv will pin torch from this index and not mix in the CPU wheels from PyPI.
-#
 # [[tool.uv.index]]
 # name = "pytorch-cu121"
 # url = "https://download.pytorch.org/whl/cu121"
@@ -44,5 +39,6 @@ prism-vggt = { path = "PRISM-VGGT", editable = true }
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Single-module application — ship just the server script.
 [tool.hatch.build.targets.wheel]
-packages = ["server"]
+only-include = ["mapping_server.py"]

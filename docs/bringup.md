@@ -24,18 +24,21 @@ export SERVER_IP=<SERVER_IP>
 export ROBOT_NAME=go2
 ```
 
-Install deps once: server `uv sync --package vat-server`; client (incl. the
-bring-up tools) `uv sync --package vat-client`; robot builds the Docker image.
+Install deps once: mapping server `uv sync --package vat-mapping`; router (its
+own isolated env) `cd server/router && uv sync`; client (incl. the bring-up
+tools) `uv sync --package vat-client`; robot builds the Docker image.
 
 ---
 
 ## Stage 0 — Transport is alive
 
-**☁️ SERVER — start the Zenoh router** (everything connects to it):
+**☁️ SERVER — start the Zenoh router microservice** (everything connects to it).
+This is a pure-Python router node in its own isolated env — no `zenohd` binary,
+no Docker:
 
 ```bash
-zenohd -l tcp/0.0.0.0:7447
-# or: pip install eclipse-zenoh && python -m zenoh.router  (if no zenohd binary)
+cd server/router && uv sync && uv run python router.py      # or: make router
+# listens on tcp/0.0.0.0:7447 — override with ZENOH_LISTEN
 ```
 
 **🤖 ROBOT — start the camera stack + container:**
@@ -109,7 +112,7 @@ the embedded defs in `robot/docker/kinematics.py`.
 ```bash
 source .venv/bin/activate
 ZENOH_ROUTER=tcp/127.0.0.1:7447 ROBOT_NAME=go2 \
-  python server/mapping_server.py
+  python server/mapping/mapping_server.py
 ```
 
 **💻 CLIENT — watch the pose path (no heavy cloud yet):**
@@ -145,8 +148,8 @@ moves smoothly (predicted between pose samples), green/amber by fix quality.
 
 | Machine | Command | Stage |
 |---|---|---|
-| ☁️ SERVER | `zenohd -l tcp/0.0.0.0:7447` | 0+ |
-| ☁️ SERVER | `python server/mapping_server.py` | 3+ |
+| ☁️ SERVER | `cd server/router && uv run python router.py` (or `make router`) | 0+ |
+| ☁️ SERVER | `python server/mapping/mapping_server.py` | 3+ |
 | 🤖 ROBOT | `ros2 launch vat_bringup vat_bringup.launch.xml` | 0+ |
 | 🤖 ROBOT | `./robot/docker/run.sh $SERVER_IP` | 0+ |
 | 💻 CLIENT | `python tools/check_link.py` | 0 |

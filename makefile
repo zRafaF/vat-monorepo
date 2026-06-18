@@ -13,7 +13,7 @@ else
 endif
 
 .PHONY: all build clean \
-        sync sync-server sync-client sync-docs \
+        sync sync-mapping sync-client sync-router router sync-docs \
         docs docs-serve
 
 all: build
@@ -23,13 +23,21 @@ all: build
 sync:
 	uv sync --all-groups
 
-# Install only the server package (heavy CUDA deps — run on the GPU machine)
-sync-server:
-	uv sync --package vat-server
+# Install only the mapping server (heavy CUDA deps — run on the GPU machine)
+sync-mapping:
+	uv sync --package vat-mapping
 
-# Install only the client package (lightweight — Rerun viewer)
+# Install only the client package (lightweight — Rerun viewer + bring-up tools)
 sync-client:
 	uv sync --package vat-client
+
+# Install the standalone Zenoh router microservice (isolated env)
+sync-router:
+	cd server/router && uv sync
+
+# Run the Zenoh router (server host)
+router: sync-router
+	cd server/router && uv run python router.py
 
 # Install docs dev-deps and serve locally
 sync-docs:

@@ -55,7 +55,7 @@ The cloud is the heavy-lifter for global environment context — **but it is not
 * **PRISM Integration:** Receives sensory data from the robot and builds the dense, global point cloud map.
 * **Delta Streaming:** Employs a robust delta streaming architecture to send only the updated portions of the point cloud to the client.
 * **Low-Frequency Global Pose (VGGT):** PRISM-VGGT produces a metrically-scaled camera trajectory as it integrates each sub-window. The **latest keyframe pose in the global map frame** is the cloud's localization product. It is accurate and drift-free *relative to the map*, but slow (it lands once per sub-window, on the order of 0.3–3 Hz) and arrives ~2–4 s after capture. The cloud **sends this pose *down* to the robot** as a correction — it does not forward it to the client directly.
-* **Pose Router:** The robot publishes its fused, authoritative pose stream back up. The cloud (specifically the Zenoh router process running on the cloud machine) **relays** that stream straight through to the client. The cloud does no fusion on the return path — it is a router for this data. This is the `server (pose) → dog → server (router) → client` path.
+* **Pose Router:** The robot publishes its fused, authoritative pose stream back up. The cloud (specifically the Zenoh router process running on the cloud machine — a pure-Python `vat-router` microservice in `server/router/`) **relays** that stream straight through to the client. The cloud does no fusion on the return path — it is a router for this data. This is the `server (pose) → dog → server (router) → client` path.
 * **Global Pathfinding (future):** Computes the Euclidean Signed Distance Field (ESDF) and generates a global path. It streams a sequence of sparse waypoints down to the robot for navigation.
 
 > **Why does the global pose go *down* to the robot instead of straight to the client?**
@@ -74,7 +74,7 @@ The robot focuses on immediate survival, data collection, and **owning its own g
 
 ---
 
-## Pose & State Estimation {#pose-state-estimation}
+## Pose & State Estimation
 
 This is the core of the architecture change: **the robot, not the cloud, is authoritative for the robot's global pose.** The pose travels in a loop:
 

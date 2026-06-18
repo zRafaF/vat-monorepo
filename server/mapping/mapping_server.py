@@ -45,8 +45,9 @@ import cv2
 import numpy as np
 import zenoh
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "common"))
+# repo root is three levels up: server/mapping/mapping_server.py → repo/common
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "common"))
 import vat_protocol as proto  # noqa: E402
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -69,7 +70,7 @@ ZENOH_ROUTER  = os.environ.get("ZENOH_ROUTER",  "tcp/127.0.0.1:7447")
 ROBOT_NAME    = os.environ.get("ROBOT_NAME",    "go2")
 SERVER_PREFIX = os.environ.get("SERVER_PREFIX", "server/prism")
 
-WEIGHTS_PATH  = os.environ.get("WEIGHTS_PATH", "server/PRISM-VGGT/checkpoints/model.pt")
+WEIGHTS_PATH  = os.environ.get("WEIGHTS_PATH", "server/mapping/PRISM-VGGT/checkpoints/model.pt")
 VOXEL_SIZE    = float(os.environ.get("VOXEL_SIZE", "0.02"))
 MAX_DEPTH     = float(os.environ.get("MAX_DEPTH",  "4.5"))
 FACE_SIZE     = int(os.environ.get("FACE_SIZE",    "512"))

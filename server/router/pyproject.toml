@@ -1,0 +1,17 @@
+[project]
+name = "vat-router"
+version = "0.1.0"
+description = "VAT Zenoh router microservice — a pure-Python router node (no zenohd binary, no Docker)"
+# Deliberately a STANDALONE, isolated uv project (excluded from the root
+# workspace) so its single light dependency never clashes with the mapping
+# server's heavy CUDA/torch stack.  Sync it on its own:
+#     cd server/router && uv sync && uv run python router.py
+requires-python = ">=3.9"
+dependencies = [
+    "eclipse-zenoh>=1.0",
+]
+
+[tool.uv]
+# Virtual project: install the dependency into this dir's own .venv, but don't
+# try to build/package router.py — it's just run as a script.
+package = false
