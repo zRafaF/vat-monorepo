@@ -2,7 +2,7 @@
 name = "vat"
 version = "0.1.0"
 description = "Volumetric Asynchronous Teleoperation — monorepo workspace root"
-requires-python = ">=3.10"
+requires-python = "==3.12.*"
 # The root is virtual: it carries no runtime deps of its own.
 # All actual packages live in server/ and client/.
 dependencies = []

@@ -2,6 +2,14 @@
 
 End-to-end live point cloud from the Insta360 on the Go2 robot → PRISM-VGGT mapping server → Rerun 3D viewer on any machine.
 
+This POC also carries the **robot pose** end-to-end. Per the [system architecture](architecture.md#pose-state-estimation), the robot — not the server — is authoritative for its global pose. The data path is:
+
+```
+server (VGGT pose) ──► dog (state fusion) ──► server (Zenoh router) ──► client (prediction)
+```
+
+The server computes a slow, drift-free VGGT pose and sends it **down** to the dog; the dog fuses it with fast onboard odometry into an authoritative pose (with velocity + rotation), and sends it **up**; the server's Zenoh router relays it to the client, which dead-reckons between samples like a multiplayer game. For the POC the fuser is a **placeholder** (see [Pose & state estimation (POC)](#pose-state-estimation-poc)) — the goal is to lock in the data flow and message contract, not to ship a production EKF.
+
 ---
 
 ## Architecture
@@ -56,11 +64,46 @@ End-to-end live point cloud from the Insta360 on the Go2 robot → PRISM-VGGT ma
 │    ├─ Subscribe  server/prism/pcd_delta                                    │
 │    ├─ Subscribe  server/prism/pcd_snapshot                                 │
 │    ├─ Subscribe  server/prism/trajectory                                   │
+│    ├─ Subscribe  go2/prism/pose          (authoritative robot pose)        │
 │    ├─ LocalCloud (versioned block accumulator)                             │
-│    └─ rr.Points3D → Rerun 3D viewer                                        │
+│    ├─ PosePredictor (dead-reckon between samples)                          │
+│    └─ rr.Points3D + rr.Transform3D → Rerun 3D viewer                       │
 │                                                                            │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Pose data path (`server → dog → server router → client`)
+
+The point cloud and the pose travel on separate paths. The cloud owns the *map*; the **robot owns its *pose***. The VGGT pose is sent down to the dog, fused with fast odometry, and the authoritative result is sent back up and relayed to the client.
+
+```
+┌──────────────────────────── Cloud / Dev Machine ──────────────────────────┐
+│  prism_server.py                                                           │
+│    └─ from PRISM trajectory → latest global keyframe pose                  │
+│         │  publish (low-freq, ~0.3–3 Hz)                                   │
+│         ▼                                                                  │
+│       server/prism/pose_correction   (sent DOWN to the dog)               │
+│                                                                            │
+│   zenohd router  ◄── go2/prism/pose ──  relays straight through to client │
+└──────────┬─────────────────────────────────────────────▲──────────┬───────┘
+           │ (DOWN: correction)              (UP: relayed)│          │ (UP)
+           ▼                                              │          │
+┌──── Jetson (robot, robot/docker/) ─────────────────────┼──────────┘
+│  pose_fuser.py   (PLACEHOLDER, pure-Python, no ROS node)│
+│    ├─ sub  server/prism/pose_correction  (slow, drift-free global pose)    │
+│    ├─ sub  go2/rt/<odom|imu>  (via bridge — fast leg odom + IMU ~50–200 Hz)│
+│    ├─ EKF / complementary fuse (NumPy / filterpy)                          │
+│    └─ pub  go2/prism/pose   (authoritative: pos + quat + v + ω + ts) ──────┘
+└────────────────────────────────────────────────────────────────────────────┘
+                  │
+                  ▼   (relayed by the cloud's zenohd router)
+┌──── Client ────────────────────────────────────────────────────────────────┐
+│  prism_rerun_viewer.py → PosePredictor: dead-reckons the avatar between     │
+│  samples using the linear + angular velocity vectors (multiplayer netcode)  │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+The bridge (`dynamic_bridge.py`) does **no computation** — it merely exposes the ROS odometry/IMU topics on Zenoh as CDR. `pose_fuser.py` is "just another Zenoh client" that subscribes to those bridged inputs plus the cloud's correction, runs the fuse in NumPy, and publishes the authoritative pose. No extra ROS node is required. See [Pose & state estimation (POC)](#pose-state-estimation-poc).
 
 ---
 
@@ -81,6 +124,10 @@ vat-monorepo/
 │
 ├── robot/
 │   ├── insta360_ros_driver/    ← DO NOT MODIFY (sensitive hardware driver)
+│   ├── docker/                 ← container running alongside the ROS stack
+│   │   ├── dynamic_bridge.py   ← ROS2 → Zenoh bridge (CDR)  — no compute
+│   │   ├── frame_decimator.py  ← sharpest-frame selector → camera frames
+│   │   └── pose_fuser.py       ← NEW (PLACEHOLDER) pure-Python state fuser
 │   ├── bridge_node/            ← DO NOT MODIFY (DynamicZenohBridge)
 │   ├── frame_publisher/        ← NEW ROS2 package (throttle + JPEG compress)
 │   │   ├── frame_publisher/node.py
@@ -276,6 +323,44 @@ All values big-endian.
 | 0 | 4 | `int32` | `n` — number of poses |
 | 4 | n×12 | `float32[n,3]` | Camera positions (XYZ) |
 
+### Authoritative robot pose  (`go2/prism/pose`)
+
+Published **by the robot** (`pose_fuser.py`), relayed by the cloud router to the
+client. High-rate (target 50–200 Hz; placeholder runs at the correction rate).
+Carries the full state the client needs to dead-reckon between samples. All
+values big-endian.
+
+| Offset | Bytes | Type | Field |
+|---|---|---|---|
+| 0 | 4 | `int32` | Magic = `0x504F5345` (`"POSE"`) |
+| 4 | 8 | `int64` | `timestamp_ns` — capture time of this state estimate |
+| 12 | 4 | `uint32` | `seq` — monotonic sequence number |
+| 16 | 12 | `float32[3]` | position XYZ (m, global map frame) |
+| 28 | 16 | `float32[4]` | orientation quaternion (x, y, z, w), map frame |
+| 44 | 12 | `float32[3]` | linear velocity XYZ (m/s, map frame) |
+| 56 | 12 | `float32[3]` | angular velocity XYZ (rad/s, body frame) |
+| 68 | 4 | `int32` | `fix_quality` — 0 = dead-reckon (odom only), 1 = VGGT-corrected |
+
+Total: **72 bytes**, fixed size. `linear`/`angular velocity` are what the client
+extrapolates with: `p(t) = p₀ + v·Δt`, `q(t) = q₀ ⊗ Δq(ω, Δt)`.
+
+### VGGT pose correction  (`server/prism/pose_correction`)
+
+Published **by the server**, sent **down** to the robot's `pose_fuser.py`. The
+latest drift-free global keyframe pose derived from the PRISM trajectory. Slow
+(~0.3–3 Hz, lands once per submap) and laggy (~2–4 s). No velocity — it is an
+anchor, not a motion source. All values big-endian.
+
+| Offset | Bytes | Type | Field |
+|---|---|---|---|
+| 0 | 4 | `int32` | Magic = `0x50434F52` (`"PCOR"`) |
+| 4 | 8 | `int64` | `timestamp_ns` — capture time of the keyframe this pose anchors |
+| 12 | 4 | `int32` | `map_version` — PRISM map version this pose belongs to |
+| 16 | 12 | `float32[3]` | position XYZ (m, global map frame) |
+| 28 | 16 | `float32[4]` | orientation quaternion (x, y, z, w), map frame |
+
+Total: **44 bytes**, fixed size.
+
 ### Live throttle config  (`go2/rt/prism/config/throttle_fps`)
 
 Plain UTF-8 float string, e.g. `"3.0"`. The `frame_publisher` node subscribes
@@ -303,6 +388,83 @@ The decision to do this on the **server** (not the robot node) is deliberate:
 When you wire this up, the `_on_sport_state()` callback in `prism_server.py`
 already handles CDR decoding of `SportModeState` and updates `_camera_height`
 automatically. Just ensure the bridge is forwarding `/{robot_name}/sport_mode_state`.
+
+---
+
+## Pose & state estimation (POC) {#pose-state-estimation-poc}
+
+Per the [system architecture](architecture.md#pose-state-estimation), **the robot
+owns its global pose** — the server only produces a slow correction and routes
+the result. This section describes how that is realised (and faked) in the POC.
+
+### Roles
+
+| Component | Where | Role |
+|---|---|---|
+| `prism_server.py` | cloud | Derives the latest global keyframe pose from the PRISM trajectory and publishes it on `server/prism/pose_correction` (DOWN to the dog). |
+| `dynamic_bridge.py` | robot (docker) | Bridges ROS odometry/IMU (`SportModeState`, etc.) to Zenoh as CDR. **No computation.** |
+| `pose_fuser.py` | robot (docker) | **NEW, placeholder.** Subscribes to the correction + bridged odometry, fuses them, publishes the authoritative pose on `go2/prism/pose` (UP). |
+| `zenohd` | cloud | Relays `go2/prism/pose` straight through to the client. |
+| `prism_rerun_viewer.py` | client | Subscribes to `go2/prism/pose` and dead-reckons the avatar between samples. |
+
+### Why the fuser is pure Python in `robot/docker/`, not a ROS node
+
+`fuse` (locusrobotics) and `robot_localization` are the mature ROS sensor-fusion
+stacks — but both are **ROS-native C++ frameworks**: they run as ROS nodes,
+are configured through ROS params/YAML + launch files, and are *not* usable as a
+standalone Python library. `fuse` in particular is a graph-based fixed-lag
+smoother on top of Ceres.
+
+We do **not** want another ROS node in the loop, and we are constrained to
+Python 3.8 inside ROS Foxy. The inputs the fuser needs are already on the Zenoh
+bus: `dynamic_bridge.py` exposes the ROS odometry/IMU as CDR, and the cloud
+publishes the VGGT correction over Zenoh. So the fuser is **just another Zenoh
+client** — a plain Python process in `robot/docker/` that subscribes to both,
+runs the filter in NumPy (optionally [`filterpy`](https://filterpy.readthedocs.io/),
+which is pure-Python and fine on 3.8), and publishes `go2/prism/pose`.
+
+> **Migration path:** if the placeholder EKF proves insufficient (graph
+> optimisation, landmark constraints, loop closure), swap the Python process for
+> a real `fuse`/`robot_localization` ROS node that publishes the *same*
+> `go2/prism/pose` message onto the *same* Zenoh key. The cloud router, the wire
+> format, and the client predictor are all unaffected by that swap — which is
+> the entire point of locking the contract now.
+
+### Placeholder `pose_fuser.py` behaviour (POC)
+
+The POC fuser is intentionally trivial — it exists to prove the data path, not
+to estimate well:
+
+1. Hold the last `pose_correction` (drift-free global anchor) from the server.
+2. On each high-rate odometry tick, integrate the odometry delta on top of that
+   anchor (a constant-velocity / complementary blend — *not* a real EKF).
+3. Fill `linear`/`angular velocity` straight from the odometry twist.
+4. Set `fix_quality = 1` for a short window after each correction, `0` once it is
+   dead-reckoning on odometry alone.
+5. Publish `go2/prism/pose` at the odometry rate.
+
+A real EKF replaces only steps 2–3; the contract (inputs, outputs, key, wire
+format) stays identical.
+
+### Client-side prediction (POC)
+
+`prism_rerun_viewer.py` adds a `PosePredictor`:
+
+- Keep a small ring buffer of recent poses.
+- Each render tick, extrapolate from the newest sample:
+  `p(t) = p₀ + v·Δt`, `q(t) = q₀ ⊗ Δq(ω, Δt)`.
+- On a fresh pose, blend toward it over a few frames (slerp for rotation) instead
+  of snapping.
+- If no pose arrives within a staleness horizon, decay velocity toward zero so a
+  disconnected robot coasts to a stop.
+
+In Rerun this is logged as an `rr.Transform3D` on the robot-avatar entity, updated
+every render tick from the predictor rather than only when a pose arrives.
+
+> **POC honesty:** the placeholder fuser will produce a pose that mostly tracks
+> raw odometry (so it will drift), with periodic jumps when a VGGT correction
+> lands. That is expected and acceptable for the POC — the deliverable is the
+> *data flow and message contract*, not localisation accuracy.
 
 ---
 
@@ -373,14 +535,23 @@ This is resolved once the true online engine mode is implemented.
 - [ ] Tune `WINDOW_SIZE` and `OVERLAP` for latency vs. map quality tradeoff
 - [ ] Verify JPEG quality 85 is sufficient for PRISM depth quality
 
+#### Pose path (POC — locks the contract, fusion is a placeholder)
+
+- [ ] `prism_server.py` — publish latest VGGT keyframe pose on `server/prism/pose_correction` (DOWN)
+- [ ] `robot/docker/pose_fuser.py` — placeholder pure-Python fuser → publish `go2/prism/pose` (UP)
+- [ ] `prism_rerun_viewer.py` — subscribe `go2/prism/pose`, add `PosePredictor` (dead-reckon + slerp), log `rr.Transform3D`
+- [ ] Verify the `server → dog → server router → client` path round-trips (pose visible in viewer, predicted between samples)
+
 ### Phase 2 (after POC)
 
 - [ ] Dynamic camera height from `SportModeState_.body_height` + mount offset
 - [ ] Extend `StreamingWindowEngine` with `add_frame()` / `step()` for true online mode
 - [ ] Proper per-block delta streaming (requires stable `version` across engine calls)
-- [ ] Unity VR client as git submodule in `client/unity/`
+- [ ] **Real state estimator** — replace placeholder `pose_fuser.py` with a proper EKF (NumPy/`filterpy`) or migrate to a `fuse`/`robot_localization` ROS node publishing the same `go2/prism/pose` contract
+- [ ] Wire real high-rate inputs into the fuser (leg odometry + IMU from the bridge); tune correction gating / outlier rejection
+- [ ] Unity VR client as git submodule in `client/unity/` (port `PosePredictor` to the Unity avatar)
 - [ ] ESDF-based global pathfinding (enable `compute_esdf = True`, wire to navigation)
-- [ ] Odometry tracking and loop closure
+- [ ] Loop closure feeding back into the VGGT correction
 - [ ] Dog 3D reconstruction from protobuf joint states
 
 ---
@@ -403,3 +574,11 @@ This is resolved once the true online engine mode is implemented.
 **Throttle Zenoh update has no effect**  
 → Confirm the `frame_publisher` node's `zenoh_router` param matches your router.  
 → Check the node log: `ros2 node log /frame_publisher`.
+
+**Robot avatar doesn't move (no pose in viewer)**  
+→ `zenoh sub --key 'go2/prism/pose'` to confirm `pose_fuser.py` is publishing.  
+→ If silent, check `pose_fuser.py` is receiving odometry: `zenoh sub --key 'go2/rt/sport_mode_state'`.  
+→ Confirm the server is sending corrections: `zenoh sub --key 'server/prism/pose_correction'`.
+
+**Avatar jitters or jumps periodically**  
+→ Expected with the placeholder fuser: it tracks raw odometry and snaps when a VGGT correction lands. The client `PosePredictor` smooths this; widen its blend window if jumps are visible. A real EKF removes the jumps.
