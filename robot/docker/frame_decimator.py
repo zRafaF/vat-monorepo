@@ -1,56 +1,53 @@
 """
 VAT — Frame Decimator
 ======================
-Runs inside the Docker container alongside dynamic_bridge.py.
+Runs inside the robot Docker container alongside ``dynamic_bridge.py`` and
+``pose_fuser.py``.  It is a plain Zenoh client (not a ROS node): the bridge
+already exposes the equirectangular image stream on Zenoh as CDR, so this
+process only needs to subscribe, pick the best frame, and re-publish.
 
-Subscribes (Zenoh, CDR sensor_msgs/Image from the bridge):
-  {ROBOT_NAME}/rt/equirectangular/image
+Pipeline
+--------
+  bridge → {robot}/rt/equirectangular/image  (CDR sensor_msgs/Image, ~30 Hz)
+        → [decimate to throttle_fps, pick sharpest in an N-frame window]
+        → {robot}/prism/camera/frame          (VAT frame: ts + camera_height + JPEG)
 
-Live config (Zenoh, plain float/int string):
-  {ROBOT_NAME}/rt/prism/config/throttle_fps   → output rate Hz   (default 3.0)
-  {ROBOT_NAME}/rt/prism/config/window_size    → sharpness window  (default 5, odd)
+Best-of-window (configurable)
+-----------------------------
+The camera runs at ~30 Hz but PRISM only wants a few Hz.  Naively grabbing every
+Nth frame risks picking a motion-blurred one.  Instead, for each output tick we
+look at a **window of N consecutive frames centred on the target frame** (e.g.
+3 or 5 frames — the target frame and its immediate neighbours) and emit the
+*sharpest* one.  N is ``window_size`` and is tunable live over Zenoh.
 
-Publishes (Zenoh, raw bytes — no ROS/CDR wrapper):
-  {ROBOT_NAME}/prism/camera/frame
+  window_size = 1  → no neighbours, emit the frame nearest the tick
+  window_size = 5  → the target frame ± 2 neighbours, sharpest wins
 
-Wire format
+Sharpness is the variance of the Laplacian (computed only for the N candidates,
+not every incoming frame, to save CPU on the Jetson).
+
+Camera height (metric scale for PRISM)
+--------------------------------------
+Each emitted frame carries the camera's height above the floor at capture time,
+computed by :mod:`kinematics` from the live body state (``SportModeState`` via
+the bridge) + the selfie-stick geometry.  The Go2-W can lie down / stand up, so
+this is not constant.  The server reads it straight from the frame message.
+
+Live config (Zenoh, plain string payloads)
+-------------------------------------------
+  {robot}/rt/prism/config/throttle_fps   float, output rate Hz   (default 3.0)
+  {robot}/rt/prism/config/window_size    int, sharpness window   (default 5, odd)
+
+Environment
 -----------
-  bytes 0–7   int64 little-endian — nanoseconds (from ROS header.stamp,
-                                    falls back to time.time_ns() if stamp is zero)
-  bytes 8–N   JPEG-encoded image
-
-Best-of-window algorithm
-------------------------
-Camera publishes at ~30 Hz; we want to emit at throttle_fps (e.g. 3 Hz).
-A naive approach grabs every Nth frame, which may be motion-blurred.
-
-Instead we use a temporally-centred sharpness window:
-  - Incoming frames are buffered with their timestamps.
-  - At each target tick T (spaced 1/throttle_fps apart), we collect all frames
-    in the range [T - half_window_dt, T + half_window_dt] where
-        half_window_dt = (window_size // 2) / CAMERA_FPS  seconds.
-  - From those candidates we pick the sharpest (max Laplacian variance).
-  - We delay emitting until at least one frame past T + half_window_dt arrives,
-    guaranteeing the lookahead frames are actually in the buffer.
-
-Sharpness metric: variance of the Laplacian of the grayscale image.
-High variance → lots of edges → sharp.  Low → blurry.
-
-Environment variables
----------------------
-  ROBOT_NAME      Zenoh key prefix           (default: go2)
-  ZENOH_CONNECT   Zenoh router endpoint       (default: tcp/127.0.0.1:7447)
-  THROTTLE_FPS    Initial output rate Hz      (default: 3.0)
-  WINDOW_SIZE     Initial sharpness window    (default: 5)
-  JPEG_QUALITY    JPEG compression quality    (default: 85)
-  CAMERA_FPS      Expected camera input rate  (default: 30.0)
-                  Only used to compute half_window_dt; does not need to be exact.
+  ROBOT_NAME, ZENOH_CONNECT, THROTTLE_FPS, WINDOW_SIZE, JPEG_QUALITY,
+  CAMERA_FPS, IMAGE_TOPIC, SHARPNESS_DOWNSCALE, STICK_OFFSET_{X,Y,Z},
+  FALLBACK_BODY_HEIGHT
 """
 
 from __future__ import annotations
 
 import os
-import struct
 import logging
 import threading
 import time
@@ -63,8 +60,11 @@ import numpy as np
 import zenoh
 from rosbags.typesys import Stores, get_typestore
 
+import vat_protocol as proto
+from kinematics import build_robot_model, RobotStateTracker
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="[%(asctime)s] [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -74,50 +74,57 @@ log = logging.getLogger("frame-decimator")
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-ROBOT_NAME    = os.environ.get("ROBOT_NAME",    "go2")
-ZENOH_CONNECT = os.environ.get("ZENOH_CONNECT", "tcp/127.0.0.1:7447")
-JPEG_QUALITY  = int(os.environ.get("JPEG_QUALITY",  "85"))
-CAMERA_FPS    = float(os.environ.get("CAMERA_FPS",  "30.0"))
+ROBOT_NAME     = os.environ.get("ROBOT_NAME",     "go2")
+ZENOH_CONNECT  = os.environ.get("ZENOH_CONNECT",  "tcp/127.0.0.1:7447")
+JPEG_QUALITY   = int(os.environ.get("JPEG_QUALITY",   "85"))
+CAMERA_FPS     = float(os.environ.get("CAMERA_FPS",   "30.0"))
+IMAGE_TOPIC    = os.environ.get("IMAGE_TOPIC",    "equirectangular/image")
+SHARP_DOWNSCALE = float(os.environ.get("SHARPNESS_DOWNSCALE", "0.5"))  # 0<..<=1
+FALLBACK_BODY_H = float(os.environ.get("FALLBACK_BODY_HEIGHT", "0.30"))
 
-# Mutable config (overridable live via Zenoh)
-_throttle_fps: float = float(os.environ.get("THROTTLE_FPS",  "3.0"))
-_window_size:  int   = int(os.environ.get("WINDOW_SIZE",     "5"))
+_KEYS = proto.keys(ROBOT_NAME)
+KEY_IMAGE        = f"{ROBOT_NAME}/rt/{IMAGE_TOPIC}"
+KEY_OUTPUT       = _KEYS["camera_frame"]
+KEY_FRAME_GET    = _KEYS["camera_frame_get"]
+KEY_THROTTLE_FPS = _KEYS["cfg_throttle_fps"]
+KEY_WINDOW_SIZE  = _KEYS["cfg_window_size"]
+
+# How many recently-emitted frames to keep buffered for on-demand retransmit.
+RETX_BUFFER = int(os.environ.get("RETX_BUFFER", "256"))
+
+# Mutable, live-tunable config
+_throttle_fps: float = float(os.environ.get("THROTTLE_FPS", "3.0"))
+_window_size:  int   = int(os.environ.get("WINDOW_SIZE", "5"))
 _config_lock = threading.Lock()
 
-KEY_IMAGE        = f"{ROBOT_NAME}/rt/equirectangular/image"
-KEY_OUTPUT       = f"{ROBOT_NAME}/prism/camera/frame"
-KEY_THROTTLE_FPS = f"{ROBOT_NAME}/rt/prism/config/throttle_fps"
-KEY_WINDOW_SIZE  = f"{ROBOT_NAME}/rt/prism/config/window_size"
+
+def _get_config():
+    with _config_lock:
+        return _throttle_fps, _window_size
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROS2 CDR deserialisation
+# ROS2 image CDR decode
 # ─────────────────────────────────────────────────────────────────────────────
 
 _typestore = get_typestore(Stores.ROS2_HUMBLE)
 
 
 def decode_ros_image(cdr_bytes: bytes) -> Optional[tuple[int, np.ndarray]]:
-    """
-    Deserialise a CDR sensor_msgs/Image payload.
-    Returns (timestamp_ns, bgr_array) or None on failure.
-    Timestamp from msg.header.stamp; falls back to time.time_ns().
-    """
+    """Deserialise a CDR sensor_msgs/Image → (timestamp_ns, bgr).  None on failure."""
     try:
         msg = _typestore.deserialize_cdr(cdr_bytes, "sensor_msgs/msg/Image")
     except Exception as e:
         log.warning(f"CDR decode failed: {e}")
         return None
 
-    sec     = getattr(msg.header.stamp, "sec",     0)
-    nanosec = getattr(msg.header.stamp, "nanosec", 0)
-    ts_ns   = int(sec) * 1_000_000_000 + int(nanosec)
-    if ts_ns == 0:
-        ts_ns = time.time_ns()
+    sec     = int(getattr(msg.header.stamp, "sec", 0))
+    nanosec = int(getattr(msg.header.stamp, "nanosec", 0))
+    ts_ns   = sec * 1_000_000_000 + nanosec or time.time_ns()
 
     h, w = int(msg.height), int(msg.width)
     enc  = str(msg.encoding).lower().strip()
     data = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-
     try:
         if enc in ("rgb8", "rgb"):
             bgr = cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
@@ -131,125 +138,186 @@ def decode_ros_image(cdr_bytes: bytes) -> Optional[tuple[int, np.ndarray]]:
             log.warning(f"Unsupported encoding '{enc}' — skipping frame")
             return None
     except Exception as e:
-        log.warning(f"Image reshape failed (enc={enc} h={h} w={w}): {e}")
+        log.warning(f"Image reshape failed (enc={enc} {w}x{h}): {e}")
         return None
-
     return ts_ns, bgr
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sharpness
-# ─────────────────────────────────────────────────────────────────────────────
 
 def sharpness(bgr: np.ndarray) -> float:
-    """Variance of Laplacian on grayscale image. Higher = sharper."""
+    """Variance of Laplacian (higher = sharper).  Downscaled for speed."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    if 0.0 < SHARP_DOWNSCALE < 1.0:
+        gray = cv2.resize(gray, None, fx=SHARP_DOWNSCALE, fy=SHARP_DOWNSCALE,
+                          interpolation=cv2.INTER_AREA)
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Frame buffer
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class FrameEntry:
-    ts_ns:     int
-    sharpness: float
-    bgr:       np.ndarray
-
-
-def _max_buffer_frames() -> int:
-    with _config_lock:
-        fps = _throttle_fps
-        ws  = _window_size
-    return max(ws + 4, int(2.0 * CAMERA_FPS / fps))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Decimator
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+@dataclass
+class FrameEntry:
+    ts_ns: int
+    bgr: np.ndarray
+
+
 class FrameDecimator:
-    def __init__(self, zenoh_session: zenoh.Session):
-        self._z   = zenoh_session
-        self._pub = self._z.declare_publisher(
-            KEY_OUTPUT,
-            congestion_control=zenoh.CongestionControl.DROP,
-        )
+    """Best-of-N-frame-window decimator with live camera-height tagging."""
+
+    def __init__(self, z: zenoh.Session, state: RobotStateTracker, model):
+        self._z = z
+        self._state = state
+        self._model = model
+        # Reliable transport: every frame matters for pose estimation, so we
+        # prefer back-pressure (BLOCK) over silent drops.
+        self._pub = self._declare_reliable_publisher(z, KEY_OUTPUT)
         self._buf: deque[FrameEntry] = deque()
         self._lock = threading.Lock()
         self._next_tick_ns: Optional[int] = None
-        self._published_count = 0
+        self._published = 0
+        self._skipped = 0
+        self._seq = 0
+        # Ring buffer of recently emitted payloads, keyed by seq, for retransmit.
+        self._retx: dict[int, bytes] = {}
+        self._retx_order: deque[int] = deque()
+        self._retx_lock = threading.Lock()
+        # Queryable so the server can re-request a dropped frame by seq.
+        try:
+            z.declare_queryable(KEY_FRAME_GET, self._on_frame_get)
+            log.info(f"[Decimator] retransmit queryable on '{KEY_FRAME_GET}'")
+        except Exception as e:
+            log.warning(f"[Decimator] could not declare retransmit queryable: {e}")
+
+    @staticmethod
+    def _declare_reliable_publisher(z, key):
+        # Newer zenoh supports a reliability kwarg; fall back gracefully.
+        for kwargs in (
+            dict(congestion_control=zenoh.CongestionControl.BLOCK,
+                 reliability=zenoh.Reliability.RELIABLE,
+                 priority=zenoh.Priority.DATA_HIGH),
+            dict(congestion_control=zenoh.CongestionControl.BLOCK,
+                 priority=zenoh.Priority.DATA_HIGH),
+            dict(congestion_control=zenoh.CongestionControl.BLOCK),
+        ):
+            try:
+                return z.declare_publisher(key, **kwargs)
+            except TypeError:
+                continue
+        return z.declare_publisher(key)
+
+    def _on_frame_get(self, query):
+        """Reply with a buffered frame payload for the requested ?seq=N."""
+        try:
+            params = query.parameters if hasattr(query, "parameters") else \
+                query.selector.parameters
+            seq = int(params["seq"]) if "seq" in params else -1
+            with self._retx_lock:
+                payload = self._retx.get(seq)
+            if payload is not None:
+                query.reply(KEY_FRAME_GET, payload)
+                log.debug(f"[Decimator] retransmit seq={seq} ({len(payload)//1024}kB)")
+            else:
+                query.reply_err(f"seq {seq} not buffered".encode())
+        except Exception as e:
+            try:
+                query.reply_err(str(e).encode())
+            except Exception:
+                pass
 
     def push(self, ts_ns: int, bgr: np.ndarray):
-        entry = FrameEntry(ts_ns=ts_ns, sharpness=sharpness(bgr), bgr=bgr)
-
-        with _config_lock:
-            fps = _throttle_fps
-            ws  = _window_size
-
-        max_buf = _max_buffer_frames()
-        half_win_ns = int((ws // 2) / CAMERA_FPS * 1_000_000_000)
-        tick_interval_ns = int(1_000_000_000 / fps)
+        fps, ws = _get_config()
+        ws = max(1, ws | 1)                 # force odd, >=1
+        half = ws // 2
+        interval_ns = int(1e9 / max(fps, 0.1))
+        # generous bound on how long to wait for the lookahead half-window
+        lookahead_ns = int((half + 0.5) / max(CAMERA_FPS, 1.0) * 1e9)
 
         with self._lock:
-            self._buf.append(entry)
-
+            self._buf.append(FrameEntry(ts_ns, bgr))
             if self._next_tick_ns is None:
                 self._next_tick_ns = ts_ns
 
-            # Drain frames too old to be in any future window
-            cutoff = self._next_tick_ns - half_win_ns * 2
-            while self._buf and self._buf[0].ts_ns < cutoff:
+            # Emit every tick for which we have a complete forward half-window.
+            while self._next_tick_ns is not None:
+                emitted = self._try_emit_tick(half, interval_ns, lookahead_ns, ts_ns)
+                if not emitted:
+                    break
+
+            # Bound memory: keep a little more than two windows + one interval.
+            max_keep = max(ws + 4, int(2 * CAMERA_FPS / max(fps, 0.1)))
+            while len(self._buf) > max_keep:
                 self._buf.popleft()
 
-            while len(self._buf) > max_buf:
-                self._buf.popleft()
+    def _try_emit_tick(self, half: int, interval_ns: int,
+                       lookahead_ns: int, newest_ns: int) -> bool:
+        tick = self._next_tick_ns
+        buf = self._buf
+        if not buf:
+            return False
 
-            # Emit as many ticks as we have full lookahead for
-            while (self._next_tick_ns is not None and
-                   ts_ns >= self._next_tick_ns + half_win_ns):
-                self._emit_tick(self._next_tick_ns, half_win_ns, ws)
-                self._next_tick_ns += tick_interval_ns
+        # Index of the frame closest in time to this tick.
+        center = min(range(len(buf)), key=lambda i: abs(buf[i].ts_ns - tick))
+        frames_after = len(buf) - 1 - center
 
-    def _emit_tick(self, tick_ns: int, half_win_ns: int, ws: int):
-        lo = tick_ns - half_win_ns
-        hi = tick_ns + half_win_ns
-        candidates = [e for e in self._buf if lo <= e.ts_ns <= hi]
+        # Wait for a full forward half-window UNLESS the stream has already moved
+        # well past the tick (avoid stalling if the camera slows/stops).
+        have_lookahead = frames_after >= half
+        timed_out = newest_ns >= tick + interval_ns + lookahead_ns
+        if not have_lookahead and not timed_out:
+            return False
 
-        if not candidates:
-            closest = min(self._buf, key=lambda e: abs(e.ts_ns - tick_ns), default=None)
-            if closest is None:
-                return
-            candidates = [closest]
+        lo = max(0, center - half)
+        hi = min(len(buf), center + half + 1)
+        candidates = list(buf)[lo:hi]
+        best = max(candidates, key=lambda e: sharpness(e.bgr))
 
-        best = max(candidates, key=lambda e: e.sharpness)
+        self._emit(best, n_candidates=len(candidates))
+        self._next_tick_ns = tick + interval_ns
+        return True
 
-        ok, buf = cv2.imencode(".jpg", best.bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        if not ok or buf is None:
+    def _emit(self, entry: FrameEntry, n_candidates: int):
+        ok, jbuf = cv2.imencode(".jpg", entry.bgr,
+                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        if not ok or jbuf is None:
             log.warning("JPEG encode failed — skipping tick")
+            self._skipped += 1
             return
 
-        payload = struct.pack("<q", best.ts_ns) + buf.tobytes()
-        self._pub.put(payload)
-        self._published_count += 1
+        # Camera height at capture time (kinematics + live body state).
+        body = self._state.get()
+        cam_h = self._model.camera_height(body.body_height, body.rotation)
 
-        log.debug(
-            f"tick={tick_ns//1_000_000}ms  best={best.ts_ns//1_000_000}ms  "
-            f"sharp={best.sharpness:.0f}  candidates={len(candidates)}/{ws}  "
-            f"size={len(payload)//1024}kB  total={self._published_count}"
-        )
+        seq = self._seq
+        self._seq = (self._seq + 1) & 0xFFFFFFFF
+        payload = proto.pack_frame(entry.ts_ns, seq, cam_h, jbuf.tobytes())
+
+        # Buffer for retransmit before publishing.
+        with self._retx_lock:
+            self._retx[seq] = payload
+            self._retx_order.append(seq)
+            while len(self._retx_order) > RETX_BUFFER:
+                self._retx.pop(self._retx_order.popleft(), None)
+
+        try:
+            self._pub.put(payload, encoding=proto.ENC_FRAME)
+        except TypeError:
+            self._pub.put(payload)           # older zenoh without encoding kwarg
+        self._published += 1
+        log.debug(f"emit seq={seq} ts={entry.ts_ns//1_000_000}ms cam_h={cam_h:.2f}m "
+                  f"cands={n_candidates} size={len(payload)//1024}kB "
+                  f"total={self._published}")
+
+    def stats(self) -> str:
+        fps, ws = _get_config()
+        return (f"published={self._published} skipped={self._skipped} "
+                f"buf={len(self._buf)} fps={fps:.1f} win={ws}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Zenoh callbacks
+# Live-config callbacks
 # ─────────────────────────────────────────────────────────────────────────────
-
-_decimator: Optional[FrameDecimator] = None
-
-
-def _on_image(sample):
-    result = decode_ros_image(bytes(sample.payload))
-    if result is None or _decimator is None:
-        return
-    _decimator.push(*result)
-
 
 def _on_throttle_fps(sample):
     global _throttle_fps
@@ -260,7 +328,7 @@ def _on_throttle_fps(sample):
                 _throttle_fps = val
             log.info(f"[Config] throttle_fps → {val:.2f} Hz")
         else:
-            log.warning(f"[Config] throttle_fps {val} out of range [0.1, 30.0]")
+            log.warning(f"[Config] throttle_fps {val} out of range [0.1, 30]")
     except Exception as e:
         log.warning(f"[Config] bad throttle_fps payload: {e}")
 
@@ -268,53 +336,60 @@ def _on_throttle_fps(sample):
 def _on_window_size(sample):
     global _window_size
     try:
-        val = int(bytes(sample.payload).decode().strip())
+        val = int(float(bytes(sample.payload).decode().strip()))
         if 1 <= val <= 31:
-            val = val if val % 2 == 1 else val + 1  # force odd
             with _config_lock:
-                _window_size = val
-            log.info(f"[Config] window_size → {val}")
+                _window_size = val | 1       # force odd
+            log.info(f"[Config] window_size → {_window_size}")
         else:
             log.warning(f"[Config] window_size {val} out of range [1, 31]")
     except Exception as e:
         log.warning(f"[Config] bad window_size payload: {e}")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
-    global _decimator
-
-    log.info(f"Connecting to Zenoh at {ZENOH_CONNECT}...")
+def _open_session() -> zenoh.Session:
     conf = zenoh.Config()
     conf.insert_json5("connect/endpoints", f'["{ZENOH_CONNECT}"]')
     conf.insert_json5("mode", '"client"')
-
-    z = None
-    while z is None:
+    while True:
         try:
-            z = zenoh.open(conf)
+            return zenoh.open(conf)
         except Exception as e:
             log.warning(f"Zenoh connect failed: {e} — retrying in 5s")
             time.sleep(5)
 
-    log.info(f"Connected. Listening on '{KEY_IMAGE}' → publishing '{KEY_OUTPUT}' "
-             f"@ {_throttle_fps}Hz  window={_window_size}  quality={JPEG_QUALITY}")
 
-    _decimator = FrameDecimator(z)
-    z.declare_subscriber(KEY_IMAGE,        _on_image)
+def main():
+    log.info(f"Connecting to Zenoh at {ZENOH_CONNECT}...")
+    z = _open_session()
+    fps, ws = _get_config()
+    log.info(f"Connected. '{KEY_IMAGE}' → '{KEY_OUTPUT}'  @ {fps}Hz  "
+             f"window={ws}  jpeg_q={JPEG_QUALITY}")
+
+    model = build_robot_model()
+    state = RobotStateTracker(z, ROBOT_NAME, fallback_body_height=FALLBACK_BODY_H)
+    decimator = FrameDecimator(z, state, model)
+
+    def on_image(sample):
+        try:
+            result = decode_ros_image(bytes(sample.payload))
+            if result is not None:
+                decimator.push(*result)
+        except Exception as e:
+            log.warning(f"frame handling error: {e}")
+
+    z.declare_subscriber(KEY_IMAGE, on_image)
     z.declare_subscriber(KEY_THROTTLE_FPS, _on_throttle_fps)
-    z.declare_subscriber(KEY_WINDOW_SIZE,  _on_window_size)
+    z.declare_subscriber(KEY_WINDOW_SIZE, _on_window_size)
 
     try:
         while True:
             time.sleep(10)
-            if _decimator:
-                with _config_lock:
-                    fps, ws = _throttle_fps, _window_size
-                log.info(f"published={_decimator._published_count}  "
-                         f"buf={len(_decimator._buf)}  fps={fps:.1f}  win={ws}")
+            log.info(decimator.stats())
     except KeyboardInterrupt:
         pass
     finally:
@@ -323,3 +398,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# end of frame_decimator.py

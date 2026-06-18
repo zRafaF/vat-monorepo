@@ -81,7 +81,7 @@ This is the core of the architecture change: **the robot, not the cloud, is auth
 ```
    ┌──────────────────────────── CLOUD ────────────────────────────┐
    │                                                                │
-   │  prism_server.py                          Zenoh router          │
+   │  mapping_server.py                        Zenoh router          │
    │  ┌───────────────────┐                  ┌──────────────────┐   │
    │  │ PRISM-VGGT         │  low-freq        │ relays robot     │   │
    │  │ global keyframe    │  global pose     │ pose straight    │   │
@@ -120,6 +120,23 @@ This is the core of the architecture change: **the robot, not the cloud, is auth
 
 Neither is usable alone. VGGT alone is far too slow and laggy to drive an avatar; odometry alone drifts away from the map within seconds to minutes. The fuser uses the fast odometry to **propagate** the pose between VGGT updates, and the slow VGGT pose to **anchor/correct** the accumulated drift each time a new global pose lands. The result is a high-rate pose that is both smooth and globally consistent — the standard "high-rate prediction + low-rate correction" structure of any Kalman-style estimator.
 
+### Camera ≠ base: the kinematic offset
+
+VGGT estimates the pose of the **camera**, but we want the pose of the robot
+**base**. On the Go2-W the camera rides a selfie-stick on the body's back (and
+may later move to an actuated arm), so the two differ by a real transform:
+roll/pitch the body and the stick swings the camera sideways/forward even though
+the wheels never moved. The robot therefore subtracts the mount transform,
+`T_world_base = T_world_camera ∘ inverse(T_base_camera)`, before fusing — so the
+server sends a *camera* correction and stays kinematics-agnostic, while the robot
+(which has the joint/body state) owns the base solution. The same kinematics
+yield the **camera height above the floor** for PRISM's metric scale, which is
+*not* constant on a quadruped that lies down and stands up: it is
+`body_height (from SportModeState) + the stick reach projected through the body
+tilt`, computed on the robot and stamped into every camera frame. For a fixed
+stick the mount transform is a constant; for the future arm it becomes forward
+kinematics from a URDF — the same interface, swapped implementation.
+
 ### What the robot publishes (the authoritative pose message)
 
 Every fused pose carries the full state the client needs to predict motion:
@@ -152,8 +169,8 @@ This keeps the robot side free of an extra ROS node and respects the Python 3.8 
 
 1. **Robot → Cloud:** streams RGBD frames, telemetry, and high-frequency odometry (leg odom + IMU).
 2. **Cloud (mapping):** ingests frames, builds the PRISM global map, computes deltas, and produces the **low-frequency VGGT global pose**.
-3. **Cloud → Robot:** sends the VGGT global pose *down* to the robot as a drift correction.
-4. **Robot (fusion):** fuses the slow global correction with fast onboard odometry into a single **authoritative, high-rate global pose** carrying position, orientation, linear velocity, and angular velocity, and publishes it back up.
+3. **Cloud → Robot:** sends the VGGT global **camera** pose *down* to the robot as a drift correction.
+4. **Robot (kinematics + fusion):** converts the camera correction to a **base** pose (subtracting the selfie-stick/arm transform), fuses it with fast onboard odometry into a single **authoritative, high-rate global pose** carrying position, orientation, linear velocity, and angular velocity, and publishes it back up. It also derives the camera height for PRISM's metric scale.
 5. **Cloud (router) → Client:** the Zenoh router relays the robot's pose stream straight through to the client; in parallel the cloud streams PRISM map deltas + high-res video.
 6. **Client (Python backend):** receives map deltas, the authoritative pose stream, and video streams.
 7. **Client (Unity frontend):** renders the "Toy Box" room and the 1-frame RGBD mesh, **predicts the robot avatar's motion between pose updates** using the velocity/rotation vectors, drives the Beacon video stream, and handles XR inputs to send teleoperation commands back to the cloud/robot.

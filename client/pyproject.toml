@@ -12,6 +12,9 @@ dependencies = [
     "numpy>=1.24",
     # (future) scipy for trajectory smoothing
     "scipy>=1.12",
+    # Bring-up tools (tools/): CDR decode + JPEG decode for the diagnostic viewers
+    "rosbags>=0.10",
+    "opencv-python-headless>=4.9",
 ]
 
 [build-system]

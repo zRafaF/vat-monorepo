@@ -93,6 +93,7 @@ nav:
   - Home: index.md
   - Architecture: architecture.md
   - PRISM Streaming POC: streaming_poc.md
+  - Bring-up Runbook: bringup.md
   - Setup:
       - setup/index.md
       - Robot: setup/robot.md

@@ -29,10 +29,10 @@ The server computes a slow, drift-free VGGT pose and sends it **down** to the do
 │  equirectangular node  (GPU PyTorch, 1920×960)                             │
 │      │                                                                     │
 │  /equirectangular/image           (sensor_msgs/Image, RGB8)                │
-│      │                                                                     │
-│  frame_publisher node  ← throttle_fps (default 3 Hz, tunable via Zenoh)   │
-│      │ JPEG-compressed                                                      │
-│  /prism/camera/frame              (sensor_msgs/CompressedImage)            │
+│      │  (bridged to Zenoh as CDR by dynamic_bridge)                         │
+│  frame_decimator.py (docker)  ← throttle_fps + window_size (live via Zenoh)│
+│      │ best-of-N-frame sharpest + camera_height stamp + JPEG                │
+│  {robot}/prism/camera/frame       (VAT frame: ts + camera_height + JPEG)   │
 │      │                                                                     │
 │  DynamicZenohBridge  (demand-driven, CDR-serialized)                       │
 │      │                                                                     │
@@ -41,7 +41,7 @@ The server computes a slow, drift-free VGGT pose and sends it **down** to the do
        ▼
 ┌─────────────────────────── Cloud / Dev Machine ──────────────────────────┐
 │                                                                            │
-│  prism_server.py                                                           │
+│  mapping_server.py                                                         │
 │    ├─ CDR decode  (rosbags, no ROS install)                                │
 │    ├─ JPEG decode (OpenCV)                                                 │
 │    ├─ FrameInput accumulator (sliding window)                              │
@@ -78,7 +78,7 @@ The point cloud and the pose travel on separate paths. The cloud owns the *map*;
 
 ```
 ┌──────────────────────────── Cloud / Dev Machine ──────────────────────────┐
-│  prism_server.py                                                           │
+│  mapping_server.py                                                         │
 │    └─ from PRISM trajectory → latest global keyframe pose                  │
 │         │  publish (low-freq, ~0.3–3 Hz)                                   │
 │         ▼                                                                  │
@@ -113,37 +113,40 @@ The bridge (`dynamic_bridge.py`) does **no computation** — it merely exposes t
 vat-monorepo/
 ├── pyproject.toml              ← uv workspace root (virtual, no deps of its own)
 │
+├── common/
+│   └── vat_protocol.py         ← shared wire formats (robot/server/client import it)
+│
 ├── server/
 │   ├── pyproject.toml          ← vat-server package (zenoh, rosbags, prism-vggt)
-│   ├── prism_server.py         ← PRISM streaming server  ← NEW
+│   ├── mapping_server.py         ← PRISM server + VGGT pose-correction publisher
 │   └── PRISM-VGGT/             ← git submodule  (git submodule add ... — see below)
 │
 ├── client/
 │   ├── pyproject.toml          ← vat-client package (zenoh, rerun-sdk)
-│   └── prism_rerun_viewer.py   ← Rerun point cloud viewer  ← NEW
+│   └── prism_rerun_viewer.py   ← Rerun viewer + pose predictor + robot block
 │
 ├── robot/
 │   ├── insta360_ros_driver/    ← DO NOT MODIFY (sensitive hardware driver)
-│   ├── docker/                 ← container running alongside the ROS stack
-│   │   ├── dynamic_bridge.py   ← ROS2 → Zenoh bridge (CDR)  — no compute
-│   │   ├── frame_decimator.py  ← sharpest-frame selector → camera frames
-│   │   └── pose_fuser.py       ← NEW (PLACEHOLDER) pure-Python state fuser
-│   ├── bridge_node/            ← DO NOT MODIFY (DynamicZenohBridge)
-│   ├── frame_publisher/        ← NEW ROS2 package (throttle + JPEG compress)
-│   │   ├── frame_publisher/node.py
-│   │   ├── launch/bringup.launch.xml
-│   │   ├── package.xml
-│   │   └── setup.py
-│   ├── vat_bringup/            ← NEW master launch package
-│   │   ├── launch/vat_bringup.launch.xml
-│   │   ├── package.xml
-│   │   └── setup.py
+│   ├── docker/                 ← single container alongside the host ROS stack
+│   │   ├── Dockerfile          ← build from REPO ROOT (-f robot/docker/Dockerfile)
+│   │   ├── run.sh              ← build + docker run helper (no compose)
+│   │   ├── start.sh            ← supervisor: restarts each process independently
+│   │   ├── dynamic_bridge.py   ← ROS2 → Zenoh bridge (CDR)  [only ROS node]
+│   │   ├── frame_decimator.py  ← best-of-window frames + camera-height stamp
+│   │   ├── pose_fuser.py       ← PLACEHOLDER authoritative-pose fuser
+│   │   └── kinematics.py       ← camera↔base transform + camera-height + body state
+│   ├── ros/vat_bringup/        ← ROS2 launch pkg for the camera stack (host Foxy)
 │   └── systemd/
-│       └── vat-robot.service   ← NEW systemd unit for auto-bringup
+│       ├── vat-robot.service        ← host ROS2 camera stack (Foxy)
+│       └── vat-robot-docker.service ← the Docker container (docker run, no compose)
 │
 └── docs/
     └── streaming_poc.md        ← this file
 ```
+
+> The Jetson has **no docker-compose** — there is a single `Dockerfile`, built
+> from the repo root and run via `run.sh` / the systemd unit. The bridge is the
+> only ROS node; the decimator and fuser are plain Zenoh clients.
 
 ---
 
@@ -201,41 +204,50 @@ torch = { index = "pytorch-cu121" }
 uv sync --package vat-client
 ```
 
-### 4. Build robot ROS2 packages (Jetson)
+### 4. Build the robot ROS2 camera stack (Jetson, host Foxy)
 
 ```bash
-# Create or update the ROS2 workspace
+# Only the camera driver + bringup run as ROS nodes on the host (Foxy).
 mkdir -p ~/vat_ws/src
-# Symlink the robot packages (or copy them)
-ln -sfn $(pwd)/robot/frame_publisher  ~/vat_ws/src/frame_publisher
-ln -sfn $(pwd)/robot/vat_bringup      ~/vat_ws/src/vat_bringup
+ln -sfn $(pwd)/robot/ros/vat_bringup  ~/vat_ws/src/vat_bringup
 # insta360_ros_driver should already be there from the original setup
 
 cd ~/vat_ws
-source /opt/ros/humble/setup.bash
+source /opt/ros/foxy/setup.bash
 colcon build --symlink-install
 ```
 
-### 5. Install the systemd service (Jetson)
+### 5. Build & run the robot Docker container (Jetson — NO compose)
+
+The bridge + decimator + pose fuser run in **one** container. The Jetson has no
+docker-compose, so build from the repo root and run with `run.sh` (or the
+systemd unit):
 
 ```bash
-# Edit the service file first — set ZENOH_ROUTER to your server's IP
-nano robot/systemd/vat-robot.service
+# from the repo root — point it at your server's IP
+./robot/docker/run.sh <SERVER_IP>
+# logs:
+docker logs -f vat-robot
+```
 
-sudo cp robot/systemd/vat-robot.service /etc/systemd/system/
+### 6. Install the systemd services (Jetson)
+
+```bash
+# host ROS camera stack
+sudo cp robot/systemd/vat-robot.service        /etc/systemd/system/
+# docker container (edit ZENOH_CONNECT inside first)
+sudo cp robot/systemd/vat-robot-docker.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable vat-robot.service
-
-# Start immediately (without rebooting)
-sudo systemctl start vat-robot.service
+sudo systemctl enable --now vat-robot.service vat-robot-docker.service
 
 # Verify
-sudo systemctl status vat-robot
-sudo journalctl -fu vat-robot   # follow live logs
+sudo journalctl -fu vat-robot          # camera stack
+sudo journalctl -fu vat-robot-docker   # bridge + decimator + fuser
 ```
 
 After this, **the full VAT stack starts automatically on every Jetson boot**,
-no SSH required.
+no SSH required. The container's `start.sh` restarts any of the three processes
+independently if one dies, so a transient fault doesn't take the stack down.
 
 ---
 
@@ -257,7 +269,7 @@ source .venv/bin/activate
 ZENOH_ROUTER=tcp/127.0.0.1:7447 \
 ROBOT_NAME=go2 \
 CAMERA_HEIGHT=0.50 \
-python server/prism_server.py
+python server/mapping_server.py
 ```
 
 Key env vars for the server:
@@ -346,48 +358,96 @@ extrapolates with: `p(t) = p₀ + v·Δt`, `q(t) = q₀ ⊗ Δq(ω, Δt)`.
 
 ### VGGT pose correction  (`server/prism/pose_correction`)
 
-Published **by the server**, sent **down** to the robot's `pose_fuser.py`. The
-latest drift-free global keyframe pose derived from the PRISM trajectory. Slow
-(~0.3–3 Hz, lands once per submap) and laggy (~2–4 s). No velocity — it is an
-anchor, not a motion source. All values big-endian.
+Published **by the server**, sent **down** to the robot's `pose_fuser.py`. This
+is the latest drift-free **camera** pose in the map frame, derived from the
+PRISM trajectory — *not* the base pose. The robot converts it to a base pose
+with its own kinematics (`T_world_base = T_world_camera ∘ inverse(T_base_camera)`),
+keeping the server kinematics-agnostic. Slow (~0.3–3 Hz, once per submap) and
+laggy (~2–4 s); no velocity — it is an anchor, not a motion source. Big-endian.
 
 | Offset | Bytes | Type | Field |
 |---|---|---|---|
 | 0 | 4 | `int32` | Magic = `0x50434F52` (`"PCOR"`) |
 | 4 | 8 | `int64` | `timestamp_ns` — capture time of the keyframe this pose anchors |
 | 12 | 4 | `int32` | `map_version` — PRISM map version this pose belongs to |
-| 16 | 12 | `float32[3]` | position XYZ (m, global map frame) |
-| 28 | 16 | `float32[4]` | orientation quaternion (x, y, z, w), map frame |
+| 16 | 12 | `float32[3]` | **camera** position XYZ (m, map frame) |
+| 28 | 16 | `float32[4]` | **camera** orientation quaternion (x, y, z, w), map frame |
 
 Total: **44 bytes**, fixed size.
 
-### Live throttle config  (`go2/rt/prism/config/throttle_fps`)
+> The current server derives the camera orientation from the trajectory tangent
+> (heading) as a placeholder; the robot fuser re-anchors orientation anyway.
+> Replace with the true VGGT per-keyframe extrinsics when the engine exposes them.
 
-Plain UTF-8 float string, e.g. `"3.0"`. The `frame_publisher` node subscribes
-to this key and applies the new rate immediately.
+### Camera frame  (`{robot}/prism/camera/frame`)
+
+Published **by the robot** decimator → server. Big-endian header + JPEG body.
+Carries the camera height at capture time (computed on the robot, see below).
+
+| Offset | Bytes | Type | Field |
+|---|---|---|---|
+| 0 | 4 | `int32` | Magic = `0x46524D45` (`"FRME"`) |
+| 4 | 8 | `int64` | `timestamp_ns` — capture time |
+| 12 | 4 | `uint32` | `seq` — monotonic; lets the server detect & re-request drops |
+| 16 | 4 | `float32` | `camera_height` (m above floor; **< 0 = unknown**, server falls back) |
+| 20 | … | bytes | JPEG image |
+
+Frames are published **reliably** (`RELIABLE` + `BLOCK`) so they aren't silently
+dropped. The decimator keeps a ring buffer of recent frames and exposes a
+queryable (`{robot}/prism/camera/frame/get?seq=N`); the mapping server detects a
+`seq` gap and **re-requests** the missing frame before processing a window. It
+also batches a window on **N new frames OR a timeout, whichever comes first**
+(`WINDOW_TIMEOUT_S`, default 2 s) so a sparse stream never stalls the viewer.
+
+All wire formats live in one place: **`common/vat_protocol.py`** (imported by
+robot, server and client) so they can never drift apart.
+
+### Live config  (`{robot}/rt/prism/config/throttle_fps`, `.../window_size`)
+
+Plain UTF-8 string payloads (e.g. `"3.0"`, `"5"`). The `frame_decimator.py`
+process subscribes and applies the new value immediately.
 
 ---
 
-## Camera height strategy
+## Robot kinematics: camera ↔ base, and camera height
 
-For metric scale estimation, PRISM needs to know the camera's height above the floor.
+PRISM-VGGT estimates the pose of the **camera**, but the camera is on a
+selfie-stick on the back of the **Go2-W** (wheeled), and may later move to an
+actuated arm. Two geometry problems follow, both solved on the **robot** (it has
+the joint/body state) in `robot/docker/kinematics.py`:
 
-**POC (now):** fixed constant `CAMERA_HEIGHT` env var on the server, default 0.50 m.
+**1. Camera → base.** The stick is rigid to the body, so `T_base_camera` is a
+fixed transform — but *not* identity: when the body rolls/pitches (even with the
+wheels planted) the stick swings the camera sideways/forward. To recover the
+base pose we subtract it:
 
-**Phase 2 (planned):** dynamic height from the dog's body odometry.  
-The decision to do this on the **server** (not the robot node) is deliberate:
+```
+T_world_base = T_world_camera ∘ inverse(T_base_camera)
+```
 
-- The robot already streams `SportModeState_.body_height` via the Zenoh bridge
-  (it's captured in `Go2StreamFrame` protobuf, which goes to the server for 3D
-  dog reconstruction anyway).
-- The server computes `camera_height = body_height + CAMERA_MOUNT_OFFSET`.
-- `CAMERA_MOUNT_OFFSET` is a fixed physical constant (measure from CAD or
-  physically). Default in `prism_server.py`: 0.18 m.
-- Keeps the robot node simple — it does not need limb kinematics.
+The `RobotModel` interface hides whether this is a fixed stick
+(`SelfieStickModel`, used now — configure `STICK_OFFSET_X/Y/Z`) or, in the
+future, forward kinematics of an arm from a URDF (`URDFArmModel`, placeholder;
+set `ROBOT_MODEL=urdf` + `ROBOT_URDF=…`). For the Go2-W the *wheels* are
+continuous joints — they don't change `T_base_camera`, only the body height.
 
-When you wire this up, the `_on_sport_state()` callback in `prism_server.py`
-already handles CDR decoding of `SportModeState` and updates `_camera_height`
-automatically. Just ensure the bridge is forwarding `/{robot_name}/sport_mode_state`.
+**2. Camera height above the floor** (for PRISM metric scale). The Go2-W can lie
+down / stand up, so this is **not** constant:
+
+```
+camera_height = body_height + (R_body · stick_offset).z
+```
+
+`body_height` comes from `SportModeState.body_height` (live, via the bridge),
+`R_body` from the IMU quaternion (so body tilt is accounted for). The robot
+computes this at frame-capture time and stamps it into every
+`{robot}/prism/camera/frame` message; the server reads it straight from the
+frame (falling back to its `CAMERA_HEIGHT` env var only if the value is `< 0`).
+
+`RobotStateTracker` decodes `SportModeState` directly from the bridged CDR using
+`rosbags` (no ROS install) via embedded `unitree_go` message definitions. If the
+custom message can't be decoded (firmware layout differs), it falls back to a
+configured constant and never crashes — verify the layout against your firmware.
 
 ---
 
@@ -401,7 +461,7 @@ the result. This section describes how that is realised (and faked) in the POC.
 
 | Component | Where | Role |
 |---|---|---|
-| `prism_server.py` | cloud | Derives the latest global keyframe pose from the PRISM trajectory and publishes it on `server/prism/pose_correction` (DOWN to the dog). |
+| `mapping_server.py` | cloud | Derives the latest global keyframe pose from the PRISM trajectory and publishes it on `server/prism/pose_correction` (DOWN to the dog). |
 | `dynamic_bridge.py` | robot (docker) | Bridges ROS odometry/IMU (`SportModeState`, etc.) to Zenoh as CDR. **No computation.** |
 | `pose_fuser.py` | robot (docker) | **NEW, placeholder.** Subscribes to the correction + bridged odometry, fuses them, publishes the authoritative pose on `go2/prism/pose` (UP). |
 | `zenohd` | cloud | Relays `go2/prism/pose` straight through to the client. |
@@ -525,26 +585,30 @@ This is resolved once the true online engine mode is implemented.
 ### POC milestone (this branch)
 
 - [x] uv workspace root + `server/` + `client/` packages
+- [x] `common/vat_protocol.py` — shared wire formats (robot/server/client)
 - [x] PRISM-VGGT as git submodule (`server/PRISM-VGGT`)  — **manual** `git submodule add`
-- [x] `server/prism_server.py` — Zenoh frame subscriber → PRISM engine → pcd publisher
-- [x] `client/prism_rerun_viewer.py` — pcd delta subscriber → Rerun 3D viewer
-- [x] `robot/frame_publisher/` — throttle + JPEG-compress node with live Zenoh config
-- [x] `robot/vat_bringup/` — master launch file composing the full robot stack
-- [x] `robot/systemd/vat-robot.service` — auto-start on Jetson boot
-- [ ] Smoke test: `journalctl -fu vat-robot` shows no errors, viewer renders cloud
-- [ ] Tune `WINDOW_SIZE` and `OVERLAP` for latency vs. map quality tradeoff
-- [ ] Verify JPEG quality 85 is sufficient for PRISM depth quality
+- [x] `server/mapping_server.py` — frame subscriber → PRISM engine → pcd + pose-correction publisher
+- [x] `client/prism_rerun_viewer.py` — pcd + pose subscriber → Rerun, with `PosePredictor` + robot block
+- [x] `robot/docker/frame_decimator.py` — best-of-window sharpest + camera-height stamp
+- [x] `robot/docker/kinematics.py` — camera↔base transform + camera height + body-state tracker
+- [x] `robot/docker/pose_fuser.py` — PLACEHOLDER authoritative-pose fuser
+- [x] `robot/docker/` single Dockerfile + `run.sh` + supervised `start.sh` (no compose)
+- [x] `robot/systemd/{vat-robot,vat-robot-docker}.service` — auto-start on boot
+- [ ] Smoke test: `journalctl -fu vat-robot-docker` clean, viewer renders cloud + robot block
+- [ ] Tune `WINDOW_SIZE` (sharpness window) and `OVERLAP` for latency vs. quality
+- [ ] Measure/set the real selfie-stick geometry (`STICK_OFFSET_X/Y/Z`)
+- [ ] Verify the `unitree_go` SportModeState layout matches your firmware
 
 #### Pose path (POC — locks the contract, fusion is a placeholder)
 
-- [ ] `prism_server.py` — publish latest VGGT keyframe pose on `server/prism/pose_correction` (DOWN)
-- [ ] `robot/docker/pose_fuser.py` — placeholder pure-Python fuser → publish `go2/prism/pose` (UP)
-- [ ] `prism_rerun_viewer.py` — subscribe `go2/prism/pose`, add `PosePredictor` (dead-reckon + slerp), log `rr.Transform3D`
-- [ ] Verify the `server → dog → server router → client` path round-trips (pose visible in viewer, predicted between samples)
+- [x] `mapping_server.py` — publish VGGT **camera** pose on `server/prism/pose_correction` (DOWN)
+- [x] `pose_fuser.py` — convert camera→base via kinematics, fuse, publish `go2/prism/pose` (UP)
+- [x] `prism_rerun_viewer.py` — subscribe pose, `PosePredictor` (dead-reckon + slerp + staleness decay)
+- [ ] Verify the `server → dog → server router → client` path round-trips on hardware
 
 ### Phase 2 (after POC)
 
-- [ ] Dynamic camera height from `SportModeState_.body_height` + mount offset
+- [ ] Replace trajectory-tangent heading with true VGGT camera extrinsics in the correction
 - [ ] Extend `StreamingWindowEngine` with `add_frame()` / `step()` for true online mode
 - [ ] Proper per-block delta streaming (requires stable `version` across engine calls)
 - [ ] **Real state estimator** — replace placeholder `pose_fuser.py` with a proper EKF (NumPy/`filterpy`) or migrate to a `fuse`/`robot_localization` ROS node publishing the same `go2/prism/pose` contract
@@ -559,14 +623,23 @@ This is resolved once the true online engine mode is implemented.
 ## Troubleshooting
 
 **Viewer shows no points after server starts**  
-→ Check `journalctl -fu vat-robot` on the Jetson — frames may not be reaching the bridge.  
-→ `zenoh sub --key 'go2/rt/prism/camera/frame'` from any machine to verify frames are flowing.
+→ Check `journalctl -fu vat-robot-docker` on the Jetson — frames may not be reaching the bridge.  
+→ `zenoh sub --key 'go2/prism/camera/frame'` from any machine to verify frames are flowing.
 
 **PRISM server crashes with CUDA OOM**  
 → Lower `WINDOW_SIZE` (try 6) or `FACE_SIZE` (try 384).
 
 **`prism-vggt` import error on server**  
 → Run `git submodule update --init server/PRISM-VGGT` then `uv sync --package vat-server`.
+
+**Robot block doesn't move / no pose in viewer**  
+→ `zenoh sub --key 'go2/prism/pose'` to confirm `pose_fuser.py` publishes.  
+→ `zenoh sub --key 'server/prism/pose_correction'` to confirm the server sends corrections.  
+→ `zenoh sub --key 'go2/rt/sportmodestate'` to confirm odometry reaches the fuser.
+
+**Camera height looks wrong (map scale off)**  
+→ Set the real stick geometry via `STICK_OFFSET_X/Y/Z`; check the `SportModeState`
+   decode isn't silently falling back (look for the one-time decode-failure warning).
 
 **`frame_publisher` not found in `ros2 launch`**  
 → Run `colcon build --symlink-install` in the ROS2 workspace and `source install/setup.bash`.

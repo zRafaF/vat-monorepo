@@ -1,9 +1,10 @@
 # VAT Robot — ROS2 stack systemd service
 # ============================================================
 # Starts the ROS2 camera stack on boot (Jetson, ROS Foxy).
-# The Docker container (bridge + decimator) is managed separately:
-#   cd ~/vat/robot/docker && docker compose up -d
-# Or add a second service unit that runs docker compose.
+# The Docker container (bridge + decimator + pose fuser) is managed separately
+# by vat-robot-docker.service (the Jetson has no docker-compose):
+#   docker build -f robot/docker/Dockerfile -t vat-robot-docker .
+#   sudo systemctl enable --now vat-robot-docker.service
 #
 # Install
 # -------

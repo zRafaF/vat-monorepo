@@ -1,42 +1,27 @@
 """
-VAT — PRISM Rerun Point Cloud Viewer
-=====================================
-Subscribes to PRISM server's Zenoh topics and renders the growing 3D map in
-real-time using Rerun.
+VAT — PRISM Rerun Viewer
+========================
+Renders the live PRISM map *and* the robot avatar in Rerun.
+
+What's new vs. the first POC
+----------------------------
+* Subscribes to the **authoritative robot pose** the robot publishes
+  (``{robot}/prism/pose``), relayed by the server's Zenoh router.
+* Runs a **client-side predictor** (multiplayer-netcode style): between pose
+  samples it dead-reckons the avatar using the linear + angular velocity in
+  each message, slerps orientation, blends on correction, and decays velocity
+  when the stream goes stale.  This keeps the robot block moving smoothly at the
+  render rate even though poses arrive intermittently and late.
+* Draws a **robot-position block** (an oriented box sized like the Go2-W) at the
+  predicted pose, coloured by fix quality (green = VGGT-corrected, amber =
+  dead-reckoning on odometry only).
 
 Usage
 -----
-  # install deps (from repo root)
   uv sync --package vat-client
-
-  # run (default Zenoh router on localhost)
-  python client/prism_rerun_viewer.py
-
-  # custom router / robot name
-  ZENOH_ROUTER=tcp/192.168.1.100:7447 ROBOT_NAME=go2 python client/prism_rerun_viewer.py
-
-  # request an immediate full snapshot from the server
-  python client/prism_rerun_viewer.py --snapshot
-
-Zenoh keys consumed
---------------------
-  server/prism/pcd_delta       — incremental point cloud (binary VAT format)
-  server/prism/pcd_snapshot    — full point cloud    (same format)
-  server/prism/trajectory      — camera trajectory   (binary)
-  server/prism/status          — JSON heartbeat      (info only)
-
-Wire format (pcd)
------------------
-  Matches server/prism_server.py::pack_point_cloud / unpack_point_cloud.
-  Header (24 bytes, big-endian):
-    [4B] magic = 0x50434400
-    [4B] version: int32
-    [4B] n_points: int32
-    [4B] is_snapshot: int32
-    [4B] since_version: int32
-  Body:
-    [n*12 B] xyz  float32
-    [n*12 B] rgb  float32  (in [0,1])
+  python client/prism_rerun_viewer.py                 # localhost router
+  ZENOH_ROUTER=tcp/<ip>:7447 python client/prism_rerun_viewer.py
+  python client/prism_rerun_viewer.py --snapshot      # request full cloud on start
 """
 
 from __future__ import annotations
@@ -44,264 +29,272 @@ from __future__ import annotations
 import os
 import sys
 import json
-import struct
+import time
 import logging
 import argparse
 import threading
-import time
-from typing import Optional
 
 import numpy as np
 import rerun as rr
 import zenoh
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("prism-viewer")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "common"))
+import vat_protocol as proto  # noqa: E402
+from vat_protocol import quat_identity, quat_normalize, quat_slerp, integrate_pose  # noqa: E402
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("prism-viewer")
 
 ZENOH_ROUTER  = os.environ.get("ZENOH_ROUTER",  "tcp/127.0.0.1:7447")
 ROBOT_NAME    = os.environ.get("ROBOT_NAME",    "go2")
 SERVER_PREFIX = os.environ.get("SERVER_PREFIX", "server/prism")
+RENDER_HZ     = float(os.environ.get("RENDER_HZ", "60.0"))
+STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))    # extrapolate freely until here
+DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))    # then ramp velocity to zero
+SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))  # reconciliation time const
 
-KEY_PCD_DELTA    = f"{SERVER_PREFIX}/pcd_delta"
-KEY_PCD_SNAPSHOT = f"{SERVER_PREFIX}/pcd_snapshot"
-KEY_TRAJECTORY   = f"{SERVER_PREFIX}/trajectory"
-KEY_STATUS       = f"{SERVER_PREFIX}/status"
+_KEYS = proto.keys(ROBOT_NAME, SERVER_PREFIX)
 
-# Rerun paths
-RR_WORLD   = "world"
-RR_PCD     = f"{RR_WORLD}/point_cloud"
-RR_TRAJ    = f"{RR_WORLD}/trajectory"
-RR_STATUS  = "status"
+# Go2-W footprint (approx, metres): length × width × height
+ROBOT_HALF = np.array([0.35, 0.16, 0.18], dtype=np.float32)
+
+RR_WORLD = "world"
+RR_PCD   = f"{RR_WORLD}/point_cloud"
+RR_TRAJ  = f"{RR_WORLD}/camera_trajectory"
+RR_ROBOT = f"{RR_WORLD}/robot"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Binary format helpers  (mirror of server/prism_server.py)
+# Point cloud accumulator (versioned blocks)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_MAGIC       = 0x50434400
-_HEADER_FMT  = "!iiiii"
-_HEADER_SIZE = struct.calcsize(_HEADER_FMT)
-
-
-def _unpack_pcd(data: bytes):
-    """Returns (version, xyz, rgb, is_snapshot, since_version)."""
-    if len(data) < _HEADER_SIZE:
-        raise ValueError("Payload too short for PCD header")
-    magic, version, n, is_snap, since_v = struct.unpack_from(_HEADER_FMT, data, 0)
-    if magic != _MAGIC:
-        raise ValueError(f"Bad magic: 0x{magic:08X}")
-    offset = _HEADER_SIZE
-    xyz = np.frombuffer(data, dtype=np.float32, count=n * 3,
-                        offset=offset).reshape(n, 3).copy()
-    rgb = np.frombuffer(data, dtype=np.float32, count=n * 3,
-                        offset=offset + n * 12).reshape(n, 3).copy()
-    return version, xyz, rgb, bool(is_snap), since_v
-
-
-def _unpack_trajectory(data: bytes) -> np.ndarray:
-    """Returns (N, 3) float32 trajectory positions."""
-    if len(data) < 4:
-        return np.zeros((0, 3), dtype=np.float32)
-    (n,) = struct.unpack_from("!i", data, 0)
-    if n <= 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    arr = np.frombuffer(data, dtype=np.float32, count=n * 3, offset=4).reshape(n, 3)
-    return arr.copy()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Local point cloud accumulator
-# ─────────────────────────────────────────────────────────────────────────────
 
 class LocalCloud:
-    """
-    Maintains the client-side merged point cloud.
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._blocks: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._version = 0
+        self._dirty = False
 
-    Each block key (int64) maps to an (xyz, rgb) pair — the server's block
-    granularity is the merge unit.  When a delta arrives we overwrite the
-    relevant blocks; when a snapshot arrives we replace everything.
+    def apply_snapshot(self, version, xyz, rgb):
+        with self._lock:
+            self._blocks = {0: (xyz, rgb)}
+            self._version = version
+            self._dirty = True
+        log.info(f"[Cloud] snapshot v{version}: {xyz.shape[0]} pts")
 
-    This mirrors the server's BlockColorCache versioned-block design, keeping
-    client RAM proportional to the scene size rather than cumulative updates.
-    """
+    def apply_delta(self, version, xyz, rgb, since_version):
+        if xyz.shape[0] == 0:
+            return
+        with self._lock:
+            self._blocks[version] = (xyz, rgb)
+            self._version = version
+            self._dirty = True
+        log.info(f"[Cloud] delta v{since_version}→{version}: +{xyz.shape[0]} pts")
+
+    def take_if_dirty(self):
+        with self._lock:
+            if not self._dirty or not self._blocks:
+                return None
+            self._dirty = False
+            xyz = np.concatenate([b[0] for b in self._blocks.values()])
+            rgb = np.concatenate([b[1] for b in self._blocks.values()])
+            return xyz, rgb
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Client-side pose predictor (netcode-style dead reckoning + reconciliation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class PosePredictor:
+    """Holds the latest authoritative pose and extrapolates it to 'now'."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        # key → (xyz (M,3), rgb (M,3))
-        self._blocks: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-        self._version = 0
-        self._n_total = 0
+        self._have = False
+        self._sample: proto.PoseState | None = None
+        self._recv_monotonic = 0.0
+        # displayed (smoothed) render state
+        self._disp_pos = np.zeros(3, np.float32)
+        self._disp_quat = quat_identity().astype(np.float32)
 
-    def apply_snapshot(self, version: int, xyz: np.ndarray, rgb: np.ndarray):
+    def on_pose(self, pose: proto.PoseState):
         with self._lock:
-            # Snapshot replaces everything — treat as one mega block
-            self._blocks = {0: (xyz, rgb)}
-            self._version = version
-            self._n_total = xyz.shape[0]
-        log.info(f"[Cloud] Snapshot v{version}: {xyz.shape[0]} pts")
+            self._sample = pose
+            self._recv_monotonic = time.monotonic()
+            if not self._have:
+                self._disp_pos = pose.position.astype(np.float32)
+                self._disp_quat = quat_normalize(pose.quaternion).astype(np.float32)
+                self._have = True
 
-    def apply_delta(self, version: int, xyz: np.ndarray, rgb: np.ndarray,
-                    since_version: int):
+    def step(self, dt_render: float):
+        """Advance the displayed state toward the extrapolated target.
+        Returns (position, quaternion, fix_quality, age_s) or None."""
         with self._lock:
-            if xyz.shape[0] == 0:
-                return
-            # Simple merge: append new points under a version-keyed block
-            # (The server groups them by block key; we just keep per-version
-            # chunks since the server re-sends only changed blocks.)
-            self._blocks[version] = (xyz, rgb)
-            self._version = version
-            self._n_total = sum(v[0].shape[0] for v in self._blocks.values())
-        log.info(f"[Cloud] Delta v{since_version}→{version}: +{xyz.shape[0]} pts "
-                 f"(total={self._n_total})")
+            if not self._have or self._sample is None:
+                return None
+            s = self._sample
+            age = time.monotonic() - self._recv_monotonic
 
-    def get_flat(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return (xyz, rgb) merged across all blocks."""
-        with self._lock:
-            if not self._blocks:
-                empty = np.zeros((0, 3), dtype=np.float32)
-                return empty, empty
-            chunks_xyz = [b[0] for b in self._blocks.values()]
-            chunks_rgb = [b[1] for b in self._blocks.values()]
-            return np.concatenate(chunks_xyz), np.concatenate(chunks_rgb)
+            # velocity decay once the stream is stale → coast to a stop
+            if age <= STALE_S:
+                scale = 1.0
+            else:
+                scale = max(0.0, 1.0 - (age - STALE_S) / max(DECAY_S, 1e-3))
+            lin = s.linear_velocity * scale
+            ang = s.angular_velocity * scale
 
-    @property
-    def version(self):
-        return self._version
+            tgt_pos, tgt_quat = integrate_pose(s.position, s.quaternion, lin, ang, age)
+
+            # critically-damped blend of displayed → target (reconciliation)
+            alpha = 1.0 - np.exp(-dt_render / max(SMOOTH_TAU, 1e-3))
+            self._disp_pos = ((1 - alpha) * self._disp_pos + alpha * tgt_pos).astype(np.float32)
+            self._disp_quat = quat_slerp(self._disp_quat, tgt_quat, alpha).astype(np.float32)
+            return self._disp_pos.copy(), self._disp_quat.copy(), s.fix_quality, age
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Rerun logger
+# Viewer
 # ─────────────────────────────────────────────────────────────────────────────
 
-class RerunLogger:
-    def __init__(self):
-        rr.init("VAT-PRISM-Viewer", spawn=True)
-        log.info("[Rerun] Viewer spawned.")
-
-        # Coordinate axes: ROS-style (X forward, Z up)
-        rr.log(RR_WORLD, rr.ViewCoordinates.RIGHT_HAND_Y_UP, static=True)
-
-        self._cloud = LocalCloud()
-        self._last_render_version = -1
-        self._render_lock = threading.Lock()
-
-    def on_pcd_message(self, data: bytes):
-        try:
-            version, xyz, rgb, is_snapshot, since_v = _unpack_pcd(data)
-        except Exception as e:
-            log.warning(f"[Rerun] PCD decode error: {e}")
-            return
-
-        if is_snapshot:
-            self._cloud.apply_snapshot(version, xyz, rgb)
-        else:
-            self._cloud.apply_delta(version, xyz, rgb, since_v)
-
-        self._render()
-
-    def on_trajectory(self, data: bytes):
-        try:
-            positions = _unpack_trajectory(data)
-        except Exception as e:
-            log.warning(f"[Rerun] Trajectory decode error: {e}")
-            return
-        if positions.shape[0] == 0:
-            return
-        rr.log(RR_TRAJ, rr.LineStrips3D(
-            [positions],
-            colors=[[255, 200, 60]],
-            radii=0.01,
-        ))
-
-    def on_status(self, data: bytes):
-        try:
-            status = json.loads(data.decode())
-            rr.log(RR_STATUS, rr.TextLog(json.dumps(status)))
-            log.info(f"[Server status] {status}")
-        except Exception:
-            pass
-
-    def _render(self):
-        with self._render_lock:
-            if self._cloud.version == self._last_render_version:
-                return
-            xyz, rgb = self._cloud.get_flat()
-            if xyz.shape[0] == 0:
-                return
-            # Rerun expects uint8 colors [0, 255]
-            colors_u8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-            rr.log(RR_PCD, rr.Points3D(
-                positions=xyz,
-                colors=colors_u8,
-                radii=0.01,
-            ))
-            self._last_render_version = self._cloud.version
-            log.debug(f"[Rerun] Rendered {xyz.shape[0]} pts v{self._cloud.version}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main viewer
-# ─────────────────────────────────────────────────────────────────────────────
 
 class PRISMViewer:
-    def __init__(self, request_snapshot: bool = False):
+    def __init__(self, request_snapshot=False):
+        rr.init("VAT-PRISM-Viewer", spawn=True)
+        rr.log(RR_WORLD, rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+        # static robot body box (sits under the robot transform)
+        rr.log(f"{RR_ROBOT}/body",
+               rr.Boxes3D(half_sizes=[ROBOT_HALF], colors=[[120, 180, 255]]),
+               static=True)
+        rr.log(f"{RR_ROBOT}/heading",
+               rr.Arrows3D(origins=[[0, 0, 0]], vectors=[[0.5, 0, 0]],
+                           colors=[[255, 80, 80]]), static=True)
+
+        self._cloud = LocalCloud()
+        self._predictor = PosePredictor()
+
         log.info(f"[Viewer] Connecting to Zenoh at {ZENOH_ROUTER}...")
         conf = zenoh.Config()
         conf.insert_json5("connect/endpoints", f'["{ZENOH_ROUTER}"]')
         conf.insert_json5("mode", '"client"')
-        self._z = zenoh.open(conf)
+        self._z = self._open_with_retry(conf)
         log.info("[Viewer] Connected.")
 
-        self._logger = RerunLogger()
-
-        # Subscribe to all server output keys
-        self._z.declare_subscriber(KEY_PCD_DELTA,    self._on_delta)
-        self._z.declare_subscriber(KEY_PCD_SNAPSHOT, self._on_snapshot)
-        self._z.declare_subscriber(KEY_TRAJECTORY,   self._on_trajectory)
-        self._z.declare_subscriber(KEY_STATUS,       self._on_status)
-
-        log.info(f"[Viewer] Subscribed to {KEY_PCD_DELTA} and {KEY_PCD_SNAPSHOT}")
+        self._z.declare_subscriber(_KEYS["pcd_delta"],    self._on_pcd)
+        self._z.declare_subscriber(_KEYS["pcd_snapshot"], self._on_pcd)
+        self._z.declare_subscriber(_KEYS["trajectory"],   self._on_traj)
+        self._z.declare_subscriber(_KEYS["status"],       self._on_status)
+        self._z.declare_subscriber(_KEYS["pose"],         self._on_pose)
+        log.info(f"[Viewer] subscribed: pcd, trajectory, status, pose "
+                 f"('{_KEYS['pose']}')")
 
         if request_snapshot:
             self._request_snapshot()
 
-    def _on_delta(self, sample):
-        self._logger.on_pcd_message(bytes(sample.payload))
+        self._stop = threading.Event()
+        self._render_thread = threading.Thread(target=self._render_loop, daemon=True)
+        self._render_thread.start()
 
-    def _on_snapshot(self, sample):
-        self._logger.on_pcd_message(bytes(sample.payload))
+    @staticmethod
+    def _open_with_retry(conf):
+        while True:
+            try:
+                return zenoh.open(conf)
+            except Exception as e:
+                log.warning(f"[Viewer] Zenoh connect failed: {e} — retrying in 5s")
+                time.sleep(5)
 
-    def _on_trajectory(self, sample):
-        self._logger.on_trajectory(bytes(sample.payload))
+    # ── subscriber callbacks (keep light; no blocking) ─────────────────────────
+
+    def _on_pcd(self, sample):
+        try:
+            v, xyz, rgb, is_snap, since_v = proto.unpack_pcd(bytes(sample.payload))
+        except proto.ProtocolError as e:
+            log.warning(f"[Viewer] pcd decode: {e}")
+            return
+        if is_snap:
+            self._cloud.apply_snapshot(v, xyz, rgb)
+        else:
+            self._cloud.apply_delta(v, xyz, rgb, since_v)
+
+    def _on_traj(self, sample):
+        try:
+            pts = proto.unpack_trajectory(bytes(sample.payload))
+        except proto.ProtocolError as e:
+            log.warning(f"[Viewer] traj decode: {e}")
+            return
+        if pts.shape[0] >= 2:
+            rr.log(RR_TRAJ, rr.LineStrips3D([pts], colors=[[255, 200, 60]], radii=0.01))
+
+    def _on_pose(self, sample):
+        try:
+            pose = proto.unpack_pose(bytes(sample.payload))
+        except proto.ProtocolError as e:
+            log.warning(f"[Viewer] pose decode: {e}")
+            return
+        self._predictor.on_pose(pose)
 
     def _on_status(self, sample):
-        self._logger.on_status(bytes(sample.payload))
+        try:
+            status = json.loads(bytes(sample.payload).decode())
+            rr.log("status", rr.TextLog(json.dumps(status)))
+        except Exception:
+            pass
 
     def _request_snapshot(self):
-        """Query the server for the full current snapshot."""
-        log.info(f"[Viewer] Requesting snapshot from '{KEY_PCD_SNAPSHOT}'...")
-        replies = self._z.get(KEY_PCD_SNAPSHOT, timeout=5.0)
-        for reply in replies:
-            if reply.ok:
-                data = bytes(reply.result.payload)
-                if len(data) > _HEADER_SIZE:
-                    self._logger.on_pcd_message(data)
-                    log.info("[Viewer] Snapshot received and rendered.")
-                else:
-                    log.warning("[Viewer] Empty snapshot reply — server may not have data yet.")
+        log.info(f"[Viewer] requesting snapshot from '{_KEYS['pcd_snapshot']}'...")
+        try:
+            for reply in self._z.get(_KEYS["pcd_snapshot"], timeout=5.0):
+                if reply.ok:
+                    data = bytes(reply.result.payload)
+                    if len(data) > 20:
+                        v, xyz, rgb, *_ = proto.unpack_pcd(data)
+                        self._cloud.apply_snapshot(v, xyz, rgb)
+        except Exception as e:
+            log.warning(f"[Viewer] snapshot request failed: {e}")
+
+    # ── render loop ─────────────────────────────────────────────────────────────
+
+    def _render_loop(self):
+        period = 1.0 / max(RENDER_HZ, 1.0)
+        last = time.monotonic()
+        while not self._stop.is_set():
+            now = time.monotonic()
+            dt = now - last
+            last = now
+
+            # point cloud (only when changed)
+            cloud = self._cloud.take_if_dirty()
+            if cloud is not None:
+                xyz, rgb = cloud
+                colors = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+                rr.log(RR_PCD, rr.Points3D(positions=xyz, colors=colors, radii=0.01))
+
+            # robot avatar (every frame, predicted)
+            pred = self._predictor.step(dt)
+            if pred is not None:
+                pos, quat, fix, age = pred
+                rr.log(RR_ROBOT, rr.Transform3D(
+                    translation=pos, rotation=rr.Quaternion(xyzw=quat)))
+                color = [80, 220, 120] if fix == proto.FIX_CORRECTED else [255, 190, 60]
+                rr.log(f"{RR_ROBOT}/body",
+                       rr.Boxes3D(half_sizes=[ROBOT_HALF], colors=[color]))
+
+            time.sleep(max(0.0, period - (time.monotonic() - now)))
 
     def run(self):
-        log.info("[Viewer] Rendering. Press Ctrl+C to quit.")
+        log.info("[Viewer] Rendering. Ctrl+C to quit.")
         try:
             while True:
                 time.sleep(1.0)
         except KeyboardInterrupt:
             log.info("[Viewer] Shutting down.")
         finally:
+            self._stop.set()
             self._z.close()
 
 
@@ -310,9 +303,7 @@ def main():
     parser.add_argument("--snapshot", action="store_true",
                         help="Request full snapshot from server on start")
     args = parser.parse_args()
-
-    viewer = PRISMViewer(request_snapshot=args.snapshot)
-    viewer.run()
+    PRISMViewer(request_snapshot=args.snapshot).run()
 
 
 if __name__ == "__main__":

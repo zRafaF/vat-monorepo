@@ -1,0 +1,48 @@
+# VAT Robot — Docker container (bridge + decimator + pose fuser)
+# ==============================================================
+# The Jetson has NO docker-compose, so this unit drives plain `docker run`.
+# It complements vat-robot.service (the host ROS Foxy camera stack).
+#
+# Install
+# -------
+#   # build the image once (from the repo root):
+#   docker build -f robot/docker/Dockerfile -t vat-robot-docker .
+#
+#   sudo cp robot/systemd/vat-robot-docker.service /etc/systemd/system/
+#   # edit ZENOH_CONNECT below to point at your server, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vat-robot-docker.service
+#
+# Logs:  sudo journalctl -fu vat-robot-docker   (and: docker logs -f vat-robot)
+
+[Unit]
+Description=VAT Robot — Docker (ROS↔Zenoh bridge + frame decimator + pose fuser)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit these to match your deployment:
+Environment="ROBOT_NAME=go2"
+Environment="ZENOH_CONNECT=tcp/127.0.0.1:7447"
+
+# Remove any stale container, then run in the foreground so systemd supervises it.
+ExecStartPre=-/usr/bin/docker rm -f vat-robot
+ExecStart=/usr/bin/docker run --rm --name vat-robot \
+    --network host --ipc host \
+    -e ROBOT_NAME=${ROBOT_NAME} \
+    -e ZENOH_CONNECT=${ZENOH_CONNECT} \
+    vat-robot-docker
+ExecStop=/usr/bin/docker stop vat-robot
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vat-robot-docker
+
+[Install]
+WantedBy=multi-user.target
