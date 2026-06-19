@@ -110,9 +110,11 @@ robot-ros:
 	ROS_DISTRO=$(ROS_DISTRO) ROS2_WS=$(ROS2_WS) bash robot/ros/bringup_camera.sh
 
 # [ROBOT] Container: ROS↔Zenoh bridge + frame decimator + pose fuser.
+# Invoked via `bash` so it doesn't depend on the executable bit (git on Windows
+# doesn't preserve it). If docker needs root on your robot: `sudo make robot-docker`.
 robot-docker:
 	@echo ">> [ROBOT] build + run container → router $(ROUTER_IP)"
-	./robot/docker/run.sh $(ROUTER_IP)
+	bash robot/docker/run.sh $(ROUTER_IP)
 
 # [CLIENT] Full POC viewer.
 viewer: sync-client
