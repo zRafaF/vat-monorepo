@@ -94,7 +94,7 @@ sync-docs:
 # [SERVER] The Zenoh router (hub). Binds ZENOH_LISTEN; leave it running.
 router: sync-router
 	@echo ">> Router binding $(ZENOH_LISTEN)  (clients dial $(ROUTER_IP):$(ROUTER_PORT))"
-	cd server/router && ZENOH_LISTEN=$(ZENOH_LISTEN) uv run python router.py
+	cd server/router && uv run python router.py
 
 # [SERVER] PRISM mapping server. Needs a GPU + the PRISM-VGGT submodule.
 # Runs in its own isolated env (server/mapping/.venv).
