@@ -17,7 +17,7 @@ CLIENT_RUN ?= cd client && uv run python
 
 # Robot host ROS settings (override as needed)
 ROS_DISTRO ?= foxy
-VAT_WS     ?= $(HOME)/vat_ws
+ROS2_WS    ?= $(HOME)/ros2_ws
 
 .DEFAULT_GOAL := help
 
@@ -103,12 +103,11 @@ mapping: sync-mapping
 	@echo ">> Connecting to $(ZENOH_ROUTER)  (may be a different datacenter — OK)"
 	cd server/mapping && uv run python mapping_server.py
 
-# [ROBOT] Host ROS Foxy camera stack (Insta360 → equirectangular).
+# [ROBOT] Host ROS camera stack: Insta360 → /equirectangular/image.
+# Handles the CycloneDDS eth0 fix + sources ~/ros2_ws + equirectangular mode.
 robot-ros:
-	@echo ">> [ROBOT] launching host ROS $(ROS_DISTRO) camera stack"
-	bash -c 'source /opt/ros/$(ROS_DISTRO)/setup.bash && \
-	         source $(VAT_WS)/install/setup.bash && \
-	         ros2 launch vat_bringup vat_bringup.launch.xml'
+	@echo ">> [ROBOT] camera bringup (ROS $(ROS_DISTRO), ws=$(ROS2_WS))"
+	ROS_DISTRO=$(ROS_DISTRO) ROS2_WS=$(ROS2_WS) bash robot/ros/bringup_camera.sh
 
 # [ROBOT] Container: ROS↔Zenoh bridge + frame decimator + pose fuser.
 robot-docker:

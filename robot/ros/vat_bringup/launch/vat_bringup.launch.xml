@@ -1,19 +1,26 @@
 <launch>
   <!-- ========================================================
-       VAT Robot ROS2 Bringup  (ROS Foxy, Jetson)
+       VAT Robot ROS2 Bringup  (ROS Foxy, Go2-W)  — OPTIONAL WRAPPER
        ========================================================
+       This is a thin wrapper around the insta360_ros_driver bringup. It is
+       NOT required: the canonical camera bringup is `make robot-ros`
+       (robot/ros/bringup_camera.sh), which launches the driver directly and
+       also applies the CycloneDDS eth0 fix.
+
        Starts the ROS2-side of the stack:
          1. Insta360 camera driver (C++) → /dual_fisheye/image/compressed
          2. H.264 decoder (C++)          → /dual_fisheye/image
          3. Equirectangular node (GPU)   → /equirectangular/image
          [optional] IMU Madgwick filter
 
-       Frame decimation + Zenoh bridging run separately in Docker:
-         cd robot/docker && docker compose up -d --build
+       Frame decimation + Zenoh bridging run separately in the Docker
+       container (make robot-docker).
 
-       Quick start:
-         source /opt/ros/foxy/setup.bash
-         source ~/vat_ws/install/setup.bash
+       To use this wrapper you must symlink it into ~/ros2_ws/src and build:
+         ln -sfn $(pwd)/robot/ros/vat_bringup ~/ros2_ws/src/vat_bringup
+         cd ~/ros2_ws && colcon build --symlink-install
+         source install/setup.bash
+         export CYCLONEDDS_URI='<CycloneDDS>…name="eth0"…</CycloneDDS>'
          ros2 launch vat_bringup vat_bringup.launch.xml
        ======================================================== -->
 

@@ -139,7 +139,9 @@ vat-monorepo/
 │   │   ├── frame_decimator.py  ← best-of-window frames + camera-height stamp
 │   │   ├── pose_fuser.py       ← PLACEHOLDER authoritative-pose fuser
 │   │   └── kinematics.py       ← camera↔base transform + camera-height + body state
-│   ├── ros/vat_bringup/        ← ROS2 launch pkg for the camera stack (host Foxy)
+│   ├── ros/
+│   │   ├── bringup_camera.sh   ← camera bringup: CycloneDDS fix + insta360 equirect
+│   │   └── vat_bringup/        ← optional ROS2 launch wrapper (not required)
 │   └── systemd/
 │       ├── vat-robot.service        ← host ROS2 camera stack (Foxy)
 │       └── vat-robot-docker.service ← the Docker container (docker run, no compose)
@@ -205,18 +207,30 @@ torch = { index = "pytorch-cu121" }
 cd client && uv sync && cd -
 ```
 
-### 4. Build the robot ROS2 camera stack (Jetson, host Foxy)
+### 4. Build the robot ROS2 camera stack (Go2-W, host Foxy)
+
+The only ROS node on the host is the **`insta360_ros_driver`**, built in
+`~/ros2_ws`. Follow [robot setup](setup/robot.md) for the full driver + SDK +
+udev install, then build:
 
 ```bash
-# Only the camera driver + bringup run as ROS nodes on the host (Foxy).
-mkdir -p ~/vat_ws/src
-ln -sfn $(pwd)/robot/ros/vat_bringup  ~/vat_ws/src/vat_bringup
-# insta360_ros_driver should already be there from the original setup
-
-cd ~/vat_ws
+cd ~/ros2_ws
 source /opt/ros/foxy/setup.bash
 colcon build --symlink-install
+source install/setup.bash
 ```
+
+Bring the camera up (equirectangular mode is what PRISM consumes). `make
+robot-ros` wraps the CycloneDDS eth0 fix + sourcing + launch:
+
+```bash
+make robot-ros
+# = ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
+```
+
+This publishes `/equirectangular/image`, `/dual_fisheye/image[/compressed]` and
+`/imu/data`. (`robot/ros/vat_bringup/` is an optional convenience wrapper — not
+required; the bring-up script launches the driver directly.)
 
 ### 5. Build & run the robot Docker container (Jetson — NO compose)
 
@@ -644,12 +658,20 @@ This is resolved once the true online engine mode is implemented.
 → Set the real stick geometry via `STICK_OFFSET_X/Y/Z`; check the `SportModeState`
    decode isn't silently falling back (look for the one-time decode-failure warning).
 
-**`frame_publisher` not found in `ros2 launch`**  
-→ Run `colcon build --symlink-install` in the ROS2 workspace and `source install/setup.bash`.
+**`ros2 topic list` is empty / `package not found` on the robot**  
+→ Export the CycloneDDS fix first (the Go2 points at the wrong interface):
+   `export CYCLONEDDS_URI='<CycloneDDS>…<NetworkInterface name="eth0"/>…</CycloneDDS>'`
+   `make robot-ros` does this for you.  
+→ `insta360_ros_driver` must be built: `cd ~/ros2_ws && colcon build --symlink-install && source install/setup.bash`.
+
+**No `/equirectangular/image` topic**  
+→ The driver defaults `equirectangular:=false`. `make robot-ros` passes
+   `equirectangular:=true`; if launching by hand, add it.  
+→ Camera must be in **Dual-Lens** mode with **USB = Android**, and `/dev/insta` present.
 
 **Throttle Zenoh update has no effect**  
-→ Confirm the `frame_publisher` node's `zenoh_router` param matches your router.  
-→ Check the node log: `ros2 node log /frame_publisher`.
+→ Confirm the decimator's `ZENOH_CONNECT` matches your router, and that frames
+   are flowing (`make test_frames_server`).
 
 **Robot avatar doesn't move (no pose in viewer)**  
 → `zenoh sub --key 'go2/prism/pose'` to confirm `pose_fuser.py` is publishing.  

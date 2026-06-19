@@ -124,16 +124,24 @@ sudo chmod 777 /dev/insta
 
 
 ## 7. Usage
-**IMPORTANT:** Every time you open a new terminal, you must source both the Unitree environment and your local workspace.
+**IMPORTANT:** Every time you open a new terminal, you must source both the Unitree environment and your local workspace, and export the CycloneDDS fix.
 
 
 ```bash
+# Required on the Go2 — pin CycloneDDS to the real interface (else discovery fails)
+export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>'
+
 source ~/unitree_ros2/setup.sh
 source ~/ros2_ws/install/setup.bash
 
-# Launch the camera driver
-ros2 launch insta360_ros_driver bringup.launch.xml
+# Launch the camera driver in EQUIRECTANGULAR mode (what PRISM consumes;
+# the driver defaults this arg to false!)
+ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
 ```
+
+> From the VAT repo you can replace all of the above with **`make robot-ros`**,
+> which applies the CycloneDDS fix, sources `~/ros2_ws`, and launches the driver
+> in equirectangular mode via `robot/ros/bringup_camera.sh`.
 
 
 # Seting up Zenoh ROS bridge for Cloud Connectivity

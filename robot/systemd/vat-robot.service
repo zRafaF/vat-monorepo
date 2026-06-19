@@ -1,40 +1,39 @@
-# VAT Robot — ROS2 stack systemd service
+# VAT Robot — ROS2 camera stack systemd service
 # ============================================================
-# Starts the ROS2 camera stack on boot (Jetson, ROS Foxy).
+# Starts the Insta360 equirectangular camera stack on boot (Go2-W, ROS Foxy).
 # The Docker container (bridge + decimator + pose fuser) is managed separately
-# by vat-robot-docker.service (the Jetson has no docker-compose):
+# by vat-robot-docker.service:
 #   docker build -f robot/docker/Dockerfile -t vat-robot-docker .
 #   sudo systemctl enable --now vat-robot-docker.service
 #
-# Install
-# -------
+# Install (edit User/paths below to match your robot — defaults assume the
+# Unitree user and the repo at ~/Desktop/vat-monorepo):
 #   sudo cp robot/systemd/vat-robot.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable vat-robot.service
-#   sudo systemctl start  vat-robot.service
+#   sudo systemctl enable --now vat-robot.service
 #
-# Logs
-#   sudo journalctl -fu vat-robot
+# Logs:  sudo journalctl -fu vat-robot
 # ============================================================
 
 [Unit]
-Description=VAT Robot — ROS2 camera stack (Insta360 + equirectangular)
+Description=VAT Robot — Insta360 equirectangular camera stack
 After=network-online.target systemd-udev-settle.service
 Wants=network-online.target systemd-udev-settle.service
 
 [Service]
 Type=simple
-User=jetson
-Group=jetson
+User=unitree
+Group=unitree
 
-Environment="HOME=/home/jetson"
-Environment="VAT_WS=/home/jetson/vat_ws"
-Environment="ROS_DOMAIN_ID=42"
+Environment="HOME=/home/unitree"
+Environment="ROS_DISTRO=foxy"
+Environment="ROS2_WS=/home/unitree/ros2_ws"
+Environment="NET_IFACE=eth0"
 
-ExecStart=/bin/bash -c '\
-    source /opt/ros/foxy/setup.bash && \
-    source ${VAT_WS}/install/setup.bash && \
-    exec ros2 launch vat_bringup vat_bringup.launch.xml'
+# The bringup script applies the CycloneDDS eth0 fix, sources ~/ros2_ws and
+# launches the Insta360 driver in equirectangular mode.
+WorkingDirectory=/home/unitree/Desktop/vat-monorepo
+ExecStart=/bin/bash robot/ros/bringup_camera.sh
 
 Restart=on-failure
 RestartSec=5s

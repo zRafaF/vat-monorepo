@@ -14,35 +14,35 @@ To bridge ROS 2 topics from the robot to the remote Zenoh network, we utilize a 
 
 ### Deployment Instructions
 
-#### 1. Build the Image
+The bridge no longer runs alone — it ships in **one** container alongside the
+frame decimator and the pose fuser (`robot/docker/`). The Go2 has no
+docker-compose, so it's built from the repo root and run via `run.sh`, wrapped
+by `make robot-docker`.
 
-Run this command on the Jetson board to build the bridge container. It includes the official Zenoh library and the necessary ROS Humble components.
+#### 1. Build & run the container
 
 ```bash
-docker build -t zenoh-ros-bridge:latest .
+# from the repo root (config — router IP, robot name — comes from vat.env)
+make robot-docker
+# = ./robot/docker/run.sh $ROUTER_IP
+#   (docker build -f robot/docker/Dockerfile … then docker run --network host …)
 ```
 
-#### 2. Run the Container
+The container uses `--network host` to "see" the Foxy nodes on the robot.
+Config comes from `vat.env` (`ROBOT_NAME`, `ZENOH_CONNECT=tcp/$ROUTER_IP:7447`).
 
-The container requires `--net=host` to "see" the Foxy nodes on the robot. Use the `-e` flags to configure your specific environment.
+#### 2. Monitoring
 
 ```bash
-docker run -d \
-  --name zenoh_bridge \
-  --net=host \
-  --restart unless-stopped \
-  -e ROBOT_NAME="jetson_robot" \
-  -e ZENOH_CONNECT="tcp/100.125.156.19:7447" \
-  -e LOG_LEVEL="INFO" \
-  zenoh-ros-bridge:latest
+docker logs -f vat-robot       # expect "Registered Zenoh route ..." per topic
 ```
 
-#### 3. Monitoring
-
-To verify the bridge is discovering topics and activating routes based on demand, use the logs:
+#### 3. Auto-start on boot
 
 ```bash
-docker logs -f zenoh_bridge
+sudo cp robot/systemd/vat-robot-docker.service /etc/systemd/system/   # edit ZENOH_CONNECT
+sudo systemctl enable --now vat-robot-docker.service
+sudo journalctl -fu vat-robot-docker
 ```
 
 ---
@@ -98,12 +98,30 @@ docker logs -f zenoh_bridge
     
     The current **Humble Docker + Python Bridge** was chosen because it successfully bypassed these discovery issues. Since it utilizes the standard `rclpy` library, it maintains native compatibility with the robot's ROS graph while still leveraging Zenoh for long-distance transport.
 
-## RGB-D Camera Setup
+## Camera Setup (Insta360 360° → equirectangular)
 
-To start the RGB-D camera, you can run the following command on the robot:
+The VAT camera is an **Insta360** (dual-fisheye) driven by the
+[`insta360_ros_driver`](https://github.com/ai4ce/insta360_ros_driver), built in
+`~/ros2_ws`. See [robot/README.md](https://github.com/zrafaf/vat-monorepo/blob/main/robot/README.md)
+for the full driver + SDK + udev install. Prerequisites: camera in **Dual-Lens**
+mode, **USB mode = Android**, and the `/dev/insta` udev rule created.
+
+Bring the camera up in **equirectangular** mode (what PRISM consumes). From the
+repo root, `make robot-ros` wraps the CycloneDDS eth0 fix + sourcing + launch:
 
 ```bash
-roslaunch realsense2_camera rs_camera.launch
+make robot-ros
+# = bash robot/ros/bringup_camera.sh
+#   → ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
+```
+
+Published topics: `/equirectangular/image`, `/dual_fisheye/image[/compressed]`,
+`/imu/data[_raw]`. Verify:
+
+```bash
+export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>'
+source ~/ros2_ws/install/setup.bash
+ros2 topic hz /equirectangular/image
 ```
 
 ## Known Issues
@@ -134,3 +152,8 @@ I didn't try to fix it just used a workaround by running the follwing command be
 ```bash
 export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>'
 ```
+
+> **Note:** `make robot-ros` (via `robot/ros/bringup_camera.sh`) and the
+> `vat-robot.service` systemd unit already export this before launching, so you
+> only need it manually for ad-hoc `ros2 topic …` commands. Tip: add it to your
+> `~/.bashrc` so every shell has it. Override the interface with `NET_IFACE`.

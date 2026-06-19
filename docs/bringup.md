@@ -51,16 +51,20 @@ make router
 # = cd server/router && uv run python router.py   (binds ZENOH_LISTEN from vat.env)
 ```
 
-**🤖 ROBOT — start the camera stack + container:**
+**🤖 ROBOT — start the camera stack + container.** One-time prereqs (see
+[robot setup](setup/robot.md)): `insta360_ros_driver` built in `~/ros2_ws`,
+camera in **Dual-Lens** mode with **USB = Android**, and the `/dev/insta` udev
+rule. Then, from the repo (e.g. `~/Desktop/vat-monorepo`):
 
 ```bash
-# host ROS Foxy camera stack (Insta360 → equirectangular)
-source /opt/ros/foxy/setup.bash && source ~/vat_ws/install/setup.bash
-ros2 launch vat_bringup vat_bringup.launch.xml
+# host ROS camera stack — applies the CycloneDDS eth0 fix, sources ~/ros2_ws,
+# and launches the Insta360 driver in equirectangular mode (what PRISM needs)
+make robot-ros
+# = bash robot/ros/bringup_camera.sh
+#   → ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
 
 # in another shell: bridge + decimator + pose fuser (no compose)
-cd ~/vat-monorepo
-./robot/docker/run.sh $SERVER_IP
+make robot-docker
 docker logs -f vat-robot          # watch for "Registered Zenoh route ..."
 ```
 
