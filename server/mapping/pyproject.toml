@@ -2,6 +2,9 @@
 name = "vat-mapping"
 version = "0.1.0"
 description = "VAT mapping server — runs the PRISM-VGGT pipeline and streams point cloud deltas + pose corrections"
+# A STANDALONE microservice (excluded from the root workspace) with its own
+# isolated env, so its heavy CUDA/torch stack never touches the client/router.
+#   cd server/mapping && uv sync && uv run python mapping_server.py
 requires-python = ">=3.10"
 dependencies = [
     # Transport
@@ -19,6 +22,11 @@ dependencies = [
     # To force a CUDA build, pin torch here and add the pytorch index below.
 ]
 
+[tool.uv]
+# Virtual project: install the dependencies into this dir's own .venv, but don't
+# build/package mapping_server.py — it's run as a script (uv run python …).
+package = false
+
 # ── PRISM-VGGT as a local editable path dep ───────────────────────────────────
 # The submodule now lives at server/mapping/PRISM-VGGT.  After cloning:
 #   git submodule update --init server/mapping/PRISM-VGGT
@@ -34,11 +42,3 @@ prism-vggt = { path = "PRISM-VGGT", editable = true }
 # [tool.uv.sources]
 # torch = { index = "pytorch-cu121" }
 # torchvision = { index = "pytorch-cu121" }
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-# Single-module application — ship just the server script.
-[tool.hatch.build.targets.wheel]
-only-include = ["mapping_server.py"]

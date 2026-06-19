@@ -1,61 +1,161 @@
-# Configuration
-PROTO_DIR := proto
-OUT_DIR := proto
-PROTO_FILES := $(wildcard $(PROTO_DIR)/*.proto)
+# ============================================================================
+# VAT — central control file
+# ============================================================================
+# Public config lives in vat.env (safe to commit). This Makefile drives setup,
+# the services (router / mapping / robot), and the staged pre-POC tests.
+#
+#   make help     → list targets + the staged test order
+#   make steps    → print the full pre-POC → POC runbook
+# ============================================================================
 
-# OS Detection for Clean Command
-ifeq ($(OS),Windows_NT)
-    # Windows
-    CLEAN_CMD := del /Q *_pb2.py
-else
-    # Linux / macOS
-    CLEAN_CMD := rm -f *_pb2.py
-endif
+include vat.env
+export                          # export every vat.env var to recipe shells
 
-.PHONY: all build clean \
-        sync sync-mapping sync-client sync-router router sync-docs \
-        docs docs-serve
+# Client-side tools + viewer run in the root workspace env (vat-client).
+TOOL ?= uv run --package vat-client python
 
-all: build
+# Robot host ROS settings (override as needed)
+ROS_DISTRO ?= foxy
+VAT_WS     ?= $(HOME)/vat_ws
 
-# ── uv workspace ────────────────────────────────────────────────────────────
-# Install all workspace members (server + client + doc deps)
+.DEFAULT_GOAL := help
+
+.PHONY: help steps \
+        sync sync-mapping sync-client sync-router sync-docs \
+        router mapping robot-ros robot-docker viewer \
+        test_link test_frames_robot test_frames_server test_robot_state test_poses \
+        docs docs-serve clean
+
+# ── Help / runbook ───────────────────────────────────────────────────────────
+help:
+	@echo "VAT control file   router=$(ROUTER_IP):$(ROUTER_PORT)   robot=$(ROBOT_NAME)"
+	@echo ""
+	@echo "Setup:"
+	@echo "  make sync-router     isolated env for the Zenoh router"
+	@echo "  make sync-mapping    mapping server env (GPU machine, CUDA)"
+	@echo "  make sync-client     client + bring-up tools env"
+	@echo ""
+	@echo "Services:"
+	@echo "  make router          [SERVER] run the Zenoh router (hub)"
+	@echo "  make mapping         [SERVER] run the PRISM mapping server"
+	@echo "  make robot-ros       [ROBOT]  host ROS Foxy camera stack"
+	@echo "  make robot-docker    [ROBOT]  bridge + decimator + pose fuser container"
+	@echo "  make viewer          [CLIENT] full POC viewer (cloud + robot block)"
+	@echo ""
+	@echo "Staged pre-POC tests (run in this order — see 'make steps'):"
+	@echo "  make test_link           0  transport alive (router + bridge + rates)"
+	@echo "  make test_frames_robot   1  raw 360 frames off the robot camera"
+	@echo "  make test_frames_server  1  decimated frames the server ingests"
+	@echo "  make test_robot_state    2  body + limb/foot positions, live"
+	@echo "  make test_poses          3  camera trajectory + fused robot pose"
+	@echo ""
+	@echo "Then: make viewer  (Stage 4, the real POC)"
+
+steps:
+	@echo "VAT pre-POC → POC runbook  (router=$(ROUTER_IP))"
+	@echo "Set up once: SERVER 'make sync-router && make sync-mapping',"
+	@echo "             CLIENT 'make sync-client', ROBOT builds the docker image."
+	@echo ""
+	@echo "Stage 0  Transport"
+	@echo "  [SERVER] make router          # the hub; leave it running"
+	@echo "  [ROBOT]  make robot-ros        # host camera stack (separate shell)"
+	@echo "  [ROBOT]  make robot-docker     # bridge + decimator + fuser"
+	@echo "  [CLIENT] make test_link        # expect bridge ALIVE + non-zero Hz"
+	@echo ""
+	@echo "Stage 1  Frames"
+	@echo "  [CLIENT] make test_frames_robot   # raw equirectangular off the camera"
+	@echo "  [CLIENT] make test_frames_server  # decimated frames + camera_height"
+	@echo ""
+	@echo "Stage 2  Body & limbs"
+	@echo "  [CLIENT] make test_robot_state    # body frame + 4 feet move live"
+	@echo ""
+	@echo "Stage 3  Poses"
+	@echo "  [SERVER] make mapping             # PRISM-VGGT (needs GPU)"
+	@echo "  [CLIENT] make test_poses          # trajectory + fused pose track"
+	@echo ""
+	@echo "Stage 4  Full POC"
+	@echo "  [CLIENT] make viewer              # point cloud + predicted robot block"
+
+# ── Setup (uv) ───────────────────────────────────────────────────────────────
 sync:
 	uv sync --all-groups
 
-# Install only the mapping server (heavy CUDA deps — run on the GPU machine)
 sync-mapping:
-	uv sync --package vat-mapping
+	cd server/mapping && uv sync
 
-# Install only the client package (lightweight — Rerun viewer + bring-up tools)
 sync-client:
 	uv sync --package vat-client
 
-# Install the standalone Zenoh router microservice (isolated env)
 sync-router:
 	cd server/router && uv sync
 
-# Run the Zenoh router (server host)
-router: sync-router
-	cd server/router && uv run python router.py
-
-# Install docs dev-deps and serve locally
 sync-docs:
 	uv sync --group docs
 
-# ── Documentation ───────────────────────────────────────────────────────────
+# ── Services ─────────────────────────────────────────────────────────────────
+# [SERVER] The Zenoh router (hub). Binds ZENOH_LISTEN; leave it running.
+router: sync-router
+	@echo ">> Router binding $(ZENOH_LISTEN)  (clients dial $(ROUTER_IP):$(ROUTER_PORT))"
+	cd server/router && ZENOH_LISTEN=$(ZENOH_LISTEN) uv run python router.py
+
+# [SERVER] PRISM mapping server. Needs a GPU + the PRISM-VGGT submodule.
+# Runs in its own isolated env (server/mapping/.venv).
+mapping: sync-mapping
+	@echo ">> Reminder: the router must be running on $(ROUTER_IP)."
+	@echo ">> Connecting to $(ZENOH_ROUTER)  (may be a different datacenter — OK)"
+	cd server/mapping && uv run python mapping_server.py
+
+# [ROBOT] Host ROS Foxy camera stack (Insta360 → equirectangular).
+robot-ros:
+	@echo ">> [ROBOT] launching host ROS $(ROS_DISTRO) camera stack"
+	bash -c 'source /opt/ros/$(ROS_DISTRO)/setup.bash && \
+	         source $(VAT_WS)/install/setup.bash && \
+	         ros2 launch vat_bringup vat_bringup.launch.xml'
+
+# [ROBOT] Container: ROS↔Zenoh bridge + frame decimator + pose fuser.
+robot-docker:
+	@echo ">> [ROBOT] build + run container → router $(ROUTER_IP)"
+	./robot/docker/run.sh $(ROUTER_IP)
+
+# [CLIENT] Full POC viewer.
+viewer:
+	@echo ">> Reminder: router + mapping server must be running."
+	$(TOOL) client/prism_rerun_viewer.py --snapshot
+
+# ── Staged pre-POC tests ─────────────────────────────────────────────────────
+# Stage 0 — transport alive.
+test_link:
+	@echo ">> Reminder: 'make router' (SERVER) + robot bridge must be running."
+	$(TOOL) tools/check_link.py
+
+# Stage 1a — raw 360 frames straight off the robot camera/bridge.
+test_frames_robot:
+	@echo ">> Reminder: router + 'make robot-ros' (camera stack) + bridge running."
+	$(TOOL) tools/view_frames.py --raw
+
+# Stage 1b — the decimated frames the mapping server actually ingests.
+test_frames_server:
+	@echo ">> Reminder: router + 'make robot-docker' (decimator) running."
+	$(TOOL) tools/view_frames.py
+
+# Stage 2 — body frame + limb/foot positions, live.
+test_robot_state:
+	@echo ">> Reminder: router + robot bridge (publishing sportmodestate) running."
+	$(TOOL) tools/view_robot_state.py
+
+# Stage 3 — camera trajectory + VGGT correction + fused robot pose.
+test_poses:
+	@echo ">> Reminder: router + robot container + 'make mapping' running."
+	$(TOOL) tools/view_poses.py
+
+# ── Docs ─────────────────────────────────────────────────────────────────────
 docs: sync-docs
 	uv run mkdocs build
 
 docs-serve: sync-docs
 	uv run mkdocs serve
 
-build:
-	@echo "Compiling Protobuf files from $(PROTO_DIR)..."
-	protoc -I=$(PROTO_DIR) --python_out=$(OUT_DIR) $(PROTO_FILES)
-	@echo "Done! Generated Python files in $(OUT_DIR)"
-
+# ── Housekeeping ─────────────────────────────────────────────────────────────
 clean:
-	@echo "Cleaning generated files..."
-	-$(CLEAN_CMD)
-	@echo "Clean complete."
+	@find . -name __pycache__ -type d -not -path './.venv/*' -exec rm -rf {} + 2>/dev/null || true
+	@echo "cleaned __pycache__"

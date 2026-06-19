@@ -82,11 +82,13 @@ Requires an NVIDIA GPU + CUDA. The PRISM-VGGT submodule lives at
 ```bash
 # from the repo root
 git submodule update --init server/mapping/PRISM-VGGT
-uv sync --package vat-mapping      # heavy CUDA/torch deps
-source .venv/bin/activate
 
-ZENOH_ROUTER=tcp/127.0.0.1:7447 ROBOT_NAME=go2 \
-  python server/mapping/mapping_server.py
+# its own isolated env (heavy CUDA/torch deps — does not touch router/client)
+cd server/mapping && uv sync
+
+# run it (reads ROUTER_IP etc. from ../../vat.env via the Makefile)
+cd ../.. && make mapping
+# or directly:  cd server/mapping && ZENOH_ROUTER=tcp/<router-ip>:7447 uv run python mapping_server.py
 ```
 
 See [the bring-up runbook](../bringup.md) for the staged test sequence and

@@ -117,7 +117,7 @@ vat-monorepo/
 │   └── vat_protocol.py         ← shared wire formats (robot/server/client import it)
 │
 ├── server/                     ← multiple microservices, each its own uv project
-│   ├── mapping/                ← vat-mapping (workspace member; heavy CUDA deps)
+│   ├── mapping/                ← vat-mapping (ISOLATED env; heavy CUDA deps)
 │   │   ├── pyproject.toml
 │   │   ├── mapping_server.py   ← PRISM mapping + VGGT pose-correction publisher
 │   │   └── PRISM-VGGT/         ← git submodule (git submodule add … — see below)
@@ -177,14 +177,14 @@ git submodule update --init --recursive
 # Install uv if you don't have it
 curl -Lsf https://astral.sh/uv/install.sh | sh
 
-# From the repo root — resolves the full workspace lockfile
-uv sync
+# Client + bring-up tools (lightweight) — from the repo root
+uv sync --package vat-client
 
-# Mapping server only (on the GPU machine)
-uv sync --package vat-mapping
+# Mapping server (its own isolated env, on the GPU machine)
+cd server/mapping && uv sync && cd -
 
-# Activate venv
-source .venv/bin/activate
+# Zenoh router (its own isolated env)
+cd server/router && uv sync && cd -
 ```
 
 **PyTorch + CUDA:** `prism-vggt` requires CUDA-capable torch. If `uv sync` pulls
@@ -271,12 +271,13 @@ cd server/router && uv sync && uv run python router.py     # or: make router
 ### Start the mapping server (cloud / dev machine)
 
 ```bash
-source .venv/bin/activate
-ZENOH_ROUTER=tcp/127.0.0.1:7447 \
-ROBOT_NAME=go2 \
-CAMERA_HEIGHT=0.50 \
-python server/mapping/mapping_server.py
+# from the repo root (config comes from vat.env)
+make mapping
+# = cd server/mapping && uv run python mapping_server.py
 ```
+
+The mapping server reads `ZENOH_ROUTER` from `vat.env` (the router's VPN IP),
+so it connects to the router even from a different datacenter.
 
 Key env vars for the server:
 
@@ -637,7 +638,7 @@ This is resolved once the true online engine mode is implemented.
 → Lower `WINDOW_SIZE` (try 6) or `FACE_SIZE` (try 384).
 
 **`prism-vggt` import error on server**  
-→ Run `git submodule update --init server/mapping/PRISM-VGGT` then `uv sync --package vat-mapping`.
+→ Run `git submodule update --init server/mapping/PRISM-VGGT` then `cd server/mapping && uv sync`.
 
 **Robot block doesn't move / no pose in viewer**  
 → `zenoh sub --key 'go2/prism/pose'` to confirm `pose_fuser.py` publishes.  

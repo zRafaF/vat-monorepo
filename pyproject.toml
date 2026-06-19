@@ -8,19 +8,19 @@ requires-python = "==3.12.*"
 dependencies = []
 
 [tool.uv]
-# uv workspace — members are resolved together under a single lockfile.
-# Each member has its own pyproject.toml and can be synced independently:
-#   uv sync --package vat-mapping
-#   uv sync --package vat-client
+# The root workspace covers the lightweight client (+ the bring-up tools that
+# run in the client env).  Sync it with:  uv sync --package vat-client
 package = false
 
 [tool.uv.workspace]
-# server/ holds multiple microservices.  The mapping server is a workspace
-# member (shares the lockfile); the Zenoh router is intentionally EXCLUDED so it
-# keeps its own isolated env (its light deps never clash with the heavy CUDA
-# stack).  Sync the router separately:  cd server/router && uv sync
-members = ["server/mapping", "client"]
-exclude = ["server/router"]
+# Each server/ microservice is its OWN isolated uv project (own .venv, own
+# lockfile) so the heavy CUDA/torch stack of the mapper and the single light dep
+# of the router never clash with each other or with the client.  Sync them on
+# their own:
+#     cd server/mapping && uv sync      # mapping server (GPU machine)
+#     cd server/router  && uv sync      # Zenoh router
+members = ["client"]
+exclude = ["server/mapping", "server/router"]
 
 # ── Documentation dev-deps (shared across the workspace) ──────────────────────
 [dependency-groups]

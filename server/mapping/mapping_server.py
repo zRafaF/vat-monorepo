@@ -70,7 +70,11 @@ ZENOH_ROUTER  = os.environ.get("ZENOH_ROUTER",  "tcp/127.0.0.1:7447")
 ROBOT_NAME    = os.environ.get("ROBOT_NAME",    "go2")
 SERVER_PREFIX = os.environ.get("SERVER_PREFIX", "server/prism")
 
-WEIGHTS_PATH  = os.environ.get("WEIGHTS_PATH", "server/mapping/PRISM-VGGT/checkpoints/model.pt")
+# Default relative to THIS file (the submodule sits next to it), so the server
+# runs correctly no matter the working directory (e.g. `cd server/mapping`).
+_HERE = os.path.dirname(os.path.abspath(__file__))
+WEIGHTS_PATH  = os.environ.get("WEIGHTS_PATH",
+                               os.path.join(_HERE, "PRISM-VGGT/checkpoints/model.pt"))
 VOXEL_SIZE    = float(os.environ.get("VOXEL_SIZE", "0.02"))
 MAX_DEPTH     = float(os.environ.get("MAX_DEPTH",  "4.5"))
 FACE_SIZE     = int(os.environ.get("FACE_SIZE",    "512"))

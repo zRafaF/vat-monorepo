@@ -12,21 +12,31 @@ There are three machines:
 | ☁️ **SERVER** | GPU box | Zenoh router + mapping server (PRISM-VGGT) |
 | 💻 **CLIENT** | your laptop | diagnostic tools + Rerun viewer |
 
-Set these once per shell (adjust the IP to your server):
+### The Makefile is the control file
+
+All config lives in **`vat.env`** at the repo root (committed; VPN-internal, no
+secrets) — the router IP, robot name, ports, and tuning. Edit it once and every
+machine agrees:
 
 ```bash
-# ☁️ SERVER and 💻 CLIENT
-export ZENOH_ROUTER=tcp/<SERVER_IP>:7447
-export ROBOT_NAME=go2
-
-# 🤖 ROBOT (the container connects OUT to the server's router)
-export SERVER_IP=<SERVER_IP>
-export ROBOT_NAME=go2
+ROUTER_IP=100.87.118.34       # the host running `make router`
+ROBOT_NAME=go2
+# ...ports, throttle fps, stick offsets, etc.
 ```
 
-Install deps once: mapping server `uv sync --package vat-mapping`; router (its
-own isolated env) `cd server/router && uv sync`; client (incl. the bring-up
-tools) `uv sync --package vat-client`; robot builds the Docker image.
+The **Makefile** reads `vat.env` and drives everything. `make help` lists the
+targets; **`make steps`** prints this whole runbook. Note the mapping server
+dials the router by its IP (`ZENOH_ROUTER`), which may be in a *different
+datacenter* than the router — that's expected.
+
+Install deps once per machine:
+
+```bash
+make sync-router     # ☁️ SERVER — isolated router env
+make sync-mapping    # ☁️ SERVER — mapping server (CUDA)
+make sync-client     # 💻 CLIENT — viewer + bring-up tools
+#  🤖 ROBOT builds the Docker image (make robot-docker)
+```
 
 ---
 
@@ -37,8 +47,8 @@ This is a pure-Python router node in its own isolated env — no `zenohd` binary
 no Docker:
 
 ```bash
-cd server/router && uv sync && uv run python router.py      # or: make router
-# listens on tcp/0.0.0.0:7447 — override with ZENOH_LISTEN
+make router
+# = cd server/router && uv run python router.py   (binds ZENOH_LISTEN from vat.env)
 ```
 
 **🤖 ROBOT — start the camera stack + container:**
@@ -57,7 +67,7 @@ docker logs -f vat-robot          # watch for "Registered Zenoh route ..."
 **💻 CLIENT — check the link:**
 
 ```bash
-python tools/check_link.py
+make test_link
 ```
 
 ✅ Expect: `robot bridge ALIVE`, ROS topics listed (incl. `/equirectangular/image`,
@@ -72,11 +82,11 @@ python tools/check_link.py
 
 ```bash
 # raw equirectangular straight off the camera/bridge (tests the camera alone)
-python tools/view_frames.py --raw
+make test_frames_robot
 
 # the decimated frames the server will actually consume
 # (also shows the stamped camera_height + seq, tests the decimator)
-python tools/view_frames.py
+make test_frames_server
 ```
 
 ✅ Expect: a live equirectangular image in Rerun at ~`throttle_fps` (decimated)
@@ -95,7 +105,7 @@ zenoh put -k go2/rt/prism/config/window_size  -v 5     # best-of-5 sharpest
 **💻 CLIENT:**
 
 ```bash
-python tools/view_robot_state.py
+make test_robot_state
 ```
 
 ✅ Expect: the body frame tilts with the real robot, four feet (FR/FL/RR/RL)
@@ -107,18 +117,18 @@ the embedded defs in `robot/docker/kinematics.py`.
 
 ## Stage 3 — Are the poses right?
 
-**☁️ SERVER — start the mapping server** (needs the GPU + PRISM-VGGT):
+**☁️ SERVER — start the mapping server** (needs the GPU + PRISM-VGGT). It dials
+the router at `ROUTER_IP` from `vat.env`, even across datacenters:
 
 ```bash
-source .venv/bin/activate
-ZENOH_ROUTER=tcp/127.0.0.1:7447 ROBOT_NAME=go2 \
-  python server/mapping/mapping_server.py
+make mapping
+# = cd server/mapping && uv run python mapping_server.py  (its own isolated env)
 ```
 
 **💻 CLIENT — watch the pose path (no heavy cloud yet):**
 
 ```bash
-python tools/view_poses.py
+make test_poses
 ```
 
 ✅ Expect: the camera **trajectory** grows as the robot moves; **correction**
@@ -136,7 +146,7 @@ place relative to the camera path, re-measure `STICK_OFFSET_X/Y/Z`.
 **💻 CLIENT — the full viewer (point cloud + predicted robot block):**
 
 ```bash
-python client/prism_rerun_viewer.py --snapshot
+make viewer
 ```
 
 ✅ Expect: the coloured point cloud builds incrementally and the robot block
@@ -146,17 +156,19 @@ moves smoothly (predicted between pose samples), green/amber by fix quality.
 
 ## Per-machine command reference
 
-| Machine | Command | Stage |
+| Machine | `make` target | Stage |
 |---|---|---|
-| ☁️ SERVER | `cd server/router && uv run python router.py` (or `make router`) | 0+ |
-| ☁️ SERVER | `python server/mapping/mapping_server.py` | 3+ |
-| 🤖 ROBOT | `ros2 launch vat_bringup vat_bringup.launch.xml` | 0+ |
-| 🤖 ROBOT | `./robot/docker/run.sh $SERVER_IP` | 0+ |
-| 💻 CLIENT | `python tools/check_link.py` | 0 |
-| 💻 CLIENT | `python tools/view_frames.py [--raw]` | 1 |
-| 💻 CLIENT | `python tools/view_robot_state.py` | 2 |
-| 💻 CLIENT | `python tools/view_poses.py` | 3 |
-| 💻 CLIENT | `python client/prism_rerun_viewer.py --snapshot` | 4 |
+| ☁️ SERVER | `make router` | 0+ |
+| ☁️ SERVER | `make mapping` | 3+ |
+| 🤖 ROBOT | `make robot-ros` | 0+ |
+| 🤖 ROBOT | `make robot-docker` | 0+ |
+| 💻 CLIENT | `make test_link` | 0 |
+| 💻 CLIENT | `make test_frames_robot` / `make test_frames_server` | 1 |
+| 💻 CLIENT | `make test_robot_state` | 2 |
+| 💻 CLIENT | `make test_poses` | 3 |
+| 💻 CLIENT | `make viewer` | 4 |
+
+(`make help` lists these; `make steps` prints the ordered runbook.)
 
 ### Handy live tuning / inspection
 
