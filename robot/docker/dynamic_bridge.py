@@ -22,7 +22,7 @@ class DynamicZenohBridge(Node):
 
         conf = zenoh.Config()
         conf.insert_json5("connect/endpoints", f'["{zenoh_endpoint}"]')
-        conf.insert_json5("mode", '"client"')  # Force client mode for stability
+        conf.insert_json5("mode", '"peer"')
 
         # Retry Loop for Zenoh Connection
         self.z_session = None

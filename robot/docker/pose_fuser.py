@@ -205,7 +205,7 @@ class PoseFuser:
 def _open_session() -> zenoh.Session:
     conf = zenoh.Config()
     conf.insert_json5("connect/endpoints", f'["{ZENOH_CONNECT}"]')
-    conf.insert_json5("mode", '"client"')
+    conf.insert_json5("mode", '"peer"')
     while True:
         try:
             return zenoh.open(conf)
