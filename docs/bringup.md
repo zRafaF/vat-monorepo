@@ -62,6 +62,9 @@ rule. Then, from the repo (e.g. `~/Desktop/vat-monorepo`):
 make robot-ros
 # = bash robot/ros/bringup_camera.sh
 #   → ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
+# LEAVE THIS RUNNING in its own terminal. After "Mapping matrices initialization
+# complete" it goes quiet (it doesn't log every frame) — that's normal, it's
+# streaming. Don't Ctrl-C it, or every downstream stream drops to 0 Hz.
 
 # in another shell: bridge + decimator + pose fuser (no compose)
 make robot-docker
@@ -85,13 +88,20 @@ make test_link
 **💻 CLIENT:**
 
 ```bash
-# raw equirectangular straight off the camera/bridge (tests the camera alone)
-make test_frames_robot
-
-# the decimated frames the server will actually consume
-# (also shows the stamped camera_height + seq, tests the decimator)
+# the decimated frames the server will actually consume — USE THIS as the check
+# (small JPEG; also shows the stamped camera_height + seq; tests the decimator)
 make test_frames_server
+
+# raw equirectangular straight off the camera (tests the camera alone) — HEAVY:
+# ~5.5 MB/frame across the link, so use it sparingly, not as the routine check
+make test_frames_robot
 ```
+
+!!! note
+    If frames don't appear, image topics are **best-effort** QoS — the bridge
+    must match it (fixed; **rebuild** with `make robot-docker`). Check the bridge
+    log for `[forwarded] /equirectangular/image=N`; if it stays `0`, it's still
+    QoS/DDS, not the camera. See [robot setup → Troubleshooting](setup/robot.md).
 
 ✅ Expect: a live equirectangular image in Rerun at ~`throttle_fps` (decimated)
 or camera rate (raw); `camera/height_m` should be a sane number (≈ stand height

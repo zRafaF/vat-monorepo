@@ -145,8 +145,16 @@ make robot-ros
 #   → ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
 ```
 
+!!! warning "It goes quiet after startup — that's normal, don't Ctrl-C it"
+    Success looks like: `Camera opened successfully` → `Live streaming started`
+    → `Mapping matrices initialization complete`, and then **silence** (the
+    driver doesn't log every frame). It is streaming. **Leave `make robot-ros`
+    running in its own terminal** — if you Ctrl-C it, the camera stops and every
+    downstream stream drops to 0 Hz. (A one-off `error info: 400 [unknown msg
+    code.]` just before "Camera opened successfully" is a benign SDK quirk.)
+
 Published topics: `/equirectangular/image`, `/dual_fisheye/image[/compressed]`,
-`/imu/data[_raw]`. Verify in another shell:
+`/imu/data[_raw]`. Verify in another shell (while `make robot-ros` keeps running):
 
 ```bash
 export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>'
@@ -296,6 +304,29 @@ the Go2, so **rebuild** (`make robot-docker`). Then verify, from inside:
 should list the Go2 topics. Also confirm the ROS domain matches (the Go2 uses
 the default `0`; don't set `ROS_DOMAIN_ID` unless the robot does).
 
+**Topic is bridged + advertised, but the decimator/viewer get 0 frames (`buf=0`)**
+A **QoS mismatch**. Camera/sensor topics (`/equirectangular/image`, IMU,
+point clouds) are published **BEST_EFFORT**; a default **RELIABLE** subscriber
+receives *nothing* from a best-effort publisher (while `ros2 topic hz` "works"
+because it adapts QoS). The bridge now **probes each publisher's QoS and matches
+it** (best-effort sub is compatible with both), so **rebuild** (`make
+robot-docker`). To watch data actually flow, the bridge logs forwarded counts
+every 10 s:
+
+```
+[forwarded] /equirectangular/image=87
+```
+
+If a subscribed topic stays at `0`, it logs `[no data] subscribed to … but
+received 0 msgs` — then it's still QoS/DDS/interface/domain, not the camera.
+
+!!! tip "Raw frames are heavy over a VPN — prefer the decimated view"
+    `/equirectangular/image` is ~**5.5 MB/frame** (1920×960×3). `make
+    test_frames_robot` (raw) pulls that across the link; for normal checks use
+    `make test_frames_server` (the **decimated JPEG**, tens of KB). See
+    *Performance* below — a robot-local Zenoh router keeps the raw frames from
+    crossing the VPN at all.
+
 !!! warning "Custom Unitree types bridge only with their message package"
     The bridge resolves each topic's type with `get_message(type)`. **Standard**
     types — including the camera's `sensor_msgs/Image` (`/equirectangular/image`)
@@ -309,3 +340,27 @@ the default `0`; don't set `ROS_DOMAIN_ID` unless the robot does).
 **`ros2 topic list` is empty / `package not found` (on the host)**
 Export the CycloneDDS fix (§7) and source the workspace:
 `source ~/ros2_ws/install/setup.bash`.
+
+---
+
+## 9. Performance — keep raw frames off the VPN (recommended)
+
+Currently the robot processes (bridge, decimator, fuser) connect **directly to
+the cloud router** over the VPN. That means the bridge→decimator hop also goes
+over the VPN: the decimator pulls the **raw 5.5 MB equirectangular frame back
+from the cloud router** just to compress it locally — ~16 MB/s round-trip that
+never needed to leave the robot.
+
+The fix is the standard Zenoh "router-per-site" topology: run a **local Zenoh
+router on the robot**, point the robot processes at `tcp/127.0.0.1:7447`
+(`ZENOH_CONNECT`), and have that local router `connect` to the cloud router.
+Zenoh only forwards keys that have a *remote* subscriber, so:
+
+* `go2/rt/equirectangular/image` (raw, consumed only by the local decimator) →
+  **stays on the robot**, never crosses the VPN.
+* `go2/prism/camera/frame` (small JPEG, subscribed by the cloud mapping server)
+  and `go2/prism/pose` (subscribed by the client) → forwarded over the VPN.
+
+This makes the only things crossing the link the decimated JPEG and the tiny
+pose stream. (Not wired up yet — it's a small topology change to `run.sh` +
+`vat.env`; ask and it can be added.)
