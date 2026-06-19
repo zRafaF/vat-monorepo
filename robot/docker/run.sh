@@ -35,6 +35,7 @@ docker run -d --name "${NAME}" --restart unless-stopped \
     -e JPEG_QUALITY="${JPEG_QUALITY:-85}" \
     -e CAMERA_FPS="${CAMERA_FPS:-30.0}" \
     -e LOSSLESS="${LOSSLESS:-}" \
+    -e IMAGE_TOPIC="${IMAGE_TOPIC:-equirectangular/image}" \
     -e PUBLISH_HZ="${PUBLISH_HZ:-50.0}" \
     -e STICK_OFFSET_X="${STICK_OFFSET_X:--0.20}" \
     -e STICK_OFFSET_Y="${STICK_OFFSET_Y:-0.0}" \
