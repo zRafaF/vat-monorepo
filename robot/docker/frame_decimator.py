@@ -77,6 +77,7 @@ log = logging.getLogger("frame-decimator")
 ROBOT_NAME     = os.environ.get("ROBOT_NAME",     "go2")
 ZENOH_CONNECT  = os.environ.get("ZENOH_CONNECT",  "tcp/127.0.0.1:7447")
 JPEG_QUALITY   = int(os.environ.get("JPEG_QUALITY",   "85"))
+LOSSLESS       = os.environ.get("LOSSLESS", "").lower() in ("1", "true", "yes")
 CAMERA_FPS     = float(os.environ.get("CAMERA_FPS",   "30.0"))
 IMAGE_TOPIC    = os.environ.get("IMAGE_TOPIC",    "equirectangular/image")
 SHARP_DOWNSCALE = float(os.environ.get("SHARPNESS_DOWNSCALE", "0.5"))  # 0<..<=1
@@ -278,10 +279,13 @@ class FrameDecimator:
         return True
 
     def _emit(self, entry: FrameEntry, n_candidates: int):
-        ok, jbuf = cv2.imencode(".jpg", entry.bgr,
-                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        if LOSSLESS:
+            ok, jbuf = cv2.imencode(".png", entry.bgr)
+        else:
+            ok, jbuf = cv2.imencode(".jpg", entry.bgr,
+                                    [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if not ok or jbuf is None:
-            log.warning("JPEG encode failed — skipping tick")
+            log.warning("encode failed — skipping tick")
             self._skipped += 1
             return
 
@@ -367,8 +371,9 @@ def main():
     log.info(f"Connecting to Zenoh at {ZENOH_CONNECT}...")
     z = _open_session()
     fps, ws = _get_config()
+    enc_label = "PNG (lossless)" if LOSSLESS else f"JPEG q={JPEG_QUALITY}"
     log.info(f"Connected. '{KEY_IMAGE}' → '{KEY_OUTPUT}'  @ {fps}Hz  "
-             f"window={ws}  jpeg_q={JPEG_QUALITY}")
+             f"window={ws}  encode={enc_label}")
 
     model = build_robot_model()
     state = RobotStateTracker(z, ROBOT_NAME, fallback_body_height=FALLBACK_BODY_H)

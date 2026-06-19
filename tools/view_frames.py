@@ -51,22 +51,57 @@ def _tick(extra=""):
 def run_decimated(z):
     import cv2
 
+    _prev_recv_ns = [None]        # mutable ref for closure
+    _prev_seq     = [None]
+
     def on_frame(sample):
+        recv_ns = time.time_ns()
         try:
-            ts_ns, seq, cam_h, jpeg = proto.unpack_frame(bytes(sample.payload))
-            bgr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            raw_payload = bytes(sample.payload)
+            ts_ns, seq, cam_h, img_bytes = proto.unpack_frame(raw_payload)
+            bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
             if bgr is None:
                 return
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             rr.log("camera/equirect", rr.Image(rgb))
             rr.log("camera/height_m", rr.Scalar(cam_h))
             rr.log("camera/seq", rr.Scalar(seq))
-            _tick(f"seq={seq} cam_h={cam_h:.2f}m {rgb.shape[1]}x{rgb.shape[0]}")
+
+            # ── Metrics ──────────────────────────────────────────────
+            payload_kb = len(raw_payload) / 1024.0
+            img_kb     = len(img_bytes) / 1024.0
+            rr.log("metrics/frame_size_kB", rr.Scalar(img_kb))
+
+            # Frame age: capture timestamp → local receive time.
+            # ⚠ Only meaningful if robot and client clocks are NTP-synced.
+            age_ms = (recv_ns - ts_ns) / 1e6
+            rr.log("metrics/frame_age_ms", rr.Scalar(age_ms))
+
+            # Inter-frame interval (client-side, always accurate).
+            interval_ms = 0.0
+            if _prev_recv_ns[0] is not None:
+                interval_ms = (recv_ns - _prev_recv_ns[0]) / 1e6
+                rr.log("metrics/interval_ms", rr.Scalar(interval_ms))
+            _prev_recv_ns[0] = recv_ns
+
+            # Detect dropped frames (seq gap).
+            dropped = 0
+            if _prev_seq[0] is not None:
+                expected = (_prev_seq[0] + 1) & 0xFFFFFFFF
+                if seq != expected:
+                    dropped = (seq - expected) & 0xFFFFFFFF
+                    rr.log("metrics/dropped_frames", rr.Scalar(dropped))
+            _prev_seq[0] = seq
+
+            _tick(f"seq={seq} cam_h={cam_h:.2f}m {rgb.shape[1]}x{rgb.shape[0]} "
+                  f"img={img_kb:.0f}kB age={age_ms:.0f}ms Δ={interval_ms:.0f}ms"
+                  + (f" DROP={dropped}" if dropped else ""))
         except Exception as e:
             print(f"  decode error: {e}")
 
     z.declare_subscriber(K["camera_frame"], on_frame)
     print(f"Viewing DECIMATED frames on '{K['camera_frame']}' (Ctrl+C to quit)")
+    print(f"  ⚠ frame_age_ms is only accurate if robot & client clocks are NTP-synced.")
 
 
 def run_raw(z):
