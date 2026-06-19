@@ -50,9 +50,9 @@ trap shutdown SIGTERM SIGINT
 
 echo "[start] ROBOT_NAME=${ROBOT_NAME}  ZENOH_CONNECT=${ZENOH_CONNECT}"
 
-run_forever bridge    python3 /app/dynamic_bridge.py
-run_forever decimator python3 /app/frame_decimator.py
-run_forever fuser     python3 /app/pose_fuser.py
+run_forever bridge python3 /app/dynamic_bridge.py
+run_forever camera python3 /app/theta_camera.py
+run_forever fuser  python3 /app/pose_fuser.py
 
-echo "[start] supervising ${#PIDS[@]} processes (bridge, decimator, fuser)"
+echo "[start] supervising ${#PIDS[@]} processes (bridge, theta_camera, fuser)"
 wait

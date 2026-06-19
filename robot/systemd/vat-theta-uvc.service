@@ -1,0 +1,40 @@
+# VAT Robot — RICOH Theta X UVC → v4l2 loopback (host service)
+# ============================================================
+# Decodes the Theta X UVC stream to /dev/video0 so the container's
+# theta_camera.py can read it. Replaces the old Insta360 host camera unit.
+#
+# Install (edit User/paths to match your robot):
+#   sudo cp robot/systemd/vat-theta-uvc.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vat-theta-uvc.service
+#   sudo journalctl -fu vat-theta-uvc
+#
+# Prereqs: libuvc-theta-sample built (gst_loopback), v4l2loopback-dkms,
+#          Theta in LIVE STREAMING mode. See docs/setup/robot.md.
+
+[Unit]
+Description=VAT Robot — RICOH Theta X UVC v4l2 loopback
+After=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+Group=unitree
+Environment="HOME=/home/unitree"
+Environment="VIDEO_NR=0"
+Environment="THETA_MODE=2K"
+# Point this at your built gst_loopback binary:
+Environment="GST_LOOPBACK_BIN=/home/unitree/libuvc-theta-sample/gst/gst_loopback"
+
+WorkingDirectory=/home/unitree/Desktop/vat-monorepo
+ExecStart=/bin/bash robot/theta/theta_uvc.sh
+
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vat-theta-uvc
+
+[Install]
+WantedBy=multi-user.target

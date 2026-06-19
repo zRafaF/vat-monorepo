@@ -15,15 +15,11 @@ export                          # export every vat.env var to recipe shells
 # (The bring-up tools live in ../tools but run in this same env.)
 CLIENT_RUN ?= cd client && uv run python
 
-# Robot host ROS settings (override as needed)
-ROS_DISTRO ?= foxy
-ROS2_WS    ?= $(HOME)/ros2_ws
-
 .DEFAULT_GOAL := help
 
 .PHONY: help steps \
         sync-mapping sync-client sync-router sync-docs \
-        router mapping robot-ros robot-docker viewer \
+        router mapping theta-uvc robot-docker viewer \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         docs docs-serve clean
 
@@ -39,13 +35,13 @@ help:
 	@echo "Services:"
 	@echo "  make router          [SERVER] run the Zenoh router (hub)"
 	@echo "  make mapping         [SERVER] run the PRISM mapping server"
-	@echo "  make robot-ros       [ROBOT]  host ROS Foxy camera stack"
-	@echo "  make robot-docker    [ROBOT]  bridge + decimator + pose fuser container"
+	@echo "  make theta-uvc       [ROBOT]  expose Theta X UVC → /dev/video0 (host)"
+	@echo "  make robot-docker    [ROBOT]  bridge + theta_camera + pose fuser container"
 	@echo "  make viewer          [CLIENT] full POC viewer (cloud + robot block)"
 	@echo ""
 	@echo "Staged pre-POC tests (run in this order — see 'make steps'):"
 	@echo "  make test_link           0  transport alive (router + bridge + rates)"
-	@echo "  make test_frames_robot   1  raw 360 frames off the robot camera"
+	@echo "  make test_frames_robot   1  [ROBOT] preview the Theta UVC directly"
 	@echo "  make test_frames_server  1  decimated frames the server ingests"
 	@echo "  make test_robot_state    2  body + limb/foot positions, live"
 	@echo "  make test_poses          3  camera trajectory + fused robot pose"
@@ -59,12 +55,12 @@ steps:
 	@echo ""
 	@echo "Stage 0  Transport"
 	@echo "  [SERVER] make router          # the hub; leave it running"
-	@echo "  [ROBOT]  make robot-ros        # host camera stack (separate shell)"
-	@echo "  [ROBOT]  make robot-docker     # bridge + decimator + fuser"
+	@echo "  [ROBOT]  make theta-uvc        # Theta X → /dev/video0 (leave running)"
+	@echo "  [ROBOT]  make robot-docker     # bridge + theta_camera + fuser"
 	@echo "  [CLIENT] make test_link        # expect bridge ALIVE + non-zero Hz"
 	@echo ""
 	@echo "Stage 1  Frames"
-	@echo "  [CLIENT] make test_frames_robot   # raw equirectangular off the camera"
+	@echo "  [ROBOT]  make test_frames_robot   # preview the Theta UVC directly (camera alone)"
 	@echo "  [CLIENT] make test_frames_server  # decimated frames + camera_height"
 	@echo ""
 	@echo "Stage 2  Body & limbs"
@@ -103,13 +99,13 @@ mapping: sync-mapping
 	@echo ">> Connecting to $(ZENOH_ROUTER)  (may be a different datacenter — OK)"
 	cd server/mapping && uv run python mapping_server.py
 
-# [ROBOT] Host ROS camera stack: Insta360 → /equirectangular/image.
-# Handles the CycloneDDS eth0 fix + sources ~/ros2_ws + equirectangular mode.
-robot-ros:
-	@echo ">> [ROBOT] camera bringup (ROS $(ROS_DISTRO), ws=$(ROS2_WS))"
-	ROS_DISTRO=$(ROS_DISTRO) ROS2_WS=$(ROS2_WS) bash robot/ros/bringup_camera.sh
+# [ROBOT] Expose the RICOH Theta X UVC stream as /dev/video0 on the host
+# (libuvc-theta gst_loopback). Leave running; the container reads it.
+theta-uvc:
+	@echo ">> [ROBOT] Theta X UVC → /dev/video0 (leave running in its own shell)"
+	bash robot/theta/theta_uvc.sh
 
-# [ROBOT] Container: ROS↔Zenoh bridge + frame decimator + pose fuser.
+# [ROBOT] Container: ROS↔Zenoh bridge + theta_camera + pose fuser.
 # Invoked via `bash` so it doesn't depend on the executable bit (git on Windows
 # doesn't preserve it). If docker needs root on your robot: `sudo make robot-docker`.
 robot-docker:
@@ -128,14 +124,15 @@ test_link: sync-client
 	@echo ">> Reminder: 'make router' (SERVER) + robot bridge must be running."
 	$(CLIENT_RUN) ../tools/check_link.py
 
-# Stage 1a — raw 360 frames straight off the robot camera/bridge.
-test_frames_robot: sync-client
-	@echo ">> Reminder: router + 'make robot-ros' (camera stack) + bridge running."
-	$(CLIENT_RUN) ../tools/view_frames.py --raw
+# Stage 1a — [ROBOT] preview the Theta straight off UVC (camera alone, no Zenoh).
+# Runs on the robot host with its OpenCV; uses THETA_DEVICE / THETA_GST_PIPELINE.
+test_frames_robot:
+	@echo ">> [ROBOT] previewing the Theta UVC device directly (THETA_DEVICE=$(THETA_DEVICE))"
+	python3 tools/view_theta.py
 
-# Stage 1b — the decimated frames the mapping server actually ingests.
+# Stage 1b — [CLIENT] the decimated frames the mapping server actually ingests.
 test_frames_server: sync-client
-	@echo ">> Reminder: router + 'make robot-docker' (decimator) running."
+	@echo ">> Reminder: router + 'make theta-uvc' + 'make robot-docker' running."
 	$(CLIENT_RUN) ../tools/view_frames.py
 
 # Stage 2 — body frame + limb/foot positions, live.

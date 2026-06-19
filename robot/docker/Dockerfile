@@ -1,24 +1,27 @@
 # VAT Robot Docker container
 # ===========================
-# Runs alongside the ROS Foxy stack on the Jetson.  Hosts three pure-Zenoh
-# helpers + the ROS↔Zenoh bridge:
-#   - dynamic_bridge.py   ROS2 topics → Zenoh (CDR)            [ROS node]
-#   - frame_decimator.py  best-of-window frames → server      [Zenoh client]
-#   - pose_fuser.py       authoritative robot pose → client   [Zenoh client]
+# Runs alongside the Go2 ROS Foxy stack on the Jetson. Hosts three processes:
+#   - dynamic_bridge.py   ROS2 topics → Zenoh (CDR, for odometry)  [ROS node]
+#   - theta_camera.py     RICOH Theta X UVC → best-of-window → server [Zenoh]
+#   - pose_fuser.py       authoritative robot pose → client          [Zenoh]
 # The container uses ROS Humble (Python 3.10) for modern Zenoh; the *host*
-# stays on Foxy (Python 3.8).  DDS is wire-compatible across the two.
+# stays on Foxy (Python 3.8). DDS is wire-compatible across the two.
+#
+# The camera no longer goes through ROS — theta_camera captures the Theta over
+# UVC directly with OpenCV (see docs/setup/robot.md). The Insta360 ROS driver
+# was retired (docs/archive/insta360.md).
 #
 # IMPORTANT — the Jetson has NO docker-compose, only `docker`.
 # Build from the REPO ROOT so the shared protocol module is in context:
 #
 #   docker build -f robot/docker/Dockerfile -t vat-robot-docker .
 #
-# Run (see robot/docker/run.sh or robot/systemd/vat-robot-docker.service):
-#
+# Run (see robot/docker/run.sh or robot/systemd/vat-robot-docker.service). The
+# container needs the Theta video device, e.g.:
 #   docker run -d --name vat-robot --restart unless-stopped \
-#     --network host --ipc host \
+#     --network host --ipc host --device /dev/video0 \
 #     -e ROBOT_NAME=go2 -e ZENOH_CONNECT=tcp/SERVER_IP:7447 \
-#     vat-robot-docker
+#     -e THETA_DEVICE=/dev/video0 vat-robot-docker
 
 FROM ros:humble-ros-base
 
@@ -44,7 +47,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 COPY common/vat_protocol.py     /app/
 # Robot-side processes
 COPY robot/docker/dynamic_bridge.py   /app/
-COPY robot/docker/frame_decimator.py  /app/
+COPY robot/docker/theta_camera.py     /app/
 COPY robot/docker/pose_fuser.py       /app/
 COPY robot/docker/kinematics.py       /app/
 COPY robot/docker/start.sh            /app/
@@ -63,6 +66,8 @@ ENV ROBOT_NAME="go2" \
     STICK_OFFSET_X="-0.20" \
     STICK_OFFSET_Y="0.0" \
     STICK_OFFSET_Z="0.55" \
-    FALLBACK_BODY_HEIGHT="0.30"
+    FALLBACK_BODY_HEIGHT="0.30" \
+    THETA_MODE="2K" \
+    THETA_DEVICE="/dev/video0"
 
 ENTRYPOINT ["/bin/bash", "/app/start.sh"]
