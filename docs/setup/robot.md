@@ -177,9 +177,18 @@ docker logs -f vat-robot       # expect "Registered Zenoh route ..." per topic
 ```
 
 !!! note "Docker permissions"
-    If docker needs root on your robot, use `sudo make robot-docker`. (Better:
-    add your user to the `docker` group: `sudo usermod -aG docker $USER` then log
-    out/in.)
+    If docker needs root on your robot, use `sudo make robot-docker` and
+    `sudo docker logs -f vat-robot`. (Better: add your user to the `docker`
+    group: `sudo usermod -aG docker $USER`, then log out/in — after that no
+    `sudo` is needed.)
+
+!!! note "DDS matching (important)"
+    The Go2 host speaks **CycloneDDS** on `eth0`. The bridge container (ROS
+    Humble) is built with `rmw_cyclonedds_cpp` and exports the matching
+    `CYCLONEDDS_URI` at startup so it can actually see the host's Foxy topics —
+    otherwise the bridge runs but bridges nothing. Override the interface with
+    `NET_IFACE=eth1 make robot-docker` if needed. The container uses
+    `--network host`, so it shares the host's interfaces and ROS domain.
 
 **Auto-start on boot:**
 
@@ -270,6 +279,33 @@ Fixed: the Makefile now calls `bash robot/docker/run.sh`. If you invoke the
 script directly, use `bash robot/docker/run.sh <router-ip>` or
 `chmod +x robot/docker/run.sh` first.
 
-**`ros2 topic list` is empty / `package not found`**
+**`docker logs` → `permission denied ... /var/run/docker.sock`**
+Your user isn't in the `docker` group. Use `sudo docker logs -f vat-robot`, or
+add yourself: `sudo usermod -aG docker $USER` then log out/in.
+
+**Container logs spam `AMENT_TRACE_SETUP_FILES: unbound variable`**
+Old bug: `start.sh` ran `set -u` while sourcing ROS (which isn't `set -u`
+clean), so the bridge never started. Fixed — **rebuild the image**
+(`make robot-docker` rebuilds) and the spam is gone.
+
+**Bridge container runs but `make test_link` shows the bridge `absent` / 0 Hz**
+The bridge can't see the host's ROS graph — almost always a **DDS mismatch**.
+The container is now built with `rmw_cyclonedds_cpp` + `CYCLONEDDS_URI` to match
+the Go2, so **rebuild** (`make robot-docker`). Then verify, from inside:
+`sudo docker exec -it vat-robot bash -lc 'source /opt/ros/humble/setup.bash && ros2 topic list'`
+should list the Go2 topics. Also confirm the ROS domain matches (the Go2 uses
+the default `0`; don't set `ROS_DOMAIN_ID` unless the robot does).
+
+!!! warning "Custom Unitree types bridge only with their message package"
+    The bridge resolves each topic's type with `get_message(type)`. **Standard**
+    types — including the camera's `sensor_msgs/Image` (`/equirectangular/image`)
+    — work out of the box, so Stage 0/1 (frames) is fine. But **custom** types
+    like `unitree_go/msg/SportModeState` (`/sportmodestate`, needed for Stage 2
+    body/limbs and the pose fuser's camera-height) won't bridge until the
+    `unitree_go` message package is available inside the container. That's a
+    follow-up (install/copy the `unitree_go` msgs into the image); the camera POC
+    does not need it.
+
+**`ros2 topic list` is empty / `package not found` (on the host)**
 Export the CycloneDDS fix (§7) and source the workspace:
 `source ~/ros2_ws/install/setup.bash`.

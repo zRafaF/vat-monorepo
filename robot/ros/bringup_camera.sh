@@ -36,6 +36,21 @@ if [ -f "/opt/ros/$ROS_DISTRO/setup.bash" ]; then
 fi
 source "$ROS2_WS/install/setup.bash"
 
+# --- Preflight: the #1 failure is "No available camera devices found." -------
+# The SDK enumerates the camera via the /dev/insta udev symlink; it also needs
+# USB Mode = Android and Dual-Lens. Warn early (don't abort) so it's obvious.
+if command -v lsusb >/dev/null 2>&1 && ! lsusb | grep -qi 'Arashi'; then
+    echo "[bringup] WARNING: no Insta360 (Arashi Vision) device seen on USB."
+    echo "          → connect/power the camera; set USB Mode = Android + Dual-Lens."
+fi
+if [ ! -e /dev/insta ]; then
+    echo "[bringup] WARNING: /dev/insta is missing — the driver will likely report"
+    echo "          'No available camera devices found'. Fix the udev rule:"
+    echo "            (cd \"$ROS2_WS/src/insta360_ros_driver\" && ./setup.sh)"
+    echo "          then REPLUG the camera and: sudo chmod 777 /dev/insta"
+    echo "          (see docs/setup/robot.md → Troubleshooting)"
+fi
+
 # Camera node + decoder + equirectangular conversion (+ imu_filter by default).
 exec ros2 launch insta360_ros_driver bringup.launch.xml \
     equirectangular:="$EQUIRECTANGULAR"

@@ -28,9 +28,14 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     python3-pip \
     ros-humble-rosidl-runtime-py \
+    ros-humble-rmw-cyclonedds-cpp \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# Match the Go2 host's DDS (CycloneDDS) so the bridge can discover ROS topics.
+# start.sh sets CYCLONEDDS_URI for the right interface at runtime.
+ENV RMW_IMPLEMENTATION="rmw_cyclonedds_cpp"
 
 COPY robot/docker/requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt

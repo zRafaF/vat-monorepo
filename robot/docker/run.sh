@@ -29,6 +29,7 @@ docker run -d --name "${NAME}" --restart unless-stopped \
     --network host --ipc host \
     -e ROBOT_NAME="${ROBOT_NAME}" \
     -e ZENOH_CONNECT="${ZENOH_CONNECT}" \
+    -e NET_IFACE="${NET_IFACE:-eth0}" \
     -e THROTTLE_FPS="${THROTTLE_FPS:-3.0}" \
     -e WINDOW_SIZE="${WINDOW_SIZE:-5}" \
     -e JPEG_QUALITY="${JPEG_QUALITY:-85}" \

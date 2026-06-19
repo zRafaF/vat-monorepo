@@ -8,8 +8,19 @@
 # The container itself only stops on SIGTERM/SIGINT (docker stop), at which
 # point we tear the children down cleanly.
 
-set -uo pipefail
+# NOTE: no `set -u` — ROS's setup.bash references unset vars (e.g.
+# AMENT_TRACE_SETUP_FILES) and would abort under `set -u`.
+set -o pipefail
+
+# The Go2 host speaks CycloneDDS on a specific interface. This (Humble) container
+# must match the RMW *and* the interface to discover the host's Foxy topics —
+# otherwise the bridge sees an empty ROS graph. (--network host is set by run.sh.)
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
+NET_IFACE="${NET_IFACE:-eth0}"
+export CYCLONEDDS_URI="${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><Interfaces><NetworkInterface name=\"${NET_IFACE}\"/></Interfaces></General></Domain></CycloneDDS>}"
+
 source /opt/ros/humble/setup.bash
+echo "[start] RMW=$RMW_IMPLEMENTATION  iface=$NET_IFACE  domain=${ROS_DOMAIN_ID:-0}"
 
 PIDS=()
 
