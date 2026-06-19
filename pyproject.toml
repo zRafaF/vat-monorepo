@@ -1,28 +1,22 @@
 [project]
 name = "vat"
 version = "0.1.0"
-description = "Volumetric Asynchronous Teleoperation — monorepo workspace root"
-requires-python = "==3.12.*"
-# The root is virtual: it carries no runtime deps of its own.
-# All actual packages live in server/ and client/.
+description = "Volumetric Asynchronous Teleoperation — monorepo root (docs only)"
+requires-python = ">=3.10"
+# This root project is NOT a workspace. Each runtime service is its own isolated
+# uv project, with its own .venv and uv.lock inside its folder, so you can run
+# several on one machine without a shared lockfile being rewritten:
+#     cd client         && uv sync      # client viewer + bring-up tools
+#     cd server/mapping && uv sync      # mapping server (GPU machine)
+#     cd server/router  && uv sync      # Zenoh router
+# The root keeps ONLY the documentation tooling (its own root .venv, touched only
+# by `make docs`).
 dependencies = []
 
 [tool.uv]
-# The root workspace covers the lightweight client (+ the bring-up tools that
-# run in the client env).  Sync it with:  uv sync --package vat-client
 package = false
 
-[tool.uv.workspace]
-# Each server/ microservice is its OWN isolated uv project (own .venv, own
-# lockfile) so the heavy CUDA/torch stack of the mapper and the single light dep
-# of the router never clash with each other or with the client.  Sync them on
-# their own:
-#     cd server/mapping && uv sync      # mapping server (GPU machine)
-#     cd server/router  && uv sync      # Zenoh router
-members = ["client"]
-exclude = ["server/mapping", "server/router"]
-
-# ── Documentation dev-deps (shared across the workspace) ──────────────────────
+# ── Documentation dev-deps (root-only; build with `make docs`) ────────────────
 [dependency-groups]
 docs = [
     "mkdocs-material>=9.5",

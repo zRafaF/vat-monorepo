@@ -2,6 +2,9 @@
 name = "vat-client"
 version = "0.1.0"
 description = "VAT client — receives PRISM point cloud deltas and renders them in Rerun"
+# Standalone, isolated uv project: own client/.venv + client/uv.lock.
+#   cd client && uv sync && uv run python prism_rerun_viewer.py
+# The bring-up tools in ../tools run in this same env.
 requires-python = ">=3.10"
 dependencies = [
     # Transport
@@ -17,9 +20,7 @@ dependencies = [
     "opencv-python-headless>=4.9",
 ]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["client"]
+[tool.uv]
+# Virtual project: install deps into client/.venv, run the viewer/tools as
+# scripts (no build of the client module itself).
+package = false

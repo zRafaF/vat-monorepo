@@ -177,14 +177,11 @@ git submodule update --init --recursive
 # Install uv if you don't have it
 curl -Lsf https://astral.sh/uv/install.sh | sh
 
-# Client + bring-up tools (lightweight) — from the repo root
-uv sync --package vat-client
-
-# Mapping server (its own isolated env, on the GPU machine)
-cd server/mapping && uv sync && cd -
-
-# Zenoh router (its own isolated env)
-cd server/router && uv sync && cd -
+# Each service is its own isolated uv project — its .venv + uv.lock live in its
+# own folder, so running several on one machine never rewrites a shared lock.
+cd client        && uv sync && cd -    # client viewer + bring-up tools
+cd server/mapping && uv sync && cd -   # mapping server (GPU machine)
+cd server/router  && uv sync && cd -   # Zenoh router
 ```
 
 **PyTorch + CUDA:** `prism-vggt` requires CUDA-capable torch. If `uv sync` pulls
@@ -204,8 +201,8 @@ torch = { index = "pytorch-cu121" }
 ### 3. Install Python deps (client)
 
 ```bash
-# On the visualisation machine (no GPU required)
-uv sync --package vat-client
+# On the visualisation machine (no GPU required) — own client/.venv
+cd client && uv sync && cd -
 ```
 
 ### 4. Build the robot ROS2 camera stack (Jetson, host Foxy)
@@ -297,11 +294,9 @@ Key env vars for the server:
 ### Start the Rerun viewer (any machine)
 
 ```bash
-source .venv/bin/activate
-ZENOH_ROUTER=tcp/<server-ip>:7447 python client/prism_rerun_viewer.py
-
-# Request the full current snapshot immediately on startup
-python client/prism_rerun_viewer.py --snapshot
+# from the repo root (config from vat.env) — runs in client/.venv
+make viewer
+# or directly:  cd client && uv run python prism_rerun_viewer.py --snapshot
 ```
 
 ### Tune the frame rate live (from any machine)

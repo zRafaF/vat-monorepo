@@ -11,8 +11,9 @@
 include vat.env
 export                          # export every vat.env var to recipe shells
 
-# Client-side tools + viewer run in the root workspace env (vat-client).
-TOOL ?= uv run --package vat-client python
+# Client-side tools + viewer run in the client's OWN isolated env (client/.venv).
+# (The bring-up tools live in ../tools but run in this same env.)
+CLIENT_RUN ?= cd client && uv run python
 
 # Robot host ROS settings (override as needed)
 ROS_DISTRO ?= foxy
@@ -21,7 +22,7 @@ VAT_WS     ?= $(HOME)/vat_ws
 .DEFAULT_GOAL := help
 
 .PHONY: help steps \
-        sync sync-mapping sync-client sync-router sync-docs \
+        sync-mapping sync-client sync-router sync-docs \
         router mapping robot-ros robot-docker viewer \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         docs docs-serve clean
@@ -76,15 +77,12 @@ steps:
 	@echo "Stage 4  Full POC"
 	@echo "  [CLIENT] make viewer              # point cloud + predicted robot block"
 
-# ── Setup (uv) ───────────────────────────────────────────────────────────────
-sync:
-	uv sync --all-groups
-
+# ── Setup (uv) — each service syncs into its OWN folder (.venv + uv.lock) ─────
 sync-mapping:
 	cd server/mapping && uv sync
 
 sync-client:
-	uv sync --package vat-client
+	cd client && uv sync
 
 sync-router:
 	cd server/router && uv sync
@@ -118,35 +116,36 @@ robot-docker:
 	./robot/docker/run.sh $(ROUTER_IP)
 
 # [CLIENT] Full POC viewer.
-viewer:
+viewer: sync-client
 	@echo ">> Reminder: router + mapping server must be running."
-	$(TOOL) client/prism_rerun_viewer.py --snapshot
+	$(CLIENT_RUN) prism_rerun_viewer.py --snapshot
 
 # ── Staged pre-POC tests ─────────────────────────────────────────────────────
+# All run in the client's own env; tools live in ../tools relative to client/.
 # Stage 0 — transport alive.
-test_link:
+test_link: sync-client
 	@echo ">> Reminder: 'make router' (SERVER) + robot bridge must be running."
-	$(TOOL) tools/check_link.py
+	$(CLIENT_RUN) ../tools/check_link.py
 
 # Stage 1a — raw 360 frames straight off the robot camera/bridge.
-test_frames_robot:
+test_frames_robot: sync-client
 	@echo ">> Reminder: router + 'make robot-ros' (camera stack) + bridge running."
-	$(TOOL) tools/view_frames.py --raw
+	$(CLIENT_RUN) ../tools/view_frames.py --raw
 
 # Stage 1b — the decimated frames the mapping server actually ingests.
-test_frames_server:
+test_frames_server: sync-client
 	@echo ">> Reminder: router + 'make robot-docker' (decimator) running."
-	$(TOOL) tools/view_frames.py
+	$(CLIENT_RUN) ../tools/view_frames.py
 
 # Stage 2 — body frame + limb/foot positions, live.
-test_robot_state:
+test_robot_state: sync-client
 	@echo ">> Reminder: router + robot bridge (publishing sportmodestate) running."
-	$(TOOL) tools/view_robot_state.py
+	$(CLIENT_RUN) ../tools/view_robot_state.py
 
 # Stage 3 — camera trajectory + VGGT correction + fused robot pose.
-test_poses:
+test_poses: sync-client
 	@echo ">> Reminder: router + robot container + 'make mapping' running."
-	$(TOOL) tools/view_poses.py
+	$(CLIENT_RUN) ../tools/view_poses.py
 
 # ── Docs ─────────────────────────────────────────────────────────────────────
 docs: sync-docs
