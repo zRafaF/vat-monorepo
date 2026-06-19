@@ -1,0 +1,46 @@
+#!/bin/bash
+# VAT robot container — build & run helper (no docker-compose needed).
+# Run from the REPO ROOT:  ./robot/docker/run.sh [SERVER_IP]
+#
+# Env overrides (all optional):
+#   ROBOT_NAME      (default go2)
+#   ZENOH_CONNECT   (default tcp/<SERVER_IP|127.0.0.1>:7447)
+#   THROTTLE_FPS WINDOW_SIZE JPEG_QUALITY CAMERA_FPS PUBLISH_HZ
+#   STICK_OFFSET_X STICK_OFFSET_Y STICK_OFFSET_Z FALLBACK_BODY_HEIGHT
+set -euo pipefail
+
+SERVER_IP="${1:-127.0.0.1}"
+IMAGE="vat-robot-docker"
+NAME="vat-robot"
+
+ROBOT_NAME="${ROBOT_NAME:-go2}"
+ZENOH_CONNECT="${ZENOH_CONNECT:-tcp/${SERVER_IP}:7447}"
+
+# Build from repo root (this script's grandparent) so /common is in context.
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$REPO_ROOT"
+
+echo "[run] building ${IMAGE} (context=${REPO_ROOT})"
+docker build -f robot/docker/Dockerfile -t "${IMAGE}" .
+
+echo "[run] (re)starting container ${NAME} → ${ZENOH_CONNECT}"
+docker rm -f "${NAME}" 2>/dev/null || true
+docker run -d --name "${NAME}" --restart unless-stopped \
+    --network host --ipc host \
+    -e ROBOT_NAME="${ROBOT_NAME}" \
+    -e ZENOH_CONNECT="${ZENOH_CONNECT}" \
+    -e NET_IFACE="${NET_IFACE:-eth0}" \
+    -e THROTTLE_FPS="${THROTTLE_FPS:-3.0}" \
+    -e WINDOW_SIZE="${WINDOW_SIZE:-5}" \
+    -e JPEG_QUALITY="${JPEG_QUALITY:-85}" \
+    -e CAMERA_FPS="${CAMERA_FPS:-30.0}" \
+    -e LOSSLESS="${LOSSLESS:-}" \
+    -e IMAGE_TOPIC="${IMAGE_TOPIC:-equirectangular/image}" \
+    -e PUBLISH_HZ="${PUBLISH_HZ:-50.0}" \
+    -e STICK_OFFSET_X="${STICK_OFFSET_X:--0.20}" \
+    -e STICK_OFFSET_Y="${STICK_OFFSET_Y:-0.0}" \
+    -e STICK_OFFSET_Z="${STICK_OFFSET_Z:-0.55}" \
+    -e FALLBACK_BODY_HEIGHT="${FALLBACK_BODY_HEIGHT:-0.30}" \
+    "${IMAGE}"
+
+echo "[run] done.  logs:  docker logs -f ${NAME}"

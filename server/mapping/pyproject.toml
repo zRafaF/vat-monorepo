@@ -1,0 +1,44 @@
+[project]
+name = "vat-mapping"
+version = "0.1.0"
+description = "VAT mapping server — runs the PRISM-VGGT pipeline and streams point cloud deltas + pose corrections"
+# A STANDALONE microservice (excluded from the root workspace) with its own
+# isolated env, so its heavy CUDA/torch stack never touches the client/router.
+#   cd server/mapping && uv sync && uv run python mapping_server.py
+requires-python = ">=3.10"
+dependencies = [
+    # Transport
+    "eclipse-zenoh>=1.0",
+    # Serialization — CDR (no protobuf needed)
+    "rosbags>=0.10",
+    # PRISM-VGGT library (local submodule — installed editable, see tool.uv.sources)
+    "prism-vggt",
+    # Image decoding (JPEG → numpy)
+    "numpy>=1.24",
+    "opencv-python-headless>=4.9",
+    # 3D / point cloud helpers
+    "open3d>=0.18",
+    # NOTE: torch + nvblox_torch are pulled in transitively by prism-vggt.
+    # To force a CUDA build, pin torch here and add the pytorch index below.
+]
+
+[tool.uv]
+# Virtual project: install the dependencies into this dir's own .venv, but don't
+# build/package mapping_server.py — it's run as a script (uv run python …).
+package = false
+
+# ── PRISM-VGGT as a local editable path dep ───────────────────────────────────
+# The submodule now lives at server/mapping/PRISM-VGGT.  After cloning:
+#   git submodule update --init server/mapping/PRISM-VGGT
+[tool.uv.sources]
+prism-vggt = { path = "PRISM-VGGT", editable = true }
+
+# ── PyTorch CUDA index (uncomment + adjust for your CUDA version) ─────────────
+# [[tool.uv.index]]
+# name = "pytorch-cu121"
+# url = "https://download.pytorch.org/whl/cu121"
+# explicit = true
+#
+# [tool.uv.sources]
+# torch = { index = "pytorch-cu121" }
+# torchvision = { index = "pytorch-cu121" }

@@ -14,8 +14,8 @@ repo_url: https://github.com/zrafaf/vat-monorepo
 copyright: Copyright &copy; 2026 Rafael F. Meneses
 theme:
   name: material
-  logo: resources/LogoBolinho512.png
-  favicon: resources/LogoBolinho512.png
+  # logo: resources/LogoBolinho512.png
+  # favicon: resources/LogoBolinho512.png
   palette:
     - media: "(prefers-color-scheme)"
       toggle:
@@ -92,12 +92,14 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Architecture: architecture.md
+  - PRISM Streaming POC: streaming_poc.md
+  - Bring-up Runbook: bringup.md
   - Setup:
       - setup/index.md
       - Robot: setup/robot.md
       - Server: setup/server.md
       - Client: setup/client.md
-      - Development: 
+      - Development:
         - setup/development/index.md
         - Documentation: setup/development/documentation.md
         - VPN: setup/development/vpn.md

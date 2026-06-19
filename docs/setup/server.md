@@ -1,67 +1,64 @@
 # Server setup
 
+The server host runs two microservices, each with its **own** environment:
 
-## Zenoh
+1. **`vat-router`** — a pure-Python Zenoh router (`server/router/`). Everything
+   (robot, mapping server, client) connects to it.
+2. **`vat-mapping`** — the PRISM-VGGT mapping server (`server/mapping/`), heavy
+   CUDA/torch deps.
 
-To install Zenoh router you can follow the detailed instructions is the [Zenoh documentation](https://zenoh.io/docs/getting-started/installation/).
+They are kept separate on purpose so the router's single light dependency never
+clashes with the mapper's CUDA stack.
 
-On Ubuntu, you can use the following commands to install the Zenoh router:
+---
 
-```bash
-curl -L https://download.eclipse.org/zenoh/debian-repo/zenoh-public-key | sudo gpg --dearmor --yes --output /etc/apt/keyrings/zenoh-public-key.gpg
-```
+## 1. Zenoh router microservice
 
-``` bash
-echo "deb [signed-by=/etc/apt/keyrings/zenoh-public-key.gpg] https://download.eclipse.org/zenoh/debian-repo/ /" | sudo tee -a /etc/apt/sources.list > /dev/null
-```
-
-```bash
-sudo apt update
-```
-
-```bash
-sudo apt install zenoh
-```
-
-Then you can start the Zenoh router with this command:
+We run the router from **pure Python** (a `router`-mode Zenoh session) rather
+than the `zenohd` binary or a Docker container — no extra system packages, and
+the deps stay isolated in the router's own venv.
 
 ```bash
-zenohd --listen tcp/0.0.0.0:7447 --rest-http-port 39522
+# from the repo root
+cd server/router
+uv sync                 # creates server/router/.venv with just eclipse-zenoh
+uv run python router.py # listens on tcp/0.0.0.0:7447
 ```
 
-!!! Note
-    We are not using docker because the documentation states that "Docker doesn’t support UDP multicast between a container and its host" so a bare metal installation is recommended.
+Configuration (environment variables):
 
+| Variable | Default | Description |
+|---|---|---|
+| `ZENOH_LISTEN` | `tcp/0.0.0.0:7447` | listen endpoint(s), comma-separated |
+| `ZENOH_CONNECT` | _(none)_ | other routers to mesh with, comma-separated |
+| `ZENOH_CONFIG` | _(none)_ | path to a full JSON5 Zenoh config (overrides the above) |
 
-### Setting up auto start for Zenoh router
+!!! note
+    The eclipse-zenoh Python package does **not** provide a `zenoh.router`
+    module (`python -m zenoh.router` only exists for the `zenohd` Rust binary).
+    Running a `router`-mode session as `router.py` does is the supported
+    pure-Python equivalent. If you ever need the router's REST/admin plugins or
+    storages, install the `zenohd` binary instead — but for VAT this is enough.
 
-To set up auto start for the Zenoh router, you can create a systemd service file. Here are the steps to do that:
-
-First find where the zenohd binary is located:
+### Auto-start on boot (systemd)
 
 ```bash
-which zenohd
-
-# /usr/bin/zenohd
+sudo nano /etc/systemd/system/vat-router.service
 ```
-
-Then create a systemd service file for the Zenoh router:
-
-```bash
-sudo nano /etc/systemd/system/zenohd.service
-```
-
-Add the following content to the file:
 
 ```ini
 [Unit]
-Description=Zenoh Router
-After=network.target
+Description=VAT Zenoh Router (pure-Python microservice)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=lab # replace with your username
-ExecStart=/usr/bin/zenohd --listen tcp/0.0.0.0:7447 --rest-http-port 39522
+User=lab                      # replace with your username
+WorkingDirectory=/home/lab/vat-monorepo/server/router
+# uv created the isolated venv here during `uv sync`
+ExecStart=/home/lab/vat-monorepo/server/router/.venv/bin/python router.py
+Environment=ZENOH_LISTEN=tcp/0.0.0.0:7447
 Restart=always
 RestartSec=5
 
@@ -69,16 +66,30 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Now enable and start the service:
-
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable zenohd
-sudo systemctl start zenohd
+sudo systemctl enable --now vat-router
+sudo journalctl -fu vat-router
 ```
 
-To check if the service is running, you can use:
+---
+
+## 2. Mapping server (PRISM-VGGT)
+
+Requires an NVIDIA GPU + CUDA. The PRISM-VGGT submodule lives at
+`server/mapping/PRISM-VGGT`.
 
 ```bash
-curl http://localhost:39522/@/router/local/info
+# from the repo root
+git submodule update --init server/mapping/PRISM-VGGT
+
+# its own isolated env (heavy CUDA/torch deps — does not touch router/client)
+cd server/mapping && uv sync
+
+# run it (reads ROUTER_IP etc. from ../../vat.env via the Makefile)
+cd ../.. && make mapping
+# or directly:  cd server/mapping && ZENOH_ROUTER=tcp/<router-ip>:7447 uv run python mapping_server.py
 ```
+
+See [the bring-up runbook](../bringup.md) for the staged test sequence and
+[the streaming POC](../streaming_poc.md) for the full env-var reference.

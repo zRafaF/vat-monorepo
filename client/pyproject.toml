@@ -1,0 +1,26 @@
+[project]
+name = "vat-client"
+version = "0.1.0"
+description = "VAT client — receives PRISM point cloud deltas and renders them in Rerun"
+# Standalone, isolated uv project: own client/.venv + client/uv.lock.
+#   cd client && uv sync && uv run python prism_rerun_viewer.py
+# The bring-up tools in ../tools run in this same env.
+requires-python = ">=3.10"
+dependencies = [
+    # Transport
+    "eclipse-zenoh>=1.0",
+    # Visualization
+    "rerun-sdk>=0.21",
+    # Numerics
+    "numpy>=1.24",
+    # (future) scipy for trajectory smoothing
+    "scipy>=1.12",
+    # Bring-up tools (tools/): CDR decode + JPEG decode for the diagnostic viewers
+    "rosbags>=0.10",
+    "opencv-python>=4.9",
+]
+
+[tool.uv]
+# Virtual project: install deps into client/.venv, run the viewer/tools as
+# scripts (no build of the client module itself).
+package = false
