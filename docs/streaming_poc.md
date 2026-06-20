@@ -1,6 +1,6 @@
 # PRISM Streaming POC
 
-End-to-end live point cloud from the Insta360 on the Go2 robot → PRISM-VGGT mapping server → Rerun 3D viewer on any machine.
+End-to-end live point cloud from the **RICOH Theta X** on the Go2 robot → PRISM-VGGT mapping server → Rerun 3D viewer on any machine. (The camera was switched from the Insta360 — see [archive](archive/insta360.md).)
 
 This POC also carries the **robot pose** end-to-end. Per the [system architecture](architecture.md#pose-state-estimation), the robot — not the server — is authoritative for its global pose. The data path is:
 
@@ -17,27 +17,19 @@ The server computes a slow, drift-free VGGT pose and sends it **down** to the do
 ```
 ┌─────────────────────────── Jetson (on robot) ────────────────────────────┐
 │                                                                            │
-│  Insta360 SDK (C++)                                                        │
-│      │ H.264 (USB)                                                         │
-│      ▼                                                                     │
-│  /dual_fisheye/image/compressed   (sensor_msgs/CompressedImage)            │
+│  RICOH Theta X  (in-camera stitched equirectangular, H.264 over UVC)       │
+│      │ USB                                                                 │
+│  libuvc-theta gst_loopback  →  /dev/video0   (host)                        │
 │      │                                                                     │
-│  decoder node  (insta360_ros_driver)                                       │
+│  theta_camera.py (docker)  ← OpenCV UVC capture                            │
+│      │ best-of-N-frame sharpest + camera_height stamp + JPEG               │
+│      │   (throttle_fps + window_size live via Zenoh)                       │
+│  {robot}/prism/camera/frame       (VAT frame: ts + seq + camera_height + JPEG)│
 │      │                                                                     │
-│  /dual_fisheye/image              (sensor_msgs/Image, BGR8)                │
-│      │                                                                     │
-│  equirectangular node  (GPU PyTorch, 1920×960)                             │
-│      │                                                                     │
-│  /equirectangular/image           (sensor_msgs/Image, RGB8)                │
-│      │  (bridged to Zenoh as CDR by dynamic_bridge)                         │
-│  frame_decimator.py (docker)  ← throttle_fps + window_size (live via Zenoh)│
-│      │ best-of-N-frame sharpest + camera_height stamp + JPEG                │
-│  {robot}/prism/camera/frame       (VAT frame: ts + camera_height + JPEG)   │
-│      │                                                                     │
-│  DynamicZenohBridge  (demand-driven, CDR-serialized)                       │
+│  dynamic_bridge.py  (docker)  — ROS odometry (/sportmodestate) → Zenoh     │
 │      │                                                                     │
 └──────┼─────────────────────────────────────────────────────────────────────┘
-       │  Zenoh  (go2/rt/prism/camera/frame)
+       │  Zenoh  (go2/prism/camera/frame)
        ▼
 ┌─────────────────────────── Cloud / Dev Machine ──────────────────────────┐
 │                                                                            │
@@ -130,29 +122,29 @@ vat-monorepo/
 │   └── prism_rerun_viewer.py   ← Rerun viewer + pose predictor + robot block
 │
 ├── robot/
-│   ├── insta360_ros_driver/    ← DO NOT MODIFY (sensitive hardware driver)
+│   ├── theta/
+│   │   └── theta_uvc.sh        ← Theta X UVC → /dev/video0 (libuvc-theta loopback)
 │   ├── docker/                 ← single container alongside the host ROS stack
 │   │   ├── Dockerfile          ← build from REPO ROOT (-f robot/docker/Dockerfile)
 │   │   ├── run.sh              ← build + docker run helper (no compose)
 │   │   ├── start.sh            ← supervisor: restarts each process independently
-│   │   ├── dynamic_bridge.py   ← ROS2 → Zenoh bridge (CDR)  [only ROS node]
-│   │   ├── frame_decimator.py  ← best-of-window frames + camera-height stamp
+│   │   ├── dynamic_bridge.py   ← ROS2 → Zenoh bridge (odometry)  [only ROS node]
+│   │   ├── theta_camera.py     ← Theta UVC capture + best-of-window + camera-height
 │   │   ├── pose_fuser.py       ← PLACEHOLDER authoritative-pose fuser
 │   │   └── kinematics.py       ← camera↔base transform + camera-height + body state
-│   ├── ros/
-│   │   ├── bringup_camera.sh   ← camera bringup: CycloneDDS fix + insta360 equirect
-│   │   └── vat_bringup/        ← optional ROS2 launch wrapper (not required)
 │   └── systemd/
-│       ├── vat-robot.service        ← host ROS2 camera stack (Foxy)
-│       └── vat-robot-docker.service ← the Docker container (docker run, no compose)
+│       ├── vat-theta-uvc.service     ← host: Theta UVC → /dev/video0
+│       └── vat-robot-docker.service  ← the Docker container (docker run, no compose)
 │
 └── docs/
-    └── streaming_poc.md        ← this file
+    ├── streaming_poc.md        ← this file
+    └── archive/insta360.md     ← retired Insta360 camera setup (historical)
 ```
 
 > The Jetson has **no docker-compose** — there is a single `Dockerfile`, built
-> from the repo root and run via `run.sh` / the systemd unit. The bridge is the
-> only ROS node; the decimator and fuser are plain Zenoh clients.
+> from the repo root and run via `run.sh` / the systemd unit. The camera is
+> captured directly over UVC (no ROS camera node); the bridge (odometry),
+> `theta_camera`, and `pose_fuser` are the three container processes.
 
 ---
 
@@ -207,42 +199,33 @@ torch = { index = "pytorch-cu121" }
 cd client && uv sync && cd -
 ```
 
-### 4. Build the robot ROS2 camera stack (Go2-W, host Foxy)
+### 4. Bring up the camera (RICOH Theta X over UVC)
 
-The only ROS node on the host is the **`insta360_ros_driver`**, built in
-`~/ros2_ws`. Follow [robot setup](setup/robot.md) for the full driver + SDK +
-udev install, then build:
-
-```bash
-cd ~/ros2_ws
-source /opt/ros/foxy/setup.bash
-colcon build --symlink-install
-source install/setup.bash
-```
-
-Bring the camera up (equirectangular mode is what PRISM consumes). `make
-robot-ros` wraps the CycloneDDS eth0 fix + sourcing + launch:
+No ROS camera node — the Theta X streams in-camera-stitched equirectangular over
+UVC. Follow [robot setup](setup/robot.md) for the one-time `libuvc-theta` +
+`v4l2loopback` install, then expose it as `/dev/video0`:
 
 ```bash
-make robot-ros
-# = ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
+make theta-uvc      # = bash robot/theta/theta_uvc.sh  (leave running)
 ```
 
-This publishes `/equirectangular/image`, `/dual_fisheye/image[/compressed]` and
-`/imu/data`. (`robot/ros/vat_bringup/` is an optional convenience wrapper — not
-required; the bring-up script launches the driver directly.)
+Sanity-check the camera alone (on the robot, no Zenoh):
+
+```bash
+make test_frames_robot      # = python3 tools/view_theta.py
+```
 
 ### 5. Build & run the robot Docker container (Jetson — NO compose)
 
-The bridge + decimator + pose fuser run in **one** container. The Jetson has no
-docker-compose, so build from the repo root and run with `run.sh` (or the
-systemd unit):
+The bridge (odometry) + `theta_camera` + pose fuser run in **one** container.
+The Jetson has no docker-compose, so build from the repo root and run with
+`run.sh` (or the systemd unit). The Theta `/dev/video0` is passed in:
 
 ```bash
-# from the repo root — point it at your server's IP
-./robot/docker/run.sh <SERVER_IP>
+# from the repo root — point it at your server's IP (start theta-uvc first)
+bash robot/docker/run.sh <SERVER_IP>
 # logs:
-docker logs -f vat-robot
+docker logs -f vat-robot       # expect "Theta stream open. Streaming…"
 ```
 
 ### 6. Install the systemd services (Jetson)
@@ -257,7 +240,7 @@ sudo systemctl enable --now vat-robot.service vat-robot-docker.service
 
 # Verify
 sudo journalctl -fu vat-robot          # camera stack
-sudo journalctl -fu vat-robot-docker   # bridge + decimator + fuser
+sudo journalctl -fu vat-robot-docker   # bridge + theta_camera + fuser
 ```
 
 After this, **the full VAT stack starts automatically on every Jetson boot**,
@@ -420,7 +403,7 @@ robot, server and client) so they can never drift apart.
 
 ### Live config  (`{robot}/rt/prism/config/throttle_fps`, `.../window_size`)
 
-Plain UTF-8 string payloads (e.g. `"3.0"`, `"5"`). The `frame_decimator.py`
+Plain UTF-8 string payloads (e.g. `"3.0"`, `"5"`). The `theta_camera.py`
 process subscribes and applies the new value immediately.
 
 ---
@@ -606,7 +589,7 @@ This is resolved once the true online engine mode is implemented.
 - [x] `server/mapping/mapping_server.py` — frame subscriber → PRISM engine → pcd + pose-correction publisher
 - [x] `server/router/router.py` — standalone pure-Python Zenoh router (isolated uv env)
 - [x] `client/prism_rerun_viewer.py` — pcd + pose subscriber → Rerun, with `PosePredictor` + robot block
-- [x] `robot/docker/frame_decimator.py` — best-of-window sharpest + camera-height stamp
+- [x] `robot/docker/theta_camera.py` — Theta UVC capture + best-of-window + camera-height stamp
 - [x] `robot/docker/kinematics.py` — camera↔base transform + camera height + body-state tracker
 - [x] `robot/docker/pose_fuser.py` — PLACEHOLDER authoritative-pose fuser
 - [x] `robot/docker/` single Dockerfile + `run.sh` + supervised `start.sh` (no compose)
@@ -658,19 +641,21 @@ This is resolved once the true online engine mode is implemented.
 → Set the real stick geometry via `STICK_OFFSET_X/Y/Z`; check the `SportModeState`
    decode isn't silently falling back (look for the one-time decode-failure warning).
 
+**No camera frames (`camera/frame` 0 Hz)**  
+→ Preview the Theta on the robot first: `make test_frames_robot`
+   (`tools/view_theta.py`). If that's blank, the UVC source is down — start
+   `make theta-uvc` and confirm `ls -l /dev/video0`.  
+→ If the robot preview works but the client sees 0 Hz, the container didn't get
+   the device — start `make theta-uvc` **before** `make robot-docker` so `--device
+   /dev/video0` is attached; check `docker logs vat-robot` for `theta_camera`.
+
 **`ros2 topic list` is empty / `package not found` on the robot**  
 → Export the CycloneDDS fix first (the Go2 points at the wrong interface):
    `export CYCLONEDDS_URI='<CycloneDDS>…<NetworkInterface name="eth0"/>…</CycloneDDS>'`
-   `make robot-ros` does this for you.  
-→ `insta360_ros_driver` must be built: `cd ~/ros2_ws && colcon build --symlink-install && source install/setup.bash`.
-
-**No `/equirectangular/image` topic**  
-→ The driver defaults `equirectangular:=false`. `make robot-ros` passes
-   `equirectangular:=true`; if launching by hand, add it.  
-→ Camera must be in **Dual-Lens** mode with **USB = Android**, and `/dev/insta` present.
+   (the container handles this itself). This only affects the odometry bridge now.
 
 **Throttle Zenoh update has no effect**  
-→ Confirm the decimator's `ZENOH_CONNECT` matches your router, and that frames
+→ Confirm `theta_camera`'s `ZENOH_CONNECT` matches your router, and that frames
    are flowing (`make test_frames_server`).
 
 **Robot avatar doesn't move (no pose in viewer)**  

@@ -1,0 +1,14 @@
+# Normalize line endings. The runtime targets (Jetson container, Linux server)
+# need LF — especially shell scripts and the container entrypoint. This keeps
+# Windows working copies from shipping CRLF that would break `bash`/Docker.
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.py    text eol=lf
+Makefile text eol=lf
+*.env   text eol=lf
+
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.pt    binary

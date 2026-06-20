@@ -51,24 +51,18 @@ make router
 # = cd server/router && uv run python router.py   (binds ZENOH_LISTEN from vat.env)
 ```
 
-**🤖 ROBOT — start the camera stack + container.** One-time prereqs (see
-[robot setup](setup/robot.md)): `insta360_ros_driver` built in `~/ros2_ws`,
-camera in **Dual-Lens** mode with **USB = Android**, and the `/dev/insta` udev
-rule. Then, from the repo (e.g. `~/Desktop/vat-monorepo`):
+**🤖 ROBOT — start the Theta UVC + container.** One-time prereqs (see
+[robot setup](setup/robot.md)): `libuvc-theta` + `libuvc-theta-sample` built,
+`v4l2loopback-dkms` installed, Theta X in **live-streaming** mode. Then, from the
+repo (e.g. `~/Desktop/vat-monorepo`):
 
 ```bash
-# host ROS camera stack — applies the CycloneDDS eth0 fix, sources ~/ros2_ws,
-# and launches the Insta360 driver in equirectangular mode (what PRISM needs)
-make robot-ros
-# = bash robot/ros/bringup_camera.sh
-#   → ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
-# LEAVE THIS RUNNING in its own terminal. After "Mapping matrices initialization
-# complete" it goes quiet (it doesn't log every frame) — that's normal, it's
-# streaming. Don't Ctrl-C it, or every downstream stream drops to 0 Hz.
+# expose the Theta X UVC stream as /dev/video0 — LEAVE RUNNING in its own shell
+make theta-uvc
 
-# in another shell: bridge + decimator + pose fuser (no compose)
+# in another shell: bridge (odometry) + theta_camera + pose fuser
 make robot-docker
-docker logs -f vat-robot          # watch for "Registered Zenoh route ..."
+docker logs -f vat-robot          # expect "Theta stream open. Streaming…"
 ```
 
 **💻 CLIENT — check the link:**
@@ -77,9 +71,10 @@ docker logs -f vat-robot          # watch for "Registered Zenoh route ..."
 make test_link
 ```
 
-✅ Expect: `robot bridge ALIVE`, ROS topics listed (incl. `/equirectangular/image`,
-`/sportmodestate`), and non-zero Hz on `equirectangular/image` and
-`camera/frame`. If a stream is 0 Hz, fix it here before continuing.
+✅ Expect: `robot bridge ALIVE`, `robot pose fuser ALIVE`, and non-zero Hz on
+`camera/frame` and `pose`. (`/sportmodestate` needs the `unitree_go` msgs in the
+container — Stage 2.) If `camera/frame` is 0 Hz, fix the camera first
+(`make test_frames_robot` on the robot).
 
 ---
 
@@ -88,23 +83,21 @@ make test_link
 **💻 CLIENT:**
 
 ```bash
-# the decimated frames the server will actually consume — USE THIS as the check
-# (small JPEG; also shows the stamped camera_height + seq; tests the decimator)
-make test_frames_server
+# [ROBOT] preview the Theta UVC directly (camera alone, no Zenoh) — sanity check
+make test_frames_robot      # = python3 tools/view_theta.py
 
-# raw equirectangular straight off the camera (tests the camera alone) — HEAVY:
-# ~5.5 MB/frame across the link, so use it sparingly, not as the routine check
-make test_frames_robot
+# [CLIENT] the decimated frames the server will actually consume — the real check
+make test_frames_server     # small JPEG; shows camera_height + seq
 ```
 
 !!! note
-    If frames don't appear, image topics are **best-effort** QoS — the bridge
-    must match it (fixed; **rebuild** with `make robot-docker`). Check the bridge
-    log for `[forwarded] /equirectangular/image=N`; if it stays `0`, it's still
-    QoS/DDS, not the camera. See [robot setup → Troubleshooting](setup/robot.md).
+    If the robot preview works but `camera/frame` is 0 Hz on the client, check
+    `docker logs vat-robot` for `theta_camera` errors (device not passed in?) and
+    that `make theta-uvc` is running. The Theta capture is local to the robot —
+    only the decimated JPEG crosses the link.
 
-✅ Expect: a live equirectangular image in Rerun at ~`throttle_fps` (decimated)
-or camera rate (raw); `camera/height_m` should be a sane number (≈ stand height
+✅ Expect: a live equirectangular image at ~`throttle_fps` (decimated);
+`camera/height_m` should be a sane number (≈ stand height
 + stick). Tune live if needed:
 
 ```bash
@@ -174,10 +167,10 @@ moves smoothly (predicted between pose samples), green/amber by fix quality.
 |---|---|---|
 | ☁️ SERVER | `make router` | 0+ |
 | ☁️ SERVER | `make mapping` | 3+ |
-| 🤖 ROBOT | `make robot-ros` | 0+ |
+| 🤖 ROBOT | `make theta-uvc`  (Theta X → /dev/video0) | 0+ |
 | 🤖 ROBOT | `make robot-docker` | 0+ |
 | 💻 CLIENT | `make test_link` | 0 |
-| 💻 CLIENT | `make test_frames_robot` / `make test_frames_server` | 1 |
+| 🤖 ROBOT `make test_frames_robot` / 💻 CLIENT `make test_frames_server` | | 1 |
 | 💻 CLIENT | `make test_robot_state` | 2 |
 | 💻 CLIENT | `make test_poses` | 3 |
 | 💻 CLIENT | `make viewer` | 4 |

@@ -34,7 +34,7 @@ Design notes
   is best-effort: if the custom Unitree message can't be decoded it falls back
   to configured constants and never raises.
 
-This module is shared by ``frame_decimator.py`` (needs camera height) and
+This module is shared by ``theta_camera.py`` (needs camera height) and
 ``pose_fuser.py`` (needs the camera→base transform + body twist).
 """
 
