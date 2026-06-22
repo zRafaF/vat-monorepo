@@ -30,6 +30,7 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
     python3-pip \
+    iproute2 \
     ros-humble-rosidl-runtime-py \
     ros-humble-rmw-cyclonedds-cpp \
     libgl1 \

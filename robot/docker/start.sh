@@ -18,34 +18,57 @@ set -o pipefail
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 
 # ── Resolve the CycloneDDS network interface ─────────────────────────────────
-# Binding a NIC that doesn't exist makes node creation fail outright
-# ("<iface>: does not match an available interface"), which crash-loops the
-# bridge. Resolve a REAL interface, in order:
-#   1. NET_IFACE, if it exists;
-#   2. the NIC on the Unitree internal subnet 192.168.123.x (where the Go2 MCU
-#      publishes /sportmodestate etc.);
-#   3. the default-route NIC;
-#   4. the first non-loopback UP NIC.
-iface_exists() { [ -d "/sys/class/net/$1" ]; }
+# CycloneDDS only enumerates interfaces that are UP *and* have an IPv4 address;
+# binding any other name fails with "<iface>: does not match an available
+# interface", which crash-loops the bridge. So we must pick a *usable* NIC.
+# Note: an interface can EXIST in /sys (e.g. eth0) yet be down / address-less —
+# that is exactly this robot's case — so existence alone is not enough.
+#
+# Order: 1) NET_IFACE if usable; 2) the NIC on the Unitree subnet 192.168.123.x
+# (the Go2 MCU's network); 3) the default-route NIC; 4) the first UP NIC w/ IPv4.
+iface_usable() {
+    local n="$1" st
+    [ -d "/sys/class/net/$n" ] || return 1
+    st="$(cat "/sys/class/net/$n/operstate" 2>/dev/null)"
+    # "up" = link present; "unknown" = lo/tun/veth that still carry traffic
+    [ "$st" = "up" ] || [ "$st" = "unknown" ] || return 1
+    ip -o -4 addr show dev "$n" 2>/dev/null | grep -q 'inet ' || return 1
+    return 0
+}
+iface_addr() { ip -o -4 addr show dev "$1" 2>/dev/null | awk '{print $4}' | head -1; }
 
-_want="${NET_IFACE:-eth0}"
-if iface_exists "$_want"; then
+_want="${NET_IFACE:-}"
+NET_IFACE=""
+if [ -n "$_want" ] && iface_usable "$_want"; then
     NET_IFACE="$_want"
-else
-    echo "[start] NET_IFACE='${_want}' not present. Interfaces available:"
-    ip -br link 2>/dev/null | sed 's/^/[start]   /' || ls /sys/class/net | sed 's/^/[start]   /'
-    _pick="$(ip -o -4 addr show 2>/dev/null | awk '/inet 192\.168\.123\./{print $2; exit}')"
-    [ -z "$_pick" ] && _pick="$(ip route show default 2>/dev/null | awk '/^default/{print $5; exit}')"
-    if [ -z "$_pick" ] || ! iface_exists "$_pick"; then
-        for _d in /sys/class/net/*; do
-            _n="$(basename "$_d")"; [ "$_n" = "lo" ] && continue
-            [ "$(cat "$_d/operstate" 2>/dev/null)" = "up" ] && { _pick="$_n"; break; }
-        done
+fi
+if [ -z "$NET_IFACE" ]; then
+    NET_IFACE="$(ip -o -4 addr show 2>/dev/null | awk '/inet 192\.168\.123\./{print $2; exit}')"
+fi
+if [ -z "$NET_IFACE" ]; then
+    _c="$(ip route show default 2>/dev/null | awk '/^default/{print $5; exit}')"
+    [ -n "$_c" ] && iface_usable "$_c" && NET_IFACE="$_c"
+fi
+if [ -z "$NET_IFACE" ]; then
+    for _d in /sys/class/net/*; do
+        _n="$(basename "$_d")"; [ "$_n" = "lo" ] && continue
+        iface_usable "$_n" && { NET_IFACE="$_n"; break; }
+    done
+fi
+
+echo "[start] interfaces (UP + IPv4 are the candidates):"
+ip -br addr 2>/dev/null | sed 's/^/[start]   /' || true
+if [ -n "$NET_IFACE" ]; then
+    echo "[start] DDS interface: ${NET_IFACE} ($(iface_addr "$NET_IFACE"))"
+    if [ -n "$_want" ] && [ "$NET_IFACE" != "$_want" ]; then
+        echo "[start] (NET_IFACE='${_want}' was not usable — auto-selected '${NET_IFACE}')."
+        echo "[start]  If the bridge shows [no data], pin NET_IFACE in vat.env."
     fi
-    NET_IFACE="${_pick:-lo}"
-    echo "[start] auto-selected NET_IFACE='${NET_IFACE}'."
-    echo "[start] If the bridge reports no topics / [no data], pin the correct one:"
-    echo "[start]   set NET_IFACE=<iface> in vat.env (the NIC on the Go2's subnet)."
+else
+    echo "[start] ERROR: no UP interface with an IPv4 address — CycloneDDS can't bind."
+    echo "[start]        Connect the Go2 network, or set NET_IFACE in vat.env."
+    echo "[start]        Falling back to 'lo' so the container doesn't crash-loop."
+    NET_IFACE="lo"
 fi
 export NET_IFACE
 export CYCLONEDDS_URI="${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><Interfaces><NetworkInterface name=\"${NET_IFACE}\"/></Interfaces></General></Domain></CycloneDDS>}"
