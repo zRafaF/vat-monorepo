@@ -1,6 +1,6 @@
 # VAT Robot — RICOH Theta X UVC → v4l2 loopback (host service)
 # ============================================================
-# Decodes the Theta X UVC stream to /dev/video0 so the container's
+# Decodes the Theta X UVC stream to /dev/video10 so the container's
 # theta_camera.py can read it. Replaces the old Insta360 host camera unit.
 #
 # Install (edit User/paths to match your robot):
@@ -23,7 +23,8 @@ Type=simple
 User=unitree
 Group=unitree
 Environment="HOME=/home/unitree"
-Environment="VIDEO_NR=0"
+# Dedicated loopback node (RealSense claims /dev/video0..N); match THETA_DEVICE.
+Environment="VIDEO_NR=10"
 Environment="THETA_MODE=2K"
 Environment="THETA_BACKEND=gstthetauvc"
 # If gstthetauvc.so is not in the system GStreamer plugin dir, point at it:

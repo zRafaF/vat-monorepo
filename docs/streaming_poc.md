@@ -19,7 +19,7 @@ The server computes a slow, drift-free VGGT pose and sends it **down** to the do
 │                                                                            │
 │  RICOH Theta X  (in-camera stitched equirectangular, H.264 over UVC)       │
 │      │ USB                                                                 │
-│  gstthetauvc (thetauvcsrc→v4l2sink)  →  /dev/video0   (host)               │
+│  gstthetauvc (thetauvcsrc→v4l2sink)  →  /dev/video10   (host)              │
 │      │                                                                     │
 │  theta_camera.py (docker)  ← OpenCV UVC capture                            │
 │      │ best-of-N-frame sharpest + camera_height stamp + JPEG               │
@@ -123,7 +123,7 @@ vat-monorepo/
 │
 ├── robot/
 │   ├── theta/
-│   │   └── theta_uvc.sh        ← Theta X UVC → /dev/video0 (libuvc-theta loopback)
+│   │   └── theta_uvc.sh        ← Theta X UVC → /dev/video10 (libuvc-theta loopback)
 │   ├── docker/                 ← single container alongside the host ROS stack
 │   │   ├── Dockerfile          ← build from REPO ROOT (-f robot/docker/Dockerfile)
 │   │   ├── run.sh              ← build + docker run helper (no compose)
@@ -133,7 +133,7 @@ vat-monorepo/
 │   │   ├── pose_fuser.py       ← PLACEHOLDER authoritative-pose fuser
 │   │   └── kinematics.py       ← camera↔base transform + camera-height + body state
 │   └── systemd/
-│       ├── vat-theta-uvc.service     ← host: Theta UVC → /dev/video0
+│       ├── vat-theta-uvc.service     ← host: Theta UVC → /dev/video10
 │       └── vat-robot-docker.service  ← the Docker container (docker run, no compose)
 │
 └── docs/
@@ -203,7 +203,7 @@ cd client && uv sync && cd -
 
 No ROS camera node — the Theta X streams in-camera-stitched equirectangular over
 UVC. Follow [robot setup](setup/robot.md) for the one-time `libuvc-theta` +
-`v4l2loopback` install, then expose it as `/dev/video0`:
+`v4l2loopback` install, then expose it as `/dev/video10`:
 
 ```bash
 make theta-uvc      # = bash robot/theta/theta_uvc.sh  (leave running)
@@ -219,7 +219,7 @@ make test_frames_robot      # = python3 tools/view_theta.py
 
 The bridge (odometry) + `theta_camera` + pose fuser run in **one** container.
 The Jetson has no docker-compose, so build from the repo root and run with
-`run.sh` (or the systemd unit). The Theta `/dev/video0` is passed in:
+`run.sh` (or the systemd unit). The Theta `/dev/video10` is passed in:
 
 ```bash
 # from the repo root — point it at your server's IP (start theta-uvc first)
@@ -644,10 +644,10 @@ This is resolved once the true online engine mode is implemented.
 **No camera frames (`camera/frame` 0 Hz)**  
 → Preview the Theta on the robot first: `make test_frames_robot`
    (`tools/view_theta.py`). If that's blank, the UVC source is down — start
-   `make theta-uvc` and confirm `ls -l /dev/video0`.  
+   `make theta-uvc` and confirm `ls -l /dev/video10`.  
 → If the robot preview works but the client sees 0 Hz, the container didn't get
    the device — start `make theta-uvc` **before** `make robot-docker` so `--device
-   /dev/video0` is attached; check `docker logs vat-robot` for `theta_camera`.
+   /dev/video10` is attached; check `docker logs vat-robot` for `theta_camera`.
 
 **`ros2 topic list` is empty / `package not found` on the robot**  
 → Export the CycloneDDS fix first (the Go2 points at the wrong interface):

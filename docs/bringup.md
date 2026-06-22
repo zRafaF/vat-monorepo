@@ -57,7 +57,7 @@ make router
 repo (e.g. `~/Desktop/vat-monorepo`):
 
 ```bash
-# expose the Theta X UVC stream as /dev/video0 — LEAVE RUNNING in its own shell
+# expose the Theta X UVC stream as /dev/video10 — LEAVE RUNNING in its own shell
 make theta-uvc
 
 # in another shell: bridge (odometry) + theta_camera + pose fuser
@@ -167,7 +167,7 @@ moves smoothly (predicted between pose samples), green/amber by fix quality.
 |---|---|---|
 | ☁️ SERVER | `make router` | 0+ |
 | ☁️ SERVER | `make mapping` | 3+ |
-| 🤖 ROBOT | `make theta-uvc`  (Theta X → /dev/video0) | 0+ |
+| 🤖 ROBOT | `make theta-uvc`  (Theta X → /dev/video10) | 0+ |
 | 🤖 ROBOT | `make robot-docker` | 0+ |
 | 💻 CLIENT | `make test_link` | 0 |
 | 🤖 ROBOT `make test_frames_robot` / 💻 CLIENT `make test_frames_server` | | 1 |

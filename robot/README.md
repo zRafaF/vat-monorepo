@@ -15,13 +15,13 @@ Quick start (after the one-time install in the docs), from the repo root on the
 robot:
 
 ```bash
-make theta-uvc      # Theta X UVC → /dev/video0 (leave running)
+make theta-uvc      # Theta X UVC → /dev/video10 (leave running)
 make robot-docker   # ROS↔Zenoh bridge (odometry) + theta_camera + pose fuser
 ```
 
 Folders here:
 
-- `robot/theta/` — `theta_uvc.sh` (Theta UVC → /dev/video0 loopback helper).
+- `robot/theta/` — `theta_uvc.sh` (Theta UVC → /dev/video10 loopback helper).
 - `robot/docker/` — the container (`dynamic_bridge.py`, `theta_camera.py`,
   `pose_fuser.py`, `kinematics.py`) + `run.sh` + `start.sh`.
 - `robot/systemd/` — boot units (`vat-theta-uvc.service`, `vat-robot-docker.service`).

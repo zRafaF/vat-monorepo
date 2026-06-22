@@ -19,9 +19,9 @@
 # Run (see robot/docker/run.sh or robot/systemd/vat-robot-docker.service). The
 # container needs the Theta video device, e.g.:
 #   docker run -d --name vat-robot --restart unless-stopped \
-#     --network host --ipc host --device /dev/video0 \
+#     --network host --ipc host --device /dev/video10 \
 #     -e ROBOT_NAME=go2 -e ZENOH_CONNECT=tcp/SERVER_IP:7447 \
-#     -e THETA_DEVICE=/dev/video0 vat-robot-docker
+#     -e THETA_DEVICE=/dev/video10 vat-robot-docker
 
 FROM ros:humble-ros-base
 
@@ -68,6 +68,6 @@ ENV ROBOT_NAME="go2" \
     STICK_OFFSET_Z="0.55" \
     FALLBACK_BODY_HEIGHT="0.30" \
     THETA_MODE="2K" \
-    THETA_DEVICE="/dev/video0"
+    THETA_DEVICE="/dev/video10"
 
 ENTRYPOINT ["/bin/bash", "/app/start.sh"]

@@ -35,7 +35,7 @@ help:
 	@echo "Services:"
 	@echo "  make router          [SERVER] run the Zenoh router (hub)"
 	@echo "  make mapping         [SERVER] run the PRISM mapping server"
-	@echo "  make theta-uvc       [ROBOT]  expose Theta X UVC → /dev/video0 (host)"
+	@echo "  make theta-uvc       [ROBOT]  expose Theta X UVC → /dev/video10 (host)"
 	@echo "  make robot-docker    [ROBOT]  bridge + theta_camera + pose fuser container"
 	@echo "  make viewer          [CLIENT] full POC viewer (cloud + robot block)"
 	@echo ""
@@ -55,7 +55,7 @@ steps:
 	@echo ""
 	@echo "Stage 0  Transport"
 	@echo "  [SERVER] make router          # the hub; leave it running"
-	@echo "  [ROBOT]  make theta-uvc        # Theta X → /dev/video0 (leave running)"
+	@echo "  [ROBOT]  make theta-uvc        # Theta X → /dev/video10 (leave running)"
 	@echo "  [ROBOT]  make robot-docker     # bridge + theta_camera + fuser"
 	@echo "  [CLIENT] make test_link        # expect bridge ALIVE + non-zero Hz"
 	@echo ""
@@ -99,10 +99,10 @@ mapping: sync-mapping
 	@echo ">> Connecting to $(ZENOH_ROUTER)  (may be a different datacenter — OK)"
 	cd server/mapping && uv run python mapping_server.py
 
-# [ROBOT] Expose the RICOH Theta X UVC stream as /dev/video0 on the host
+# [ROBOT] Expose the RICOH Theta X UVC stream as /dev/video10 on the host
 # (libuvc-theta via the gstthetauvc plugin). Leave running; the container reads it.
 theta-uvc:
-	@echo ">> [ROBOT] Theta X UVC → /dev/video0 (leave running in its own shell)"
+	@echo ">> [ROBOT] Theta X UVC → /dev/video10 (leave running in its own shell)"
 	bash robot/theta/theta_uvc.sh
 
 # [ROBOT] Container: ROS↔Zenoh bridge + theta_camera + pose fuser.

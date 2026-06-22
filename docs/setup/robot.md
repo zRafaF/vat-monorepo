@@ -13,7 +13,7 @@ End-to-end setup for the **Unitree Go2-W**. Two parts:
 !!! tip "Quick start (after the one-time install below)"
     From the repo root on the robot:
     ```bash
-    make theta-uvc      # Theta X UVC → /dev/video0 (leave running in its own shell)
+    make theta-uvc      # Theta X UVC → /dev/video10 (leave running in its own shell)
     make robot-docker   # bridge + theta_camera + pose fuser
     ```
 
@@ -25,10 +25,17 @@ The Theta X is **not** a plain webcam. The mainline kernel `uvcvideo` driver
 enumerates it (`dmesg` shows *"Found UVC 1.50 device RICOH THETA X"*) but then
 reports *"No streaming interface found"* and exposes **no `/dev/videoN` capture
 node** — the H.264 stream rides a vendor UVC 1.5 configuration the kernel driver
-won't surface. (This is why plain `cv2.VideoCapture("/dev/video0")` works on
-Windows, where Ricoh ships a UVC driver, but never on stock Linux.) The stream
-must be pulled in **userspace via `libuvc-theta`**. We decode it into a standard
-**v4l2 loopback** device that OpenCV reads as `/dev/video0`.
+won't surface. (This is why plain `cv2.VideoCapture(0)` works on Windows, where
+Ricoh ships a UVC driver, but never on stock Linux.) The stream must be pulled
+in **userspace via `libuvc-theta`**. We decode it into a standard **v4l2
+loopback** device that OpenCV reads as `/dev/video10`.
+
+!!! warning "Loopback node is `/dev/video10`, not `/dev/video0`"
+    This robot also runs an **Intel RealSense**, which claims the low-numbered
+    `/dev/video0..N` nodes at boot. The Theta loopback therefore uses a dedicated
+    high number — **`/dev/video10`** (`VIDEO_NR` in `theta_uvc.sh`, `THETA_DEVICE`
+    in `vat.env`). If you put the loopback on a node the RealSense already owns,
+    GStreamer fails with *"Device '/dev/videoN' is not a output device"*.
 
 !!! warning "Use `gstthetauvc`, not stock `gst_loopback`"
     The `libuvc-theta-sample` `gst_loopback` binary identifies the camera by a
@@ -42,7 +49,12 @@ must be pulled in **userspace via `libuvc-theta`**. We decode it into a standard
 
 **a) Put the camera in live-streaming mode** and update its firmware
 ([Ricoh guide](https://blog.ricoh360.com/en/12306)). Connect it to the Jetson by
-USB-C. Confirm: `lsusb | grep -i ricoh` (you should see `05ca:2717`).
+USB-C, then on the camera switch to **Live Streaming** mode (Mode button →
+`LIVE`). Confirm: `lsusb | grep -i ricoh` must show **`05ca:2717`**. If you see
+**`05ca:0373`** (or any other id) the camera is in normal/MTP mode, not
+streaming — `make theta-uvc` will refuse to start until it reads `2717`. The
+camera can silently drop out of streaming mode on reboot/idle, so re-check this
+if a previously-working setup stops.
 
 **b) Build `libuvc-theta`** (the UVC1.5/H.264 fork) and remove any stray system
 `libuvc` that would shadow it:
@@ -88,7 +100,7 @@ gst-inspect-1.0 thetauvcsrc
 sudo apt install v4l2loopback-dkms
 ```
 
-**e) Expose the Theta as `/dev/video0`** with the helper (loads the loopback
+**e) Expose the Theta as `/dev/video10`** with the helper (loads the loopback
 module + runs the `thetauvcsrc → v4l2sink` pipeline):
 
 ```bash
@@ -100,14 +112,14 @@ make theta-uvc        # = bash robot/theta/theta_uvc.sh  (leave running)
 Verify the device streams (run on the robot — camera alone, no Zenoh):
 
 ```bash
-make test_frames_robot     # = python3 tools/view_theta.py  (THETA_DEVICE=/dev/video0)
+make test_frames_robot     # = python3 tools/view_theta.py  (THETA_DEVICE=/dev/video10)
 ```
 
 !!! note "Advanced: skip the loopback entirely"
     If your OpenCV is built **with GStreamer**, you can hand a pipeline straight
     to OpenCV via `THETA_GST_PIPELINE` (e.g. `thetauvcsrc mode=2K ! … ! appsink`,
     with `nvv4l2decoder` for Jetson HW decode) instead of going through
-    `/dev/video0`. `theta_camera.py` and `tools/view_theta.py` both honour it.
+    `/dev/video10`. `theta_camera.py` and `tools/view_theta.py` both honour it.
     We keep the loopback as the default because the **pip OpenCV in the container
     has V4L but not GStreamer**.
 
@@ -140,13 +152,13 @@ decimated JPEG goes out.
 The container ships three processes (`robot/docker/`): the ROS↔Zenoh **bridge**
 (odometry, e.g. `/sportmodestate`), **`theta_camera`** (above), and
 **`pose_fuser`**. The Go2 has no docker-compose, so it's built from the repo root
-and run via `run.sh`, wrapped by `make robot-docker`. The Theta `/dev/video0` is
+and run via `run.sh`, wrapped by `make robot-docker`. The Theta `/dev/video10` is
 passed in with `--device`.
 
 ```bash
 # from the repo root (config — router IP, robot name, THETA_* — comes from vat.env)
 make robot-docker
-# = bash robot/docker/run.sh $ROUTER_IP   (build + docker run --network host --device /dev/video0 …)
+# = bash robot/docker/run.sh $ROUTER_IP   (build + docker run --network host --device /dev/video10 …)
 
 docker logs -f vat-robot
 ```
@@ -214,7 +226,8 @@ export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterfac
 
 1. Camera in **live-streaming mode** and connected (`lsusb | grep -i ricoh` →
    `05ca:2717`).
-2. The loopback is up: `make theta-uvc` running, and `ls -l /dev/video0` exists.
+2. The loopback is up: `make theta-uvc` running, and `ls -l /dev/video10` exists
+   (it is the loopback, not the RealSense).
 3. `gstthetauvc` plugin found: `gst-inspect-1.0 thetauvcsrc` succeeds (set
    `GST_PLUGIN_PATH` if not in the system dir); `v4l2loopback-dkms` installed.
 4. `THETA not found` from `make theta-uvc` → you're on the `loopback` backend
@@ -223,11 +236,19 @@ export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterfac
 5. `Found 1 Theta(s), but none available` / cannot open → a **stray system
    `libuvc`** is shadowing the fork: `sudo apt purge libuvc-dev libuvc0`, then
    rebuild and `sudo ldconfig`.
-6. The container got the device: `--device /dev/video0` (run.sh adds it if the
+6. `Device '/dev/videoN' is not a output device` (caps `0x…0001` = capture-only)
+   → the loopback node clashed with a **real capture device** (the RealSense owns
+   `/dev/video0..N`). Use the dedicated `VIDEO_NR=10` (default) and keep
+   `THETA_DEVICE=/dev/video10` in `vat.env`. Check with
+   `cat /sys/class/video4linux/video10/name` → it should read `ThetaUVC`.
+7. The camera dropped to `05ca:0373` (normal/MTP) → re-enter **Live Streaming**
+   mode on the camera; `make theta-uvc` refuses to start until `lsusb` shows
+   `05ca:2717`.
+8. The container got the device: `--device /dev/video10` (run.sh adds it if the
    device exists — start `make theta-uvc` **before** `make robot-docker`).
 
 **Container `theta_camera` logs "could not open Theta stream"** — the device
-isn't visible inside the container. Confirm `/dev/video0` exists on the host
+isn't visible inside the container. Confirm `/dev/video10` exists on the host
 *before* `make robot-docker`, or rerun it so `--device` is attached.
 
 **`make robot-docker` → `run.sh: Permission denied`** — the Makefile calls `bash

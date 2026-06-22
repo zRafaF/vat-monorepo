@@ -7,7 +7,7 @@
 #   ZENOH_CONNECT   (default tcp/<SERVER_IP|127.0.0.1>:7447)
 #   THROTTLE_FPS WINDOW_SIZE JPEG_QUALITY CAMERA_FPS PUBLISH_HZ LOSSLESS
 #   STICK_OFFSET_X STICK_OFFSET_Y STICK_OFFSET_Z FALLBACK_BODY_HEIGHT
-#   THETA_DEVICE        v4l2 device for the Theta UVC stream (default /dev/video0)
+#   THETA_DEVICE        v4l2 device for the Theta UVC stream (default /dev/video10)
 #   THETA_MODE          2K | 4K   (default 2K)
 #   THETA_GST_PIPELINE  full GStreamer pipeline (advanced; needs GStreamer OpenCV)
 set -euo pipefail
@@ -18,7 +18,7 @@ NAME="vat-robot"
 
 ROBOT_NAME="${ROBOT_NAME:-go2}"
 ZENOH_CONNECT="${ZENOH_CONNECT:-tcp/${SERVER_IP}:7447}"
-THETA_DEVICE="${THETA_DEVICE:-/dev/video0}"
+THETA_DEVICE="${THETA_DEVICE:-/dev/video10}"
 
 # Build from repo root (this script's grandparent) so /common is in context.
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
