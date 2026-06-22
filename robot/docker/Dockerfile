@@ -48,6 +48,7 @@ COPY common/vat_protocol.py     /app/
 # Robot-side processes
 COPY robot/docker/dynamic_bridge.py   /app/
 COPY robot/docker/theta_camera.py     /app/
+COPY robot/docker/frame_archive.py    /app/
 COPY robot/docker/pose_fuser.py       /app/
 COPY robot/docker/kinematics.py       /app/
 COPY robot/docker/start.sh            /app/

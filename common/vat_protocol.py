@@ -78,6 +78,9 @@ def keys(robot_name: str = "go2", server_prefix: str = "server/prism") -> dict:
         "camera_frame":     f"{robot_name}/prism/camera/frame",
         # server → robot queryable: re-request a missed frame by seq
         "camera_frame_get": f"{robot_name}/prism/camera/frame/get",
+        # server/client → robot queryable: fetch the FULL-RES archived
+        # frame by seq (same seq the live stream used)
+        "camera_archive_get": f"{robot_name}/prism/camera/archive/get",
         # server → client
         "pcd_delta":       f"{server_prefix}/pcd_delta",
         "pcd_snapshot":    f"{server_prefix}/pcd_snapshot",

@@ -34,13 +34,24 @@ elif [ -z "${THETA_GST_PIPELINE:-}" ]; then
     echo "[run]          (make theta-uvc → gstthetauvc) — see docs/setup/robot.md."
 fi
 
+# Full-res archive: bind-mount a host dir so the rolling archive survives
+# container restarts and doesn't bloat the container's writable layer.
+VOL_ARGS=()
+if [ "${ARCHIVE_ENABLE:-true}" = "true" ]; then
+    ARCHIVE_DIR_HOST="${ARCHIVE_DIR_HOST:-/data/vat-archive}"
+    mkdir -p "${ARCHIVE_DIR_HOST}" 2>/dev/null || \
+        echo "[run] WARNING: could not create ${ARCHIVE_DIR_HOST} (archive may fail)"
+    VOL_ARGS=(--volume "${ARCHIVE_DIR_HOST}:${ARCHIVE_DIR:-/archive}")
+    echo "[run] archive: ${ARCHIVE_DIR_HOST} → ${ARCHIVE_DIR:-/archive} (cap ${ARCHIVE_MAX_BYTES:-10GB})"
+fi
+
 echo "[run] building ${IMAGE} (context=${REPO_ROOT})"
 docker build -f robot/docker/Dockerfile -t "${IMAGE}" .
 
 echo "[run] (re)starting container ${NAME} → ${ZENOH_CONNECT}"
 docker rm -f "${NAME}" 2>/dev/null || true
 docker run -d --name "${NAME}" --restart unless-stopped \
-    --network host --ipc host "${DEVICE_ARGS[@]}" \
+    --network host --ipc host "${DEVICE_ARGS[@]}" "${VOL_ARGS[@]}" \
     -e ROBOT_NAME="${ROBOT_NAME}" \
     -e ZENOH_CONNECT="${ZENOH_CONNECT}" \
     -e NET_IFACE="${NET_IFACE:-eth0}" \
@@ -52,6 +63,12 @@ docker run -d --name "${NAME}" --restart unless-stopped \
     -e THETA_DEVICE="${THETA_DEVICE}" \
     -e THETA_MODE="${THETA_MODE:-2K}" \
     -e THETA_GST_PIPELINE="${THETA_GST_PIPELINE:-}" \
+    -e TRANSMIT_WIDTH="${TRANSMIT_WIDTH:-0}" \
+    -e TRANSMIT_HEIGHT="${TRANSMIT_HEIGHT:-0}" \
+    -e ARCHIVE_ENABLE="${ARCHIVE_ENABLE:-true}" \
+    -e ARCHIVE_DIR="${ARCHIVE_DIR:-/archive}" \
+    -e ARCHIVE_MAX_BYTES="${ARCHIVE_MAX_BYTES:-10GB}" \
+    -e ARCHIVE_JPEG_QUALITY="${ARCHIVE_JPEG_QUALITY:-92}" \
     -e PUBLISH_HZ="${PUBLISH_HZ:-50.0}" \
     -e STICK_OFFSET_X="${STICK_OFFSET_X:--0.20}" \
     -e STICK_OFFSET_Y="${STICK_OFFSET_Y:-0.0}" \

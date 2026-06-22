@@ -21,6 +21,7 @@ CLIENT_RUN ?= cd client && uv run python
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-stream robot-docker viewer \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
+        fetch_frame \
         docs docs-serve clean
 
 # ── Help / runbook ───────────────────────────────────────────────────────────
@@ -148,6 +149,11 @@ test_frames_robot:
 test_frames_server: sync-client
 	@echo ">> Reminder: router + 'make theta-uvc' + 'make robot-docker' running."
 	$(CLIENT_RUN) ../tools/view_frames.py
+
+# [ANY] Fetch one FULL-RES archived frame by seq:  make fetch_frame SEQ=1234
+fetch_frame: sync-client
+	@echo ">> fetching full-res archive frame seq=$(SEQ) from $(ROBOT_NAME)"
+	$(CLIENT_RUN) ../tools/fetch_archive.py --seq $(SEQ)
 
 # Stage 2 — body frame + limb/foot positions, live.
 test_robot_state: sync-client

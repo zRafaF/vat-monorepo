@@ -175,6 +175,43 @@ device, picks the **sharpest frame in a small window** (live-tunable
 `{robot}/prism/camera/frame`. The raw stream never touches Zenoh — only the
 decimated JPEG goes out.
 
+### Full-res archive (offline reconstruction)
+
+The live stream is **downscaled** to `TRANSMIT_WIDTH`×`TRANSMIT_HEIGHT`
+(`1036×518` by default) for the mapping server. In parallel, `theta_camera.py`
+writes the **full-resolution twin** of every transmitted frame to a local,
+size-capped archive — same `seq` / timestamp / `camera_height`, so the live and
+archived frames line up **1:1**. This is the source for offline, non-real-time
+reconstruction (Gaussian splats, NeRF): the heavy work runs later against the
+high-res frames, joined to the recorded pose trajectory by timestamp.
+
+* **Storage** — a SQLite index (`<ARCHIVE_DIR>/index.sqlite`) plus JPEG files
+  (`<ARCHIVE_DIR>/frames/<seq>.jpg`). Written on a **separate thread** with a
+  bounded queue, so the full-res encode + disk I/O never stall the real-time
+  publish (frames are dropped from the archive, never from the live stream, if
+  the disk can't keep up).
+* **Size cap** — `ARCHIVE_MAX_BYTES` (default `10GB`); oldest frames are evicted
+  first (FIFO). It lives on a **bind-mounted host dir** (`ARCHIVE_DIR_HOST` →
+  `ARCHIVE_DIR`) so it survives container restarts; `run.sh` creates and mounts
+  it.
+* **On-demand full-res fetch** — the container exposes a Zenoh queryable
+  `{robot}/prism/camera/archive/get?seq=N`. Pull one full-res frame from the
+  host or server by the seq the live stream showed:
+
+    ```bash
+    make fetch_frame SEQ=1234        # = tools/fetch_archive.py --seq 1234
+    ```
+
+!!! note "4K needs 4K hardware decode"
+    The archive's detail comes from `THETA_MODE=4K`, which needs a Jetson that
+    can HW-decode 4K H.264 (Xavier/Orin). If `make theta-uvc` stalls at 4K, set
+    `THETA_MODE=2K` — the archive then stores 2K full-res and ~4× more history
+    fits in the 10GB budget. (5.7K/8K aren't available over live USB — they'd
+    need separate still captures.)
+
+Config (all in `vat.env`): `TRANSMIT_WIDTH`/`TRANSMIT_HEIGHT`, `ARCHIVE_ENABLE`,
+`ARCHIVE_DIR`, `ARCHIVE_DIR_HOST`, `ARCHIVE_MAX_BYTES`, `ARCHIVE_JPEG_QUALITY`.
+
 ---
 
 ## 2. Docker container (bridge + camera + fuser)

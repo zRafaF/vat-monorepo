@@ -52,6 +52,7 @@ import zenoh
 
 import vat_protocol as proto
 from kinematics import build_robot_model, RobotStateTracker
+from frame_archive import FrameArchive
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -79,9 +80,20 @@ THETA_GST_PIPELINE = os.environ.get("THETA_GST_PIPELINE", "").strip()
 THETA_DEVICE       = os.environ.get("THETA_DEVICE", "").strip()
 THETA_MODE         = os.environ.get("THETA_MODE", "2K").strip()
 
+# Real-time transmit downscale (0/unset → send the capture resolution as-is)
+TRANSMIT_WIDTH  = int(os.environ.get("TRANSMIT_WIDTH", "0"))
+TRANSMIT_HEIGHT = int(os.environ.get("TRANSMIT_HEIGHT", "0"))
+
+# Full-res frame archive (written off the real-time path; see frame_archive.py)
+ARCHIVE_ENABLE       = os.environ.get("ARCHIVE_ENABLE", "").lower() in ("1", "true", "yes")
+ARCHIVE_DIR          = os.environ.get("ARCHIVE_DIR", "/archive")
+ARCHIVE_MAX_BYTES    = os.environ.get("ARCHIVE_MAX_BYTES", "10GB")
+ARCHIVE_JPEG_QUALITY = int(os.environ.get("ARCHIVE_JPEG_QUALITY", "92"))
+
 _KEYS = proto.keys(ROBOT_NAME)
 KEY_OUTPUT       = _KEYS["camera_frame"]
 KEY_FRAME_GET    = _KEYS["camera_frame_get"]
+KEY_ARCHIVE_GET  = _KEYS["camera_archive_get"]
 KEY_THROTTLE_FPS = _KEYS["cfg_throttle_fps"]
 KEY_WINDOW_SIZE  = _KEYS["cfg_window_size"]
 
@@ -189,10 +201,12 @@ class FrameEntry:
 class FrameDecimator:
     """Best-of-N-frame-window decimator with live camera-height tagging."""
 
-    def __init__(self, z: zenoh.Session, state: RobotStateTracker, model):
+    def __init__(self, z: zenoh.Session, state: RobotStateTracker, model,
+                 archive=None):
         self._z = z
         self._state = state
         self._model = model
+        self._archive = archive
         self._pub = self._declare_reliable_publisher(z, KEY_OUTPUT)
         self._buf: deque[FrameEntry] = deque()
         self._lock = threading.Lock()
@@ -208,6 +222,12 @@ class FrameDecimator:
             log.info(f"[Decimator] retransmit queryable on '{KEY_FRAME_GET}'")
         except Exception as e:
             log.warning(f"[Decimator] could not declare retransmit queryable: {e}")
+        if self._archive is not None:
+            try:
+                z.declare_queryable(KEY_ARCHIVE_GET, self._on_archive_get)
+                log.info(f"[Decimator] archive queryable on '{KEY_ARCHIVE_GET}'")
+            except Exception as e:
+                log.warning(f"[Decimator] could not declare archive queryable: {e}")
 
     @staticmethod
     def _declare_reliable_publisher(z, key):
@@ -237,6 +257,23 @@ class FrameDecimator:
                 log.debug(f"[Decimator] retransmit seq={seq} ({len(payload)//1024}kB)")
             else:
                 query.reply_err(f"seq {seq} not buffered".encode())
+        except Exception as e:
+            try:
+                query.reply_err(str(e).encode())
+            except Exception:
+                pass
+
+    def _on_archive_get(self, query):
+        try:
+            params = query.parameters if hasattr(query, "parameters") else \
+                query.selector.parameters
+            seq = int(params["seq"]) if "seq" in params else -1
+            payload = self._archive.get(seq) if self._archive is not None else None
+            if payload is not None:
+                query.reply(KEY_ARCHIVE_GET, payload)
+                log.debug(f"[Archive] served seq={seq} ({len(payload)//1024}kB)")
+            else:
+                query.reply_err(f"archive seq {seq} not found".encode())
         except Exception as e:
             try:
                 query.reply_err(str(e).encode())
@@ -281,10 +318,15 @@ class FrameDecimator:
         return True
 
     def _emit(self, entry: FrameEntry, n_candidates: int):
+        # Real-time TRANSMIT copy: downscale (if configured) then encode small.
+        tx = entry.bgr
+        if TRANSMIT_WIDTH > 0 and TRANSMIT_HEIGHT > 0:
+            tx = cv2.resize(entry.bgr, (TRANSMIT_WIDTH, TRANSMIT_HEIGHT),
+                            interpolation=cv2.INTER_AREA)
         if LOSSLESS:
-            ok, jbuf = cv2.imencode(".png", entry.bgr)
+            ok, jbuf = cv2.imencode(".png", tx)
         else:
-            ok, jbuf = cv2.imencode(".jpg", entry.bgr,
+            ok, jbuf = cv2.imencode(".jpg", tx,
                                     [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if not ok or jbuf is None:
             log.warning("encode failed — skipping tick")
@@ -309,8 +351,14 @@ class FrameDecimator:
         except TypeError:
             self._pub.put(payload)
         self._published += 1
+
+        # Full-res TWIN → archive (same seq/ts/cam_h). The heavy full-res encode
+        # and disk I/O run on the archive's own thread; submit() never blocks us.
+        if self._archive is not None:
+            self._archive.submit(seq, entry.ts_ns, cam_h, entry.bgr)
+
         log.debug(f"emit seq={seq} ts={entry.ts_ns//1_000_000}ms cam_h={cam_h:.2f}m "
-                  f"cands={n_candidates} size={len(payload)//1024}kB total={self._published}")
+                  f"cands={n_candidates} tx={len(payload)//1024}kB total={self._published}")
 
     def stats(self) -> str:
         fps, ws = _get_config()
@@ -373,10 +421,22 @@ def main():
     enc_label = "PNG (lossless)" if LOSSLESS else f"JPEG q={JPEG_QUALITY}"
     log.info(f"Connected. Theta UVC → '{KEY_OUTPUT}'  @ {fps}Hz  "
              f"window={ws}  encode={enc_label}")
+    _tx = f"{TRANSMIT_WIDTH}x{TRANSMIT_HEIGHT}" if TRANSMIT_WIDTH > 0 else "capture-res"
+    log.info(f"Transmit={_tx}  archive="
+             f"{('on → ' + ARCHIVE_DIR) if ARCHIVE_ENABLE else 'off'}")
 
     model = build_robot_model()
     state = RobotStateTracker(z, ROBOT_NAME, fallback_body_height=FALLBACK_BODY_H)
-    decimator = FrameDecimator(z, state, model)
+
+    archive = None
+    if ARCHIVE_ENABLE:
+        try:
+            archive = FrameArchive(ARCHIVE_DIR, ARCHIVE_MAX_BYTES,
+                                   jpeg_quality=ARCHIVE_JPEG_QUALITY)
+        except Exception as e:
+            log.warning(f"[archive] disabled — init failed: {e}")
+            archive = None
+    decimator = FrameDecimator(z, state, model, archive=archive)
 
     capture = ThetaCapture(decimator)
     capture.start()
@@ -387,11 +447,14 @@ def main():
     try:
         while True:
             time.sleep(10)
-            log.info(f"{decimator.stats()} captured={capture.frames}")
+            extra = f"  {archive.stats()}" if archive is not None else ""
+            log.info(f"{decimator.stats()} captured={capture.frames}{extra}")
     except KeyboardInterrupt:
         pass
     finally:
         capture.stop()
+        if archive is not None:
+            archive.close()
         z.close()
 
 
