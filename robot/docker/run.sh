@@ -31,7 +31,7 @@ if [ -z "${THETA_GST_PIPELINE:-}" ] && [ -e "${THETA_DEVICE}" ]; then
     echo "[run] passing camera device ${THETA_DEVICE} into the container"
 elif [ -z "${THETA_GST_PIPELINE:-}" ]; then
     echo "[run] WARNING: ${THETA_DEVICE} not found. Start the Theta UVC source first"
-    echo "[run]          (libuvc-theta gst_loopback) — see docs/setup/robot.md."
+    echo "[run]          (make theta-uvc → gstthetauvc) — see docs/setup/robot.md."
 fi
 
 echo "[run] building ${IMAGE} (context=${REPO_ROOT})"

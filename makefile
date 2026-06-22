@@ -100,7 +100,7 @@ mapping: sync-mapping
 	cd server/mapping && uv run python mapping_server.py
 
 # [ROBOT] Expose the RICOH Theta X UVC stream as /dev/video0 on the host
-# (libuvc-theta gst_loopback). Leave running; the container reads it.
+# (libuvc-theta via the gstthetauvc plugin). Leave running; the container reads it.
 theta-uvc:
 	@echo ">> [ROBOT] Theta X UVC → /dev/video0 (leave running in its own shell)"
 	bash robot/theta/theta_uvc.sh

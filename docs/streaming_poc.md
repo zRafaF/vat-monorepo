@@ -19,7 +19,7 @@ The server computes a slow, drift-free VGGT pose and sends it **down** to the do
 │                                                                            │
 │  RICOH Theta X  (in-camera stitched equirectangular, H.264 over UVC)       │
 │      │ USB                                                                 │
-│  libuvc-theta gst_loopback  →  /dev/video0   (host)                        │
+│  gstthetauvc (thetauvcsrc→v4l2sink)  →  /dev/video0   (host)               │
 │      │                                                                     │
 │  theta_camera.py (docker)  ← OpenCV UVC capture                            │
 │      │ best-of-N-frame sharpest + camera_height stamp + JPEG               │

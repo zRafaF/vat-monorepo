@@ -18,7 +18,7 @@ Capture source (pick one; checked in this order)
   THETA_GST_PIPELINE  full GStreamer pipeline → cv2.CAP_GSTREAMER
                       (needs OpenCV built with GStreamer + the gstthetauvc plugin)
   THETA_DEVICE        v4l2 device path/index → cv2.CAP_V4L2
-                      (e.g. /dev/video0 fed by libuvc-theta-sample `gst_loopback`;
+                      (e.g. /dev/video0 fed by `make theta-uvc` (gstthetauvc);
                        works with the pip OpenCV in the container)
   (neither set)       a default gstthetauvc pipeline built from THETA_MODE
 

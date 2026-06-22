@@ -52,7 +52,7 @@ make router
 ```
 
 **🤖 ROBOT — start the Theta UVC + container.** One-time prereqs (see
-[robot setup](setup/robot.md)): `libuvc-theta` + `libuvc-theta-sample` built,
+[robot setup](setup/robot.md)): `libuvc-theta` + `gstthetauvc` plugin built,
 `v4l2loopback-dkms` installed, Theta X in **live-streaming** mode. Then, from the
 repo (e.g. `~/Desktop/vat-monorepo`):
 

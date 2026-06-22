@@ -21,42 +21,80 @@ End-to-end setup for the **Unitree Go2-W**. Two parts:
 
 ## 1. Camera setup (RICOH Theta X over UVC)
 
-The Theta X is not a plain webcam — its UVC stream needs `libuvc-theta` to
-decode. The cleanest path on the Jetson is to decode it into a standard **v4l2
-loopback** device that OpenCV reads as `/dev/video0`.
+The Theta X is **not** a plain webcam. The mainline kernel `uvcvideo` driver
+enumerates it (`dmesg` shows *"Found UVC 1.50 device RICOH THETA X"*) but then
+reports *"No streaming interface found"* and exposes **no `/dev/videoN` capture
+node** — the H.264 stream rides a vendor UVC 1.5 configuration the kernel driver
+won't surface. (This is why plain `cv2.VideoCapture("/dev/video0")` works on
+Windows, where Ricoh ships a UVC driver, but never on stock Linux.) The stream
+must be pulled in **userspace via `libuvc-theta`**. We decode it into a standard
+**v4l2 loopback** device that OpenCV reads as `/dev/video0`.
+
+!!! warning "Use `gstthetauvc`, not stock `gst_loopback`"
+    The `libuvc-theta-sample` `gst_loopback` binary identifies the camera by a
+    **hardcoded product-ID table** (`0x2712` THETA V, `0x2715` Z1). The Theta X
+    is `0x2717`, which isn't in the list, so it prints **`THETA not found`** and
+    exits — *the camera is fine, the sample just doesn't know the X*. The
+    [`gstthetauvc`](https://github.com/nickel110/gstthetauvc) plugin matches by
+    **product name** (`strncmp(..., "RICOH THETA")`), so the Theta X — and any
+    future model — works with **no source edits**. That's our default backend.
+    (A patched `gst_loopback` is documented as a fallback at the end.)
 
 **a) Put the camera in live-streaming mode** and update its firmware
 ([Ricoh guide](https://blog.ricoh360.com/en/12306)). Connect it to the Jetson by
-USB-C. Confirm: `lsusb | grep -i ricoh`.
+USB-C. Confirm: `lsusb | grep -i ricoh` (you should see `05ca:2717`).
 
-**b) Build `libuvc-theta` + `libuvc-theta-sample`** (provides `gst_loopback`):
+**b) Build `libuvc-theta`** (the UVC1.5/H.264 fork) and remove any stray system
+`libuvc` that would shadow it:
 
 ```bash
 sudo apt install libjpeg-dev libusb-1.0-0-dev cmake \
-  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-bad
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+
+# A system libuvc shadows the THETA fork → "Found 1 Theta(s), but none available"
+# / "could not open". Remove it if present:
+apt list --installed 2>/dev/null | grep -i libuvc   # if libuvc-dev/libuvc0 show up:
+sudo apt purge -y libuvc-dev libuvc0 || true
 
 # libuvc fork for THETA
 git clone -b theta_uvc https://github.com/ricohapi/libuvc-theta
 cd libuvc-theta && mkdir build && cd build && cmake .. && make && sudo make install && sudo ldconfig
 cd ~
-
-# sample apps (gst_loopback / gst_viewer)
-git clone https://github.com/ricohapi/libuvc-theta-sample
-cd libuvc-theta-sample/gst && make
 ```
 
-**c) Install the v4l2 loopback module:**
+**c) Build + install the `gstthetauvc` plugin** (matches the camera by name → no
+patch needed for the Theta X):
+
+```bash
+git clone https://github.com/nickel110/gstthetauvc
+cd gstthetauvc/thetauvc && make
+# put it where GStreamer finds it (adjust the triplet for your arch):
+sudo cp gstthetauvc.so /usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0/
+cd ~
+
+# sanity check — prints properties (mode/serial), no error:
+gst-inspect-1.0 thetauvcsrc
+```
+
+!!! note "Plugin in a custom dir?"
+    If you don't copy `gstthetauvc.so` into the system plugin dir, export
+    `GST_PLUGIN_PATH=/path/to/gstthetauvc/thetauvc` instead; the helper script
+    and the systemd unit both honour it.
+
+**d) Install the v4l2 loopback module:**
 
 ```bash
 sudo apt install v4l2loopback-dkms
 ```
 
-**d) Expose the Theta as `/dev/video0`** with the helper (loads the loopback
-module + runs `gst_loopback`):
+**e) Expose the Theta as `/dev/video0`** with the helper (loads the loopback
+module + runs the `thetauvcsrc → v4l2sink` pipeline):
 
 ```bash
 make theta-uvc        # = bash robot/theta/theta_uvc.sh  (leave running)
-# overrides: GST_LOOPBACK_BIN, VIDEO_NR, THETA_MODE (2K|4K)
+# overrides: THETA_BACKEND (gstthetauvc|loopback), VIDEO_NR, THETA_MODE (2K|4K),
+#            GST_PLUGIN_PATH
 ```
 
 Verify the device streams (run on the robot — camera alone, no Zenoh):
@@ -65,14 +103,29 @@ Verify the device streams (run on the robot — camera alone, no Zenoh):
 make test_frames_robot     # = python3 tools/view_theta.py  (THETA_DEVICE=/dev/video0)
 ```
 
-!!! note "Advanced: skip the loopback with a GStreamer pipeline"
-    If your OpenCV is built **with GStreamer** and you have the
-    [`gstthetauvc`](https://github.com/nickel110/gstthetauvc) plugin, set
-    `THETA_GST_PIPELINE` instead of `THETA_DEVICE` (e.g. a `thetauvcsrc mode=2K !
-    … ! appsink` pipeline, with `nvv4l2decoder` for Jetson HW decode).
-    `theta_camera.py` and `tools/view_theta.py` both honour it. The pip OpenCV in
-    the container has **V4L but not GStreamer**, which is why the default is the
-    `/dev/video0` loopback path.
+!!! note "Advanced: skip the loopback entirely"
+    If your OpenCV is built **with GStreamer**, you can hand a pipeline straight
+    to OpenCV via `THETA_GST_PIPELINE` (e.g. `thetauvcsrc mode=2K ! … ! appsink`,
+    with `nvv4l2decoder` for Jetson HW decode) instead of going through
+    `/dev/video0`. `theta_camera.py` and `tools/view_theta.py` both honour it.
+    We keep the loopback as the default because the **pip OpenCV in the container
+    has V4L but not GStreamer**.
+
+??? note "Fallback: patched `gst_loopback` (only if you can't build the plugin)"
+    The original `libuvc-theta-sample` route still works **if** you add the
+    Theta X product ID. In `libuvc-theta-sample/gst/thetauvc.c`:
+
+    ```c
+    #define USBPID_THETAX_UVC 0x2717        // add near the other USBPID_ defines
+    // …and accept it in thetauvc_find_devices():
+    if (desc->idProduct == USBPID_THETAV_UVC
+        || desc->idProduct == USBPID_THETAZ1_UVC
+        || desc->idProduct == USBPID_THETAX_UVC) {
+    ```
+
+    Then `cd libuvc-theta-sample/gst && make`, and run with
+    `THETA_BACKEND=loopback make theta-uvc` (set `GST_LOOPBACK_BIN` if the binary
+    isn't at `~/libuvc-theta-sample/gst/gst_loopback`).
 
 The Theta capture lives in the container's **`theta_camera.py`**: it reads the
 device, picks the **sharpest frame in a small window** (live-tunable
@@ -159,10 +212,18 @@ export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterfac
 
 **`tools/view_theta.py` / `theta_camera`: could not open the Theta stream**
 
-1. Camera in **live-streaming mode** and connected (`lsusb | grep -i ricoh`).
+1. Camera in **live-streaming mode** and connected (`lsusb | grep -i ricoh` →
+   `05ca:2717`).
 2. The loopback is up: `make theta-uvc` running, and `ls -l /dev/video0` exists.
-3. `gst_loopback` built and on `GST_LOOPBACK_BIN`; `v4l2loopback-dkms` installed.
-4. The container got the device: `--device /dev/video0` (run.sh adds it if the
+3. `gstthetauvc` plugin found: `gst-inspect-1.0 thetauvcsrc` succeeds (set
+   `GST_PLUGIN_PATH` if not in the system dir); `v4l2loopback-dkms` installed.
+4. `THETA not found` from `make theta-uvc` → you're on the `loopback` backend
+   with an **unpatched** `gst_loopback` (no Theta X `0x2717` PID). Switch to the
+   default `gstthetauvc` backend, or apply the patch (see §1 fallback note).
+5. `Found 1 Theta(s), but none available` / cannot open → a **stray system
+   `libuvc`** is shadowing the fork: `sudo apt purge libuvc-dev libuvc0`, then
+   rebuild and `sudo ldconfig`.
+6. The container got the device: `--device /dev/video0` (run.sh adds it if the
    device exists — start `make theta-uvc` **before** `make robot-docker`).
 
 **Container `theta_camera` logs "could not open Theta stream"** — the device
