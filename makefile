@@ -18,7 +18,7 @@ CLIENT_RUN ?= cd client && uv run python
 .DEFAULT_GOAL := help
 
 .PHONY: help steps \
-        sync-mapping sync-client sync-router sync-docs \
+        sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-stream robot-docker viewer \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         docs docs-serve clean
@@ -31,6 +31,7 @@ help:
 	@echo "  make sync-router     isolated env for the Zenoh router"
 	@echo "  make sync-mapping    mapping server env (GPU machine, CUDA)"
 	@echo "  make sync-client     client + bring-up tools env"
+	@echo "  make sync-robot      [ROBOT] host-side tools env (theta_pub)"
 	@echo ""
 	@echo "Services:"
 	@echo "  make router          [SERVER] run the Zenoh router (hub)"
@@ -82,6 +83,10 @@ sync-mapping:
 sync-client:
 	cd client && uv sync
 
+# [ROBOT] Host-side tools env (theta_pub.py): eclipse-zenoh + headless OpenCV.
+sync-robot:
+	cd robot && uv sync
+
 sync-router:
 	cd server/router && uv sync
 
@@ -109,9 +114,9 @@ theta-uvc:
 
 # [ROBOT] Headless: publish the Theta loopback to Zenoh so you can view it on
 # the host (make test_frames_server). No display on the robot; no container.
-theta-stream:
+theta-stream: sync-robot
 	@echo ">> [ROBOT] Theta /dev/video10 → Zenoh (view on host: make test_frames_server)"
-	python3 tools/theta_pub.py
+	cd robot && uv run python ../tools/theta_pub.py
 
 # [ROBOT] Container: ROS↔Zenoh bridge + theta_camera + pose fuser.
 # Invoked via `bash` so it doesn't depend on the executable bit (git on Windows

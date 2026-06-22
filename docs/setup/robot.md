@@ -132,7 +132,7 @@ make test_frames_robot     # = python3 tools/view_theta.py  (THETA_DEVICE=/dev/v
     ```bash
     # on the robot (leave both running):
     make theta-uvc                  # feed /dev/video10
-    make theta-stream               # = python3 tools/theta_pub.py  → Zenoh
+    make theta-stream               # uv run tools/theta_pub.py → Zenoh
     # on the host:
     make test_frames_server         # = tools/view_frames.py  (OpenCV window)
     ```
@@ -140,8 +140,10 @@ make test_frames_robot     # = python3 tools/view_theta.py  (THETA_DEVICE=/dev/v
     `theta-stream` publishes on the **same** `{robot}/prism/camera/frame` key
     the container uses, so run **either** `theta-stream` **or** the full
     container — not both. Tune `PREVIEW_FPS` / `PREVIEW_SCALE` /
-    `PREVIEW_QUALITY` (env) to trade latency vs. quality. Deps on the robot:
-    `pip install eclipse-zenoh opencv-python-headless numpy`.
+    `PREVIEW_QUALITY` (env) to trade latency vs. quality. Dependencies are a
+    standalone **uv** project (`robot/pyproject.toml`: eclipse-zenoh +
+    headless OpenCV + numpy); `make theta-stream` runs `make sync-robot`
+    first, so the `robot/.venv` is created automatically on first run.
 
 !!! note "Advanced: skip the loopback entirely"
     If your OpenCV is built **with GStreamer**, you can hand a pipeline straight
