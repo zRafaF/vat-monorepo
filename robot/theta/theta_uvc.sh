@@ -17,6 +17,13 @@
 #   number (default /dev/video10) to avoid colliding with the RealSense. Keep
 #   THETA_DEVICE (vat.env) in sync with VIDEO_NR here.
 #
+# NOTE on the decoder (Jetson):
+#   On the Jetson, GStreamer's `decodebin` auto-selects `nvv4l2decoder`, whose
+#   output lives in NVMM (GPU) memory. A CPU `videoconvert`/`v4l2sink` can't
+#   negotiate with NVMM → an endless "not negotiated" warning and no frames.
+#   The fix is an explicit `nvv4l2decoder ! nvvidconv` pair (nvvidconv copies
+#   NVMM → CPU). THETA_DECODER=auto detects this; force with nv|sw if needed.
+#
 # Two backends (THETA_BACKEND):
 #   * gstthetauvc  (DEFAULT) — the `thetauvcsrc` GStreamer element matches the
 #     camera by PRODUCT NAME ("RICOH THETA"*), so the Theta X works with no
@@ -36,6 +43,7 @@
 # Usage:   bash robot/theta/theta_uvc.sh
 # Env:
 #   THETA_BACKEND     gstthetauvc (default) | loopback
+#   THETA_DECODER     auto (default) | nv (Jetson NVDEC) | sw (decodebin/CPU)
 #   VIDEO_NR          v4l2loopback device number (default 10 → /dev/video10)
 #   THETA_MODE        2K | 4K (default 2K)
 #   CARD_LABEL        v4l2loopback card label (default ThetaUVC)
@@ -47,6 +55,7 @@
 set -euo pipefail
 
 THETA_BACKEND="${THETA_BACKEND:-gstthetauvc}"
+THETA_DECODER="${THETA_DECODER:-auto}"
 VIDEO_NR="${VIDEO_NR:-10}"
 THETA_MODE="${THETA_MODE:-2K}"
 CARD_LABEL="${CARD_LABEL:-ThetaUVC}"
@@ -103,13 +112,31 @@ case "$THETA_BACKEND" in
         echo "       (Or set THETA_BACKEND=loopback to use a patched gst_loopback.)"
         exit 1
     fi
-    echo "[theta] starting gstthetauvc (mode=${THETA_MODE}) → ${DEV}"
+
+    # Pick the decode segment. Jetson's decodebin → nvv4l2decoder (NVMM) won't
+    # negotiate with the CPU v4l2sink; use an explicit nvv4l2decoder ! nvvidconv.
+    if [ "$THETA_DECODER" = "auto" ]; then
+        if gst-inspect-1.0 nvv4l2decoder >/dev/null 2>&1; then
+            THETA_DECODER=nv
+        else
+            THETA_DECODER=sw
+        fi
+    fi
+    case "$THETA_DECODER" in
+        nv) DECODE="nvv4l2decoder ! nvvidconv" ;;   # Jetson HW (NVDEC) → CPU mem
+        sw) DECODE="decodebin ! videoconvert" ;;    # x86 / software decode
+        *)  echo "ERROR: THETA_DECODER must be auto|nv|sw (got '${THETA_DECODER}')."; exit 1 ;;
+    esac
+
+    echo "[theta] starting gstthetauvc (mode=${THETA_MODE}, decoder=${THETA_DECODER}) → ${DEV}"
     echo "[theta] leave this running; the container reads THETA_DEVICE=${DEV}"
-    # thetauvcsrc decodes H.264 → I420 raw → v4l2loopback sink.
+    # thetauvcsrc (H.264) → decode → I420 raw → v4l2loopback sink.
+    # ${DECODE} is intentionally unquoted so its ` ! ` splits into gst tokens.
+    # shellcheck disable=SC2086
     exec gst-launch-1.0 -e thetauvcsrc mode="${THETA_MODE}" \
-        ! queue ! h264parse ! decodebin ! videoconvert \
+        ! queue ! h264parse ! ${DECODE} \
         ! video/x-raw,format=I420 ! identity drop-allocation=true \
-        ! v4l2sink device="${DEV}" sync=false
+        ! v4l2sink device="${DEV}" qos=false sync=false
     ;;
 
   loopback)

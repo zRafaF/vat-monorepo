@@ -84,6 +84,10 @@ container — Stage 2.) If `camera/frame` is 0 Hz, fix the camera first
 
 ```bash
 # [ROBOT] preview the Theta UVC directly (camera alone, no Zenoh) — sanity check
+#   NOTE: test_frames_robot opens a window (needs a display). On a HEADLESS
+#   robot, publish to Zenoh instead and view on the host:
+#     [ROBOT]  make theta-uvc   &&   make theta-stream
+#     [CLIENT] make test_frames_server
 make test_frames_robot      # = python3 tools/view_theta.py
 
 # [CLIENT] the decimated frames the server will actually consume — the real check
@@ -168,6 +172,7 @@ moves smoothly (predicted between pose samples), green/amber by fix quality.
 | ☁️ SERVER | `make router` | 0+ |
 | ☁️ SERVER | `make mapping` | 3+ |
 | 🤖 ROBOT | `make theta-uvc`  (Theta X → /dev/video10) | 0+ |
+| 🤖 ROBOT | `make theta-stream`  (headless: Theta → Zenoh; view via test_frames_server) | 1 |
 | 🤖 ROBOT | `make robot-docker` | 0+ |
 | 💻 CLIENT | `make test_link` | 0 |
 | 🤖 ROBOT `make test_frames_robot` / 💻 CLIENT `make test_frames_server` | | 1 |

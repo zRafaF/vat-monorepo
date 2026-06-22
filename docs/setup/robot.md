@@ -105,15 +105,43 @@ module + runs the `thetauvcsrc → v4l2sink` pipeline):
 
 ```bash
 make theta-uvc        # = bash robot/theta/theta_uvc.sh  (leave running)
-# overrides: THETA_BACKEND (gstthetauvc|loopback), VIDEO_NR, THETA_MODE (2K|4K),
-#            GST_PLUGIN_PATH
+# overrides: THETA_BACKEND (gstthetauvc|loopback), THETA_DECODER (auto|nv|sw),
+#            VIDEO_NR, THETA_MODE (2K|4K), GST_PLUGIN_PATH
 ```
+
+!!! warning "Jetson: hardware decoder (`not negotiated` spam)"
+    On the Jetson, GStreamer's `decodebin` auto-picks **`nvv4l2decoder`**,
+    whose output lives in **NVMM** (GPU) memory. The CPU `videoconvert`/
+    `v4l2sink` can't negotiate with NVMM, so the pipeline floods
+    *"… capsfilter1: not negotiated"* and no frames reach `/dev/video10`.
+    `theta_uvc.sh` fixes this with `THETA_DECODER=auto`, which uses an
+    explicit **`nvv4l2decoder ! nvvidconv`** pair on the Jetson (force with
+    `THETA_DECODER=nv`; use `sw` for x86/software decode).
 
 Verify the device streams (run on the robot — camera alone, no Zenoh):
 
 ```bash
 make test_frames_robot     # = python3 tools/view_theta.py  (THETA_DEVICE=/dev/video10)
 ```
+
+!!! tip "Headless robot? View on the host over Zenoh (low latency)"
+    `test_frames_robot` opens an **OpenCV window on the robot** — useless on a
+    headless Go2. Instead, publish the loopback to Zenoh and view it on your
+    laptop. No container, no decimation, ~one JPEG per frame:
+
+    ```bash
+    # on the robot (leave both running):
+    make theta-uvc                  # feed /dev/video10
+    make theta-stream               # = python3 tools/theta_pub.py  → Zenoh
+    # on the host:
+    make test_frames_server         # = tools/view_frames.py  (OpenCV window)
+    ```
+
+    `theta-stream` publishes on the **same** `{robot}/prism/camera/frame` key
+    the container uses, so run **either** `theta-stream` **or** the full
+    container — not both. Tune `PREVIEW_FPS` / `PREVIEW_SCALE` /
+    `PREVIEW_QUALITY` (env) to trade latency vs. quality. Deps on the robot:
+    `pip install eclipse-zenoh opencv-python-headless numpy`.
 
 !!! note "Advanced: skip the loopback entirely"
     If your OpenCV is built **with GStreamer**, you can hand a pipeline straight
@@ -244,7 +272,12 @@ export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterfac
 7. The camera dropped to `05ca:0373` (normal/MTP) → re-enter **Live Streaming**
    mode on the camera; `make theta-uvc` refuses to start until `lsusb` shows
    `05ca:2717`.
-8. The container got the device: `--device /dev/video10` (run.sh adds it if the
+8. `… capsfilter1: not negotiated` repeating (you'll see `NvMMLiteOpen`,
+   `BlockType = 261`) → Jetson `decodebin` picked the HW decoder
+   (`nvv4l2decoder`, NVMM memory) and the CPU `v4l2sink` can't take it. The
+   script's `THETA_DECODER=auto` handles this; if you overrode it, use
+   `THETA_DECODER=nv` (Jetson) or `sw` (x86). See §1.
+9. The container got the device: `--device /dev/video10` (run.sh adds it if the
    device exists — start `make theta-uvc` **before** `make robot-docker`).
 
 **Container `theta_camera` logs "could not open Theta stream"** — the device

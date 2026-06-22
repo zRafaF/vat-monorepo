@@ -19,7 +19,7 @@ CLIENT_RUN ?= cd client && uv run python
 
 .PHONY: help steps \
         sync-mapping sync-client sync-router sync-docs \
-        router mapping theta-uvc robot-docker viewer \
+        router mapping theta-uvc theta-stream robot-docker viewer \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         docs docs-serve clean
 
@@ -36,6 +36,7 @@ help:
 	@echo "  make router          [SERVER] run the Zenoh router (hub)"
 	@echo "  make mapping         [SERVER] run the PRISM mapping server"
 	@echo "  make theta-uvc       [ROBOT]  expose Theta X UVC → /dev/video10 (host)"
+	@echo "  make theta-stream    [ROBOT]  headless: Theta → Zenoh (view on host)"
 	@echo "  make robot-docker    [ROBOT]  bridge + theta_camera + pose fuser container"
 	@echo "  make viewer          [CLIENT] full POC viewer (cloud + robot block)"
 	@echo ""
@@ -56,6 +57,7 @@ steps:
 	@echo "Stage 0  Transport"
 	@echo "  [SERVER] make router          # the hub; leave it running"
 	@echo "  [ROBOT]  make theta-uvc        # Theta X → /dev/video10 (leave running)"
+	@echo "  [ROBOT]  make theta-stream     # headless: Theta → Zenoh; view via test_frames_server"
 	@echo "  [ROBOT]  make robot-docker     # bridge + theta_camera + fuser"
 	@echo "  [CLIENT] make test_link        # expect bridge ALIVE + non-zero Hz"
 	@echo ""
@@ -105,6 +107,12 @@ theta-uvc:
 	@echo ">> [ROBOT] Theta X UVC → /dev/video10 (leave running in its own shell)"
 	bash robot/theta/theta_uvc.sh
 
+# [ROBOT] Headless: publish the Theta loopback to Zenoh so you can view it on
+# the host (make test_frames_server). No display on the robot; no container.
+theta-stream:
+	@echo ">> [ROBOT] Theta /dev/video10 → Zenoh (view on host: make test_frames_server)"
+	python3 tools/theta_pub.py
+
 # [ROBOT] Container: ROS↔Zenoh bridge + theta_camera + pose fuser.
 # Invoked via `bash` so it doesn't depend on the executable bit (git on Windows
 # doesn't preserve it). If docker needs root on your robot: `sudo make robot-docker`.
@@ -128,6 +136,7 @@ test_link: sync-client
 # Runs on the robot host with its OpenCV; uses THETA_DEVICE / THETA_GST_PIPELINE.
 test_frames_robot:
 	@echo ">> [ROBOT] previewing the Theta UVC device directly (THETA_DEVICE=$(THETA_DEVICE))"
+	@echo ">> NOTE: opens an OpenCV window (needs a display). Headless robot? Use 'make theta-stream' + host 'make test_frames_server'."
 	python3 tools/view_theta.py
 
 # Stage 1b — [CLIENT] the decimated frames the mapping server actually ingests.
