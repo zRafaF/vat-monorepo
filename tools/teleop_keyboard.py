@@ -28,10 +28,8 @@ from __future__ import annotations
 
 import os
 import sys
-import termios
 import threading
 import time
-import tty
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "common"))
@@ -107,18 +105,40 @@ def key_to_vel(ch: str, scale: float):
 
 def reader(state: KeyState):
     """Raw-mode stdin reader; runs in its own thread."""
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
+    if sys.platform == "win32":
+        import msvcrt
         while not state.quit:
-            ch = sys.stdin.read(1)
-            if ch == "\x03":  # Ctrl-C
-                state.quit = True
-                break
-            state.feed(ch)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                if ch in (b'\x00', b'\xe0'):
+                    msvcrt.getch()
+                    continue
+                try:
+                    s = ch.decode("utf-8", errors="ignore")
+                    if s == "\x03":  # Ctrl-C
+                        state.quit = True
+                        break
+                    if s:
+                        state.feed(s)
+                except Exception:
+                    pass
+            else:
+                time.sleep(0.01)
+    else:
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while not state.quit:
+                ch = sys.stdin.read(1)
+                if ch == "\x03":  # Ctrl-C
+                    state.quit = True
+                    break
+                state.feed(ch)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def main():
