@@ -60,6 +60,10 @@ MAGIC_PCD   = 0x50434400  # "PCD\x00"
 MAGIC_TRAJ  = 0x54524A00  # "TRJ\x00"
 MAGIC_POSE  = 0x504F5345  # "POSE"
 MAGIC_PCOR  = 0x50434F52  # "PCOR"
+MAGIC_CMDV  = 0x434D4456  # "CMDV"
+
+# cmd_vel flag bits (bitmask in the CmdVel.flags byte)
+CMDV_FLAG_ESTOP = 0x01   # latched emergency stop — robot enters Damp, ignores motion
 
 # Fix-quality enum for pose messages
 FIX_DEADRECKON = 0   # propagating on odometry only
@@ -93,9 +97,12 @@ def keys(robot_name: str = "go2", server_prefix: str = "server/prism") -> dict:
         # live config (anyone → robot)
         "cfg_throttle_fps": f"{robot_name}/rt/prism/config/throttle_fps",
         "cfg_window_size":  f"{robot_name}/rt/prism/config/window_size",
+        # teleoperation (client/server → robot, DOWN): velocity commands + e-stop
+        "cmd_vel":         f"{robot_name}/teleop/cmd_vel",
         # liveliness tokens
         "live_server":     f"{server_prefix}/liveliness",
         "live_pose":       f"{robot_name}/prism/pose/liveliness",
+        "live_teleop":     f"{robot_name}/teleop/liveliness",
     }
 
 
@@ -319,6 +326,59 @@ def unpack_pose_correction(buf: bytes) -> PoseCorrection:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 6. Teleop velocity command   {robot}/teleop/cmd_vel   (client/server → robot)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Streamed continuously (~20 Hz) by whoever is driving. The robot's teleop
+# bridge relays these to the Go2 sport `Move` API, but only while they keep
+# arriving — if the stream stops for longer than the bridge's watchdog window
+# the robot is commanded to stop (deadman). A latched e-stop bit forces Damp.
+#
+#   Offset  Bytes  Type        Field
+#   0       4      int32       magic = MAGIC_CMDV
+#   4       8      int64       timestamp_ns  (sender clock; for staleness/debug)
+#   12      4      uint32      seq           (monotonic)
+#   16      4      float32     vx    forward  (m/s,  body frame, +x fwd)
+#   20      4      float32     vy    lateral  (m/s,  body frame, +y left)
+#   24      4      float32     vyaw  turn     (rad/s, +z up / CCW)
+#   28      1      uint8       flags (bit0 = CMDV_FLAG_ESTOP)
+#   → 29 bytes, fixed size.
+#
+_CMDV_FMT = "!iqI3fB"
+_CMDV_SIZE = struct.calcsize(_CMDV_FMT)
+
+
+@dataclass
+class CmdVel:
+    vx: float = 0.0
+    vy: float = 0.0
+    vyaw: float = 0.0
+    flags: int = 0
+    seq: int = 0
+    timestamp_ns: int = 0
+
+    @property
+    def estop(self) -> bool:
+        return bool(self.flags & CMDV_FLAG_ESTOP)
+
+
+def pack_cmd_vel(c: CmdVel) -> bytes:
+    return struct.pack(_CMDV_FMT, MAGIC_CMDV, int(c.timestamp_ns),
+                       int(c.seq) & 0xFFFFFFFF, float(c.vx), float(c.vy),
+                       float(c.vyaw), int(c.flags) & 0xFF)
+
+
+def unpack_cmd_vel(buf: bytes) -> CmdVel:
+    if len(buf) < _CMDV_SIZE:
+        raise ProtocolError("cmd_vel buffer too short")
+    vals = struct.unpack_from(_CMDV_FMT, buf, 0)
+    if vals[0] != MAGIC_CMDV:
+        raise ProtocolError(f"bad cmd_vel magic 0x{vals[0] & 0xFFFFFFFF:08X}")
+    return CmdVel(timestamp_ns=vals[1], seq=vals[2], vx=vals[3], vy=vals[4],
+                  vyaw=vals[5], flags=vals[6])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Quaternion helpers   (Hamilton, xyzw order) — used by fuser and predictor
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -413,6 +473,7 @@ ENC_PCD   = "application/vat.pcd"
 ENC_POSE  = "application/vat.pose"
 ENC_PCOR  = "application/vat.pose_correction"
 ENC_TRAJ  = "application/vat.trajectory"
+ENC_CMDV  = "application/vat.cmd_vel"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -458,6 +519,14 @@ def _selftest() -> None:
     d = unpack_pose_correction(pack_pose_correction(c))
     assert d.map_version == 12 and np.allclose(d.position, c.position, atol=1e-5)
 
+    # cmd_vel round-trip (incl. e-stop flag)
+    cv = CmdVel(vx=0.25, vy=-0.1, vyaw=0.4, flags=CMDV_FLAG_ESTOP, seq=11,
+                timestamp_ns=7)
+    e = unpack_cmd_vel(pack_cmd_vel(cv))
+    assert e.seq == 11 and e.estop and abs(e.vx - 0.25) < 1e-6 \
+        and abs(e.vy + 0.1) < 1e-6 and abs(e.vyaw - 0.4) < 1e-6
+    assert not CmdVel(vx=0.1).estop
+
     # quaternion math
     qx = quat_from_rotvec([np.pi / 2, 0, 0])           # 90° about +x
     v = quat_rotate(qx, np.array([0, 1.0, 0]))         # +y → +z
@@ -481,6 +550,7 @@ def _selftest() -> None:
 
     print("vat_protocol self-test OK  "
           f"(pose={_POSE_SIZE}B  correction={_PCOR_SIZE}B  "
+          f"cmd_vel={_CMDV_SIZE}B  "
           f"frame_hdr={_FRAME_HDR_SIZE}B  pcd_hdr={_PCD_HDR_SIZE}B)")
 
 

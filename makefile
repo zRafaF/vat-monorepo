@@ -21,7 +21,7 @@ CLIENT_RUN ?= cd client && uv run python
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-stream robot-docker viewer \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
-        fetch_frame \
+        teleop fetch_frame \
         docs docs-serve clean
 
 # ── Help / runbook ───────────────────────────────────────────────────────────
@@ -48,6 +48,9 @@ help:
 	@echo "  make test_frames_server  1  decimated frames the server ingests"
 	@echo "  make test_robot_state    2  body + limb/foot positions, live"
 	@echo "  make test_poses          3  camera trajectory + fused robot pose"
+	@echo ""
+	@echo "Teleop:"
+	@echo "  make teleop          [CLIENT] keyboard drive (WASD), deadman + e-stop"
 	@echo ""
 	@echo "Then: make viewer  (Stage 4, the real POC)"
 
@@ -149,6 +152,11 @@ test_frames_robot:
 test_frames_server: sync-client
 	@echo ">> Reminder: router + 'make theta-uvc' + 'make robot-docker' running."
 	$(CLIENT_RUN) ../tools/view_frames.py
+
+# [CLIENT] Keyboard teleop — drive the robot (continuous stream + deadman).
+teleop: sync-client
+	@echo ">> Reminder: router + robot container (teleop_bridge) running. Keep the physical remote in hand."
+	$(CLIENT_RUN) ../tools/teleop_keyboard.py
 
 # [ANY] Fetch one FULL-RES archived frame by seq:  make fetch_frame SEQ=1234
 fetch_frame: sync-client

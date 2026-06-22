@@ -62,27 +62,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-humble-rosidl-generator-dds-idl \
         build-essential cmake \
     && rm -rf /var/lib/apt/lists/* || true
-# Only unitree_go is needed — it carries SportModeState (odometry/limbs), the
-# single custom type the fuser decodes. unitree_api (the /api/sport/* Request/
-# Response types) is NOT used by VAT and is intentionally not built. unitree_go
-# does not depend on unitree_api, so it builds standalone.
-# NOTE: unitree_go's CMake does find_package(rosidl_generator_dds_idl) — hence
-# ros-humble-rosidl-generator-dds-idl above. Without it the build fails and
-# /sportmodestate silently never forwards. We therefore HARD-FAIL the build if
-# the type can't be imported afterwards, so a broken image never ships quietly.
+# Two message packages are needed:
+#   unitree_go  — SportModeState/LowState (odometry, limbs); decoded by the fuser
+#   unitree_api — Request/Response for /api/sport/* ; published by teleop_bridge
+#                 to DRIVE the robot (Move/StopMove/Damp). Required for control.
+# NOTE: both packages' CMake do find_package(rosidl_generator_dds_idl) — hence
+# ros-humble-rosidl-generator-dds-idl above. Without it the build fails and the
+# custom topics silently never work. We therefore HARD-FAIL the build if either
+# type can't be imported afterwards, so a broken image never ships quietly.
 RUN git clone --depth 1 --branch "${UNITREE_ROS2_REF}" \
         https://github.com/unitreerobotics/unitree_ros2 /tmp/unitree_ros2 \
     && mkdir -p /opt/unitree_ws/src \
     && cp -r /tmp/unitree_ros2/cyclonedds_ws/src/unitree/unitree_go \
+            /tmp/unitree_ros2/cyclonedds_ws/src/unitree/unitree_api \
             /opt/unitree_ws/src/ \
     && rm -rf /tmp/unitree_ros2 \
     && bash -lc 'source /opt/ros/humble/setup.bash && cd /opt/unitree_ws && \
-        colcon build --packages-select unitree_go' \
+        colcon build --packages-select unitree_go unitree_api' \
     && bash -lc 'source /opt/ros/humble/setup.bash && \
         source /opt/unitree_ws/install/setup.bash && \
         python3 -c "from rosidl_runtime_py.utilities import get_message; \
         get_message(\"unitree_go/msg/SportModeState\"); \
-        print(\"[build] unitree_go OK — SportModeState importable\")"'
+        get_message(\"unitree_api/msg/Request\"); \
+        print(\"[build] unitree_go + unitree_api OK — types importable\")"'
 
 # Shared wire protocol (single source of truth — lives in repo /common)
 COPY common/vat_protocol.py     /app/
@@ -92,6 +94,7 @@ COPY robot/docker/theta_camera.py     /app/
 COPY robot/docker/frame_archive.py    /app/
 COPY robot/docker/pose_fuser.py       /app/
 COPY robot/docker/kinematics.py       /app/
+COPY robot/docker/teleop_bridge.py    /app/
 COPY robot/docker/start.sh            /app/
 RUN chmod +x /app/start.sh
 
@@ -105,6 +108,11 @@ ENV ROBOT_NAME="go2" \
     CAMERA_FPS="30.0" \
     PUBLISH_HZ="50.0" \
     SPORT_TOPIC="lf/sportmodestate" \
+    TELEOP_RATE_HZ="20.0" \
+    TELEOP_TIMEOUT_S="0.3" \
+    TELEOP_MAX_VX="0.3" \
+    TELEOP_MAX_VY="0.2" \
+    TELEOP_MAX_VYAW="0.6" \
     ROBOT_MODEL="selfie_stick" \
     STICK_OFFSET_X="-0.20" \
     STICK_OFFSET_Y="0.0" \
