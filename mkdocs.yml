@@ -103,3 +103,5 @@ nav:
         - setup/development/index.md
         - Documentation: setup/development/documentation.md
         - VPN: setup/development/vpn.md
+  - Archive:
+      - Insta360 (retired): archive/insta360.md

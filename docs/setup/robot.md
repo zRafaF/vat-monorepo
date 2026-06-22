@@ -1,366 +1,378 @@
 # Robot setup
 
-End-to-end setup for the **Unitree Go2-W**: the Insta360 camera stack (host ROS
-Foxy) and the Zenoh bridge / decimator / pose-fuser container.
+End-to-end setup for the **Unitree Go2-W**. Two parts:
 
-The robot side has two parts:
-
-* **Host ROS (Foxy)** — the `insta360_ros_driver` publishing
-  `/equirectangular/image` etc. Built in `~/ros2_ws`.
-* **Docker container** — the ROS↔Zenoh bridge + frame decimator + pose fuser
-  (`robot/docker/`), run with `make robot-docker`.
+* **Camera — RICOH Theta X over UVC.** The Theta X does dynamic stitching +
+  zenith correction *in-camera* during live streaming, so it exposes a clean
+  equirectangular **UVC** stream. We capture it directly with OpenCV
+  (`theta_camera.py`) — **no ROS camera node, no host-side stitching**. (We moved
+  here from the Insta360 driver; see [archive](../archive/insta360.md).)
+* **Docker container** — the ROS↔Zenoh **bridge** (for odometry) + `theta_camera`
+  + `pose_fuser` (`robot/docker/`), run with `make robot-docker`.
 
 !!! tip "Quick start (after the one-time install below)"
     From the repo root on the robot:
     ```bash
-    make robot-ros      # camera (CycloneDDS fix + equirectangular)
-    make robot-docker   # bridge + decimator + pose fuser
+    make theta-uvc      # Theta X UVC → /dev/video10 (leave running in its own shell)
+    make robot-docker   # bridge + theta_camera + pose fuser
     ```
 
 ---
 
-## 1. Workspace & dependencies (Foxy)
+## 1. Camera setup (RICOH Theta X over UVC)
 
-The Go2 runs Ubuntu 20.04 / ROS 2 Foxy. Enable the Unitree ROS 2 environment and
-create a clean workspace.
+The Theta X is **not** a plain webcam. The mainline kernel `uvcvideo` driver
+enumerates it (`dmesg` shows *"Found UVC 1.50 device RICOH THETA X"*) but then
+reports *"No streaming interface found"* and exposes **no `/dev/videoN` capture
+node** — the H.264 stream rides a vendor UVC 1.5 configuration the kernel driver
+won't surface. (This is why plain `cv2.VideoCapture(0)` works on Windows, where
+Ricoh ships a UVC driver, but never on stock Linux.) The stream must be pulled
+in **userspace via `libuvc-theta`**. We decode it into a standard **v4l2
+loopback** device that OpenCV reads as `/dev/video10`.
 
-```bash
-# Enable the Unitree ROS 2 environment (publishes the Go2 topics)
-source ~/unitree_ros2/setup.sh
+!!! warning "Loopback node is `/dev/video10`, not `/dev/video0`"
+    This robot also runs an **Intel RealSense**, which claims the low-numbered
+    `/dev/video0..N` nodes at boot. The Theta loopback therefore uses a dedicated
+    high number — **`/dev/video10`** (`VIDEO_NR` in `theta_uvc.sh`, `THETA_DEVICE`
+    in `vat.env`). If you put the loopback on a node the RealSense already owns,
+    GStreamer fails with *"Device '/dev/videoN' is not a output device"*.
 
-mkdir -p ~/ros2_ws/src
-cd ~/ros2_ws/src
-```
+!!! warning "Use `gstthetauvc`, not stock `gst_loopback`"
+    The `libuvc-theta-sample` `gst_loopback` binary identifies the camera by a
+    **hardcoded product-ID table** (`0x2712` THETA V, `0x2715` Z1). The Theta X
+    is `0x2717`, which isn't in the list, so it prints **`THETA not found`** and
+    exits — *the camera is fine, the sample just doesn't know the X*. The
+    [`gstthetauvc`](https://github.com/nickel110/gstthetauvc) plugin matches by
+    **product name** (`strncmp(..., "RICOH THETA")`), so the Theta X — and any
+    future model — works with **no source edits**. That's our default backend.
+    (A patched `gst_loopback` is documented as a fallback at the end.)
 
-On Foxy some dependencies are missing from `apt`, so build them from source:
+**a) Put the camera in live-streaming mode** and update its firmware
+([Ricoh guide](https://blog.ricoh360.com/en/12306)). Connect it to the Jetson by
+USB-C, then on the camera switch to **Live Streaming** mode (Mode button →
+`LIVE`). Confirm: `lsusb | grep -i ricoh` must show **`05ca:2717`**. If you see
+**`05ca:0373`** (or any other id) the camera is in normal/MTP mode, not
+streaming — `make theta-uvc` will refuse to start until it reads `2717`. The
+camera can silently drop out of streaming mode on reboot/idle, so re-check this
+if a previously-working setup stops.
 
-```bash
-cd ~/ros2_ws/src
-# Foxy-compatible camera manager
-git clone https://github.com/ros-perception/image_common.git -b foxy
-# IMU tools (imu_filter_madgwick)
-git clone https://github.com/ccny-ros-pkg/imu_tools.git -b foxy
-
-cd ~/ros2_ws
-rosdep update
-# --skip-keys avoids apt-installing the packages we just cloned
-rosdep install --from-paths src --ignore-src -r -y \
-  --skip-keys "imu_tools imu_filter_madgwick camera_info_manager"
-```
-
----
-
-## 2. Acquire the Insta360 SDK
-
-You need an Insta360 account and must request SDK access from the
-[Insta360 SDK Portal](https://www.insta360.com/sdk/record).
-
-!!! warning
-    Use the **latest** SDK. The driver requires the SDK posted **after April 23,
-    2025**. See the driver's [install notes](https://github.com/ai4ce/insta360_ros_driver/issues/10#issuecomment-3371481987).
-
-!!! tip
-    Right-click the download button → "Copy Link Address" to get a direct URL you
-    can `wget`/`curl` onto the robot. It looks like
-    `https://wassets.insta360.com/common/<key>/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip`.
+**b) Build `libuvc-theta`** (the UVC1.5/H.264 fork) and remove any stray system
+`libuvc` that would shadow it:
 
 ```bash
+sudo apt install libjpeg-dev libusb-1.0-0-dev cmake \
+  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+
+# A system libuvc shadows the THETA fork → "Found 1 Theta(s), but none available"
+# / "could not open". Remove it if present:
+apt list --installed 2>/dev/null | grep -i libuvc   # if libuvc-dev/libuvc0 show up:
+sudo apt purge -y libuvc-dev libuvc0 || true
+
+# libuvc fork for THETA
+git clone -b theta_uvc https://github.com/ricohapi/libuvc-theta
+cd libuvc-theta && mkdir build && cd build && cmake .. && make && sudo make install && sudo ldconfig
 cd ~
-curl -O https://wassets.insta360.com/common/<your-key>/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
-unzip Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
-rm Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip
-
-cd Linux_CameraSDK-2.1.1_MediaSDK-3.1.1
-# Go2-W is ARM64 → use the jetson-linux tarball
-tar -xzf CameraSDK-2.1.1-jetson-linux-9.3.0-2020.08-x86_64_aarch64_linux-gnu.tar.gz
 ```
+
+**c) Build + install the `gstthetauvc` plugin** (matches the camera by name → no
+patch needed for the Theta X):
+
+```bash
+git clone https://github.com/nickel110/gstthetauvc
+cd gstthetauvc/thetauvc && make
+# put it where GStreamer finds it (adjust the triplet for your arch):
+sudo cp gstthetauvc.so /usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0/
+cd ~
+
+# sanity check — prints properties (mode/serial), no error:
+gst-inspect-1.0 thetauvcsrc
+```
+
+!!! note "Plugin in a custom dir?"
+    If you don't copy `gstthetauvc.so` into the system plugin dir, export
+    `GST_PLUGIN_PATH=/path/to/gstthetauvc/thetauvc` instead; the helper script
+    and the systemd unit both honour it.
+
+**d) Install the v4l2 loopback module:**
+
+```bash
+sudo apt install v4l2loopback-dkms
+```
+
+**e) Expose the Theta as `/dev/video10`** with the helper (loads the loopback
+module + runs the `thetauvcsrc → v4l2sink` pipeline):
+
+```bash
+make theta-uvc        # = bash robot/theta/theta_uvc.sh  (leave running)
+# overrides: THETA_BACKEND (gstthetauvc|loopback), THETA_DECODER (auto|nv|sw),
+#            VIDEO_NR, THETA_MODE (2K|4K), GST_PLUGIN_PATH
+```
+
+!!! warning "Jetson: hardware decoder (`not negotiated` spam)"
+    On the Jetson, GStreamer's `decodebin` auto-picks **`nvv4l2decoder`**,
+    whose output lives in **NVMM** (GPU) memory. The CPU `videoconvert`/
+    `v4l2sink` can't negotiate with NVMM, so the pipeline floods
+    *"… capsfilter1: not negotiated"* and no frames reach `/dev/video10`.
+    `theta_uvc.sh` fixes this with `THETA_DECODER=auto`, which uses an
+    explicit **`nvv4l2decoder ! nvvidconv`** pair on the Jetson (force with
+    `THETA_DECODER=nv`; use `sw` for x86/software decode).
+
+Verify the device streams (run on the robot — camera alone, no Zenoh):
+
+```bash
+make test_frames_robot     # = python3 tools/view_theta.py  (THETA_DEVICE=/dev/video10)
+```
+
+!!! tip "Headless robot? View on the host over Zenoh (low latency)"
+    `test_frames_robot` opens an **OpenCV window on the robot** — useless on a
+    headless Go2. Instead, publish the loopback to Zenoh and view it on your
+    laptop. No container, no decimation, ~one JPEG per frame:
+
+    ```bash
+    # on the robot (leave both running):
+    make theta-uvc                  # feed /dev/video10
+    make theta-stream               # uv run tools/theta_pub.py → Zenoh
+    # on the host:
+    make test_frames_server         # = tools/view_frames.py  (OpenCV window)
+    ```
+
+    `theta-stream` publishes on the **same** `{robot}/prism/camera/frame` key
+    the container uses, so run **either** `theta-stream` **or** the full
+    container — not both. Tune `PREVIEW_FPS` / `PREVIEW_SCALE` /
+    `PREVIEW_QUALITY` (env) to trade latency vs. quality. Dependencies are a
+    standalone **uv** project (`robot/pyproject.toml`: eclipse-zenoh +
+    headless OpenCV + numpy); `make theta-stream` runs `make sync-robot`
+    first, so the `robot/.venv` is created automatically on first run.
+
+!!! note "Advanced: skip the loopback entirely"
+    If your OpenCV is built **with GStreamer**, you can hand a pipeline straight
+    to OpenCV via `THETA_GST_PIPELINE` (e.g. `thetauvcsrc mode=2K ! … ! appsink`,
+    with `nvv4l2decoder` for Jetson HW decode) instead of going through
+    `/dev/video10`. `theta_camera.py` and `tools/view_theta.py` both honour it.
+    We keep the loopback as the default because the **pip OpenCV in the container
+    has V4L but not GStreamer**.
+
+??? note "Fallback: patched `gst_loopback` (only if you can't build the plugin)"
+    The original `libuvc-theta-sample` route still works **if** you add the
+    Theta X product ID. In `libuvc-theta-sample/gst/thetauvc.c`:
+
+    ```c
+    #define USBPID_THETAX_UVC 0x2717        // add near the other USBPID_ defines
+    // …and accept it in thetauvc_find_devices():
+    if (desc->idProduct == USBPID_THETAV_UVC
+        || desc->idProduct == USBPID_THETAZ1_UVC
+        || desc->idProduct == USBPID_THETAX_UVC) {
+    ```
+
+    Then `cd libuvc-theta-sample/gst && make`, and run with
+    `THETA_BACKEND=loopback make theta-uvc` (set `GST_LOOPBACK_BIN` if the binary
+    isn't at `~/libuvc-theta-sample/gst/gst_loopback`).
+
+The Theta capture lives in the container's **`theta_camera.py`**: it reads the
+device, picks the **sharpest frame in a small window** (live-tunable
+`window_size`), stamps the **camera height**, and publishes
+`{robot}/prism/camera/frame`. The raw stream never touches Zenoh — only the
+decimated JPEG goes out.
+
+### Full-res archive (offline reconstruction)
+
+The live stream is **downscaled** to `TRANSMIT_WIDTH`×`TRANSMIT_HEIGHT`
+(`1036×518` by default) for the mapping server. In parallel, `theta_camera.py`
+writes the **full-resolution twin** of every transmitted frame to a local,
+size-capped archive — same `seq` / timestamp / `camera_height`, so the live and
+archived frames line up **1:1**. This is the source for offline, non-real-time
+reconstruction (Gaussian splats, NeRF): the heavy work runs later against the
+high-res frames, joined to the recorded pose trajectory by timestamp.
+
+* **Storage** — a SQLite index (`<ARCHIVE_DIR>/index.sqlite`) plus JPEG files
+  (`<ARCHIVE_DIR>/frames/<seq>.jpg`). Written on a **separate thread** with a
+  bounded queue, so the full-res encode + disk I/O never stall the real-time
+  publish (frames are dropped from the archive, never from the live stream, if
+  the disk can't keep up).
+* **Size cap** — `ARCHIVE_MAX_BYTES` (default `10GB`); oldest frames are evicted
+  first (FIFO). It lives on a **bind-mounted host dir** (`ARCHIVE_DIR_HOST` →
+  `ARCHIVE_DIR`) so it survives container restarts; `run.sh` creates and mounts
+  it.
+* **On-demand full-res fetch** — the container exposes a Zenoh queryable
+  `{robot}/prism/camera/archive/get?seq=N`. Pull one full-res frame from the
+  host or server by the seq the live stream showed:
+
+    ```bash
+    make fetch_frame SEQ=1234        # = tools/fetch_archive.py --seq 1234
+    ```
+
+!!! note "4K needs 4K hardware decode"
+    The archive's detail comes from `THETA_MODE=4K`, which needs a Jetson that
+    can HW-decode 4K H.264 (Xavier/Orin). If `make theta-uvc` stalls at 4K, set
+    `THETA_MODE=2K` — the archive then stores 2K full-res and ~4× more history
+    fits in the 10GB budget. (5.7K/8K aren't available over live USB — they'd
+    need separate still captures.)
+
+Config (all in `vat.env`): `TRANSMIT_WIDTH`/`TRANSMIT_HEIGHT`, `ARCHIVE_ENABLE`,
+`ARCHIVE_DIR`, `ARCHIVE_DIR_HOST`, `ARCHIVE_MAX_BYTES`, `ARCHIVE_JPEG_QUALITY`.
 
 ---
 
-## 3. Install & build the driver
+## 2. Docker container (bridge + camera + fuser)
+
+The container ships three processes (`robot/docker/`): the ROS↔Zenoh **bridge**
+(odometry, e.g. `/sportmodestate`), **`theta_camera`** (above), and
+**`pose_fuser`**. The Go2 has no docker-compose, so it's built from the repo root
+and run via `run.sh`, wrapped by `make robot-docker`. The Theta `/dev/video10` is
+passed in with `--device`.
 
 ```bash
-cd ~/ros2_ws/src
-git clone -b humble https://github.com/ai4ce/insta360_ros_driver
-
-# Copy SDK headers + library into the driver (dir names vary by SDK version)
-cp -r ~/Linux_CameraSDK-*/CameraSDK-*/include/* ~/ros2_ws/src/insta360_ros_driver/include/
-cp    ~/Linux_CameraSDK-*/CameraSDK-*/lib/libCameraSDK.so ~/ros2_ws/src/insta360_ros_driver/lib/
-
-# Clean up the SDK tarball
-cd ~ && rm -rf Linux_CameraSDK-2.1.1_MediaSDK-3.1.1
-```
-
-Build (the CMake policy flag keeps Foxy compatible with newer build tools):
-
-```bash
-cd ~/ros2_ws
-colcon build --symlink-install \
-  --cmake-args -DCMAKE_POLICY_VERSION_MINIMUM=3.5 --allow-overriding image_transport
-source install/setup.bash
-```
-
-Verify: `ros2 pkg prefix camera_info_manager` should return a path under
-`~/ros2_ws/install`.
-
----
-
-## 4. Hardware configuration
-
-**Camera settings (on the camera itself):**
-
-1. **USB Mode = Android** — swipe down → Settings → General → USB Mode → Android
-   (not Webcam). Required for the driver to detect the camera
-   ([Issue #4](https://github.com/ai4ce/insta360_ros_driver/issues/4)).
-2. **Dual-Lens mode** — make sure the camera is in dual-lens mode.
-
-**USB permissions (udev `/dev/insta`):** the SDK needs USB access. Create the
-udev rule (camera connected + powered on so the device node exists):
-
-```bash
-cd ~/ros2_ws/src/insta360_ros_driver
-./setup.sh
-
-# Manual fallback if setup.sh fails ("device /dev/insta not found"):
-echo SUBSYSTEM=='"usb"', ATTR{manufacturer}=='"Arashi Vision"', SYMLINK+='"insta"', MODE='"0777"' \
-  | sudo tee /etc/udev/rules.d/99-insta.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-sudo chmod 777 /dev/insta
-```
-
----
-
-## 5. Camera bringup (equirectangular)
-
-Bring the camera up in **equirectangular** mode — that's what PRISM consumes.
-The driver's `equirectangular` arg **defaults to `false`**, so it must be set.
-
-From the repo root, `make robot-ros` wraps everything (CycloneDDS eth0 fix +
-sourcing `~/ros2_ws` + the launch):
-
-```bash
-make robot-ros
-# = bash robot/ros/bringup_camera.sh
-#   → ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
-```
-
-!!! warning "It goes quiet after startup — that's normal, don't Ctrl-C it"
-    Success looks like: `Camera opened successfully` → `Live streaming started`
-    → `Mapping matrices initialization complete`, and then **silence** (the
-    driver doesn't log every frame). It is streaming. **Leave `make robot-ros`
-    running in its own terminal** — if you Ctrl-C it, the camera stops and every
-    downstream stream drops to 0 Hz. (A one-off `error info: 400 [unknown msg
-    code.]` just before "Camera opened successfully" is a benign SDK quirk.)
-
-Published topics: `/equirectangular/image`, `/dual_fisheye/image[/compressed]`,
-`/imu/data[_raw]`. Verify in another shell (while `make robot-ros` keeps running):
-
-```bash
-export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>'
-source ~/ros2_ws/install/setup.bash
-ros2 topic hz /equirectangular/image
-```
-
-Env overrides for the bringup script: `ROS_DISTRO` (default `foxy`), `ROS2_WS`
-(default `~/ros2_ws`), `NET_IFACE` (default `eth0`), `EQUIRECTANGULAR` (default
-`true`).
-
----
-
-## 6. Zenoh bridge container
-
-The bridge no longer runs alone — it ships in **one** container alongside the
-frame decimator and the pose fuser (`robot/docker/`). The Go2 has no
-docker-compose, so it's built from the repo root and run via `run.sh`, wrapped
-by `make robot-docker`.
-
-```bash
-# from the repo root (config — router IP, robot name — comes from vat.env)
+# from the repo root (config — router IP, robot name, THETA_* — comes from vat.env)
 make robot-docker
-# = bash robot/docker/run.sh $ROUTER_IP
-#   (docker build -f robot/docker/Dockerfile … ; docker run --network host …)
+# = bash robot/docker/run.sh $ROUTER_IP   (build + docker run --network host --device /dev/video10 …)
 
-docker logs -f vat-robot       # expect "Registered Zenoh route ..." per topic
+docker logs -f vat-robot
 ```
 
 !!! note "Docker permissions"
-    If docker needs root on your robot, use `sudo make robot-docker` and
-    `sudo docker logs -f vat-robot`. (Better: add your user to the `docker`
-    group: `sudo usermod -aG docker $USER`, then log out/in — after that no
-    `sudo` is needed.)
+    If docker needs root, use `sudo make robot-docker` and `sudo docker logs -f
+    vat-robot`. Better: `sudo usermod -aG docker $USER`, then log out/in.
 
-!!! note "DDS matching (important)"
+!!! note "DDS matching (for the odometry bridge)"
     The Go2 host speaks **CycloneDDS** on `eth0`. The bridge container (ROS
     Humble) is built with `rmw_cyclonedds_cpp` and exports the matching
-    `CYCLONEDDS_URI` at startup so it can actually see the host's Foxy topics —
-    otherwise the bridge runs but bridges nothing. Override the interface with
-    `NET_IFACE=eth1 make robot-docker` if needed. The container uses
-    `--network host`, so it shares the host's interfaces and ROS domain.
+    `CYCLONEDDS_URI` at startup so it can see the host's Foxy topics — otherwise
+    the bridge runs but bridges nothing. Override the interface with
+    `NET_IFACE=eth1 make robot-docker`.
 
 **Auto-start on boot:**
 
 ```bash
-sudo cp robot/systemd/vat-robot-docker.service /etc/systemd/system/   # edit ZENOH_CONNECT
-sudo systemctl enable --now vat-robot-docker.service
-sudo journalctl -fu vat-robot-docker
+# Theta UVC loopback (host) + the container
+sudo cp robot/systemd/vat-theta-uvc.service     /etc/systemd/system/   # edit paths
+sudo cp robot/systemd/vat-robot-docker.service  /etc/systemd/system/   # edit ZENOH_CONNECT
+sudo systemctl daemon-reload
+sudo systemctl enable --now vat-theta-uvc.service vat-robot-docker.service
 ```
 
 ### How the bridge works
 
 * **Dynamic discovery** — polls the ROS graph every 2 s for new topics.
-* **Smart routing (`MatchingListener`)** — only creates a ROS subscription when a
-  remote Zenoh client is actually listening; stops it when clients disconnect.
-* **Liveliness** — broadcasts a heartbeat token so the server can detect a
-  dropped robot immediately.
-
-| Variable | Description | Default |
-|---|---|---|
-| `ROBOT_NAME` | Zenoh key prefix (e.g. `go2/rt/topic`) | `go2` (from `vat.env`) |
-| `ZENOH_CONNECT` | Endpoint of the remote Zenoh router | `tcp/$ROUTER_IP:7447` |
-| `LOG_LEVEL` | `DEBUG` / `INFO` / `WARN` | `INFO` |
+* **Smart routing (`MatchingListener`)** — only subscribes to a ROS topic when a
+  remote Zenoh client is listening; stops when clients disconnect.
+* **QoS matching** — probes each publisher's QoS and matches it (sensor topics
+  are BEST_EFFORT; a default RELIABLE subscriber would get nothing).
+* **Liveliness** — a heartbeat token so the server can detect a dropped robot.
 
 ??? failure "[Experimental History] Attempted bridge solutions"
-    We explored several official Zenoh-ROS 2 integration paths before settling on
-    the current Python implementation.
-
-    **Attempt 1: `eclipse/zenoh-bridge-ros2dds` container** — connected to the
-    Zenoh network, but "No topics found" persisted; it couldn't detect the Foxy
-    nodes despite sharing the host network.
-
-    **Attempt 2: Middleware/loopback tweaks** — `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`,
-    `ROS_LOCALHOST_ONLY=1`, multicast on `lo`. Still couldn't maintain a ROS graph.
-
-    **Attempt 3: Build `zenoh-plugin-ros2dds` from source (dds_shm)** — dependency
-    conflicts with the robot's `cmake`/Foxy build tools made it impractical.
-
-    **Conclusion:** the Humble Docker + Python `rclpy` bridge bypassed the
-    discovery issues while keeping native compatibility with the robot's ROS graph.
+    Before the current Python `rclpy` bridge we tried the
+    `eclipse/zenoh-bridge-ros2dds` container (couldn't detect the Foxy nodes),
+    middleware/loopback tweaks (`RMW_IMPLEMENTATION`, `ROS_LOCALHOST_ONLY=1`,
+    multicast on `lo`), and building `zenoh-plugin-ros2dds` from source for
+    `dds_shm` (cmake/Foxy dependency conflicts). The Humble Docker + `rclpy`
+    bridge bypassed the discovery issues while keeping native compatibility with
+    the robot's ROS graph.
 
 ---
 
-## 7. Known issue — CycloneDDS interface
+## 3. Known issue — CycloneDDS interface
 
-On our Go2, ROS failed at startup with:
-
-```
-ros2: eth1: does not match an available interface.
-[ERROR] [rmw_cyclonedds_cpp]: rmw_create_node: failed to create domain
-```
-
-The fix is to pin CycloneDDS to the real interface (`eth0`) before any ROS
-command:
+On our Go2, ROS fails at startup with `<iface>: does not match an available
+interface` when CycloneDDS is bound to a NIC that doesn't exist — this
+crash-loops the bridge (`rcl node's rmw handle is invalid`). **The container
+now auto-detects the interface** (`start.sh` prefers the NIC on the Unitree
+subnet `192.168.123.x`, then the default route, then the first UP NIC), so
+`make robot-docker` should just work. If auto-detect picks the wrong one
+(bridge logs `[no data]`), pin it: set `NET_IFACE=<iface>` in `vat.env`
+(find it with `ip -br addr` on the robot). For ad-hoc `ros2` commands on the
+host, export it manually:
 
 ```bash
 export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>'
 ```
 
 !!! note
-    `make robot-ros` (via `robot/ros/bringup_camera.sh`) and the
-    `vat-robot.service` unit already export this before launching, so you only
-    need it manually for ad-hoc `ros2 topic …` commands. Tip: add it to your
-    `~/.bashrc`. Override the interface with `NET_IFACE`.
+    The container (via `start.sh`) and the `vat-theta-uvc`/`vat-robot-docker`
+    units handle this for you; you only need it manually for ad-hoc `ros2 topic …`
+    commands. Tip: add it to `~/.bashrc`. Override with `NET_IFACE`.
 
 ---
 
-## 8. Troubleshooting
+## 4. Troubleshooting
 
-**`insta360_ros_driver`: "No available camera devices found." (process dies, exit 255)**
-The driver can't enumerate the camera. Work through:
+**`tools/view_theta.py` / `theta_camera`: could not open the Theta stream**
 
-1. Camera **powered on** and connected by USB; try a different cable/port.
-2. **USB Mode = Android** and **Dual-Lens** mode set on the camera (§4).
-3. The OS sees it: `lsusb | grep -i arashi` (Arashi Vision = Insta360).
-4. The udev node exists: `ls -l /dev/insta`. If missing, (re)run `./setup.sh`
-   or the manual udev rule, **replug** the camera, then `sudo chmod 777 /dev/insta`.
-5. SDK is the **latest** (post Apr 23 2025) and the `libCameraSDK.so` + headers
-   were copied into the driver before building (§3).
-6. Sometimes the SDK only enumerates after the camera is replugged **once the
-   USB/lens modes are set** — unplug, set modes, replug, relaunch.
+1. Camera in **live-streaming mode** and connected (`lsusb | grep -i ricoh` →
+   `05ca:2717`).
+2. The loopback is up: `make theta-uvc` running, and `ls -l /dev/video10` exists
+   (it is the loopback, not the RealSense).
+3. `gstthetauvc` plugin found: `gst-inspect-1.0 thetauvcsrc` succeeds (set
+   `GST_PLUGIN_PATH` if not in the system dir); `v4l2loopback-dkms` installed.
+4. `THETA not found` from `make theta-uvc` → you're on the `loopback` backend
+   with an **unpatched** `gst_loopback` (no Theta X `0x2717` PID). Switch to the
+   default `gstthetauvc` backend, or apply the patch (see §1 fallback note).
+5. `Found 1 Theta(s), but none available` / cannot open → a **stray system
+   `libuvc`** is shadowing the fork: `sudo apt purge libuvc-dev libuvc0`, then
+   rebuild and `sudo ldconfig`.
+6. `Device '/dev/videoN' is not a output device` (caps `0x…0001` = capture-only)
+   → the loopback node clashed with a **real capture device** (the RealSense owns
+   `/dev/video0..N`). Use the dedicated `VIDEO_NR=10` (default) and keep
+   `THETA_DEVICE=/dev/video10` in `vat.env`. Check with
+   `cat /sys/class/video4linux/video10/name` → it should read `ThetaUVC`.
+7. The camera dropped to `05ca:0373` (normal/MTP) → re-enter **Live Streaming**
+   mode on the camera; `make theta-uvc` refuses to start until `lsusb` shows
+   `05ca:2717`.
+8. `… capsfilter1: not negotiated` repeating (you'll see `NvMMLiteOpen`,
+   `BlockType = 261`) → Jetson `decodebin` picked the HW decoder
+   (`nvv4l2decoder`, NVMM memory) and the CPU `v4l2sink` can't take it. The
+   script's `THETA_DECODER=auto` handles this; if you overrode it, use
+   `THETA_DECODER=nv` (Jetson) or `sw` (x86). See §1.
+9. The container got the device: `--device /dev/video10` (run.sh adds it if the
+   device exists — start `make theta-uvc` **before** `make robot-docker`).
 
-The `decoder` and `equirectangular` nodes starting fine while the camera node
-dies (as in the logs) is exactly this: no camera → no `/dual_fisheye/...` →
-`imu_filter` also "Still waiting for data on /imu/data_raw".
+**Container `theta_camera` logs "could not open Theta stream"** — the device
+isn't visible inside the container. Confirm `/dev/video10` exists on the host
+*before* `make robot-docker`, or rerun it so `--device` is attached.
 
-**`make robot-docker` → `run.sh: Permission denied`**
-Fixed: the Makefile now calls `bash robot/docker/run.sh`. If you invoke the
-script directly, use `bash robot/docker/run.sh <router-ip>` or
-`chmod +x robot/docker/run.sh` first.
+**`make robot-docker` → `run.sh: Permission denied`** — the Makefile calls `bash
+robot/docker/run.sh`; if invoking directly, prefix with `bash`.
 
-**`docker logs` → `permission denied ... /var/run/docker.sock`**
-Your user isn't in the `docker` group. Use `sudo docker logs -f vat-robot`, or
-add yourself: `sudo usermod -aG docker $USER` then log out/in.
+**`docker logs` → `permission denied … /var/run/docker.sock`** — add your user to
+the `docker` group (`sudo usermod -aG docker $USER`, re-login) or use `sudo`.
 
-**Container logs spam `AMENT_TRACE_SETUP_FILES: unbound variable`**
-Old bug: `start.sh` ran `set -u` while sourcing ROS (which isn't `set -u`
-clean), so the bridge never started. Fixed — **rebuild the image**
-(`make robot-docker` rebuilds) and the spam is gone.
+**Container spams `AMENT_TRACE_SETUP_FILES: unbound variable`** — old `set -u`
+bug, fixed; **rebuild** (`make robot-docker`).
 
-**Bridge container runs but `make test_link` shows the bridge `absent` / 0 Hz**
-The bridge can't see the host's ROS graph — almost always a **DDS mismatch**.
-The container is now built with `rmw_cyclonedds_cpp` + `CYCLONEDDS_URI` to match
-the Go2, so **rebuild** (`make robot-docker`). Then verify, from inside:
-`sudo docker exec -it vat-robot bash -lc 'source /opt/ros/humble/setup.bash && ros2 topic list'`
-should list the Go2 topics. Also confirm the ROS domain matches (the Go2 uses
-the default `0`; don't set `ROS_DOMAIN_ID` unless the robot does).
+**`make test_link` shows the bridge `absent`, or odometry won't bridge** — a DDS
+mismatch. The container is built with `rmw_cyclonedds_cpp` + `CYCLONEDDS_URI`;
+**rebuild**. Verify inside: `sudo docker exec -it vat-robot bash -lc 'source
+/opt/ros/humble/setup.bash && ros2 topic list'`. The bridge logs forwarded
+counts every 10 s (`[forwarded] …`); `[no data]` means QoS/DDS/interface/domain.
 
-**Topic is bridged + advertised, but the decimator/viewer get 0 frames (`buf=0`)**
-A **QoS mismatch**. Camera/sensor topics (`/equirectangular/image`, IMU,
-point clouds) are published **BEST_EFFORT**; a default **RELIABLE** subscriber
-receives *nothing* from a best-effort publisher (while `ros2 topic hz` "works"
-because it adapts QoS). The bridge now **probes each publisher's QoS and matches
-it** (best-effort sub is compatible with both), so **rebuild** (`make
-robot-docker`). To watch data actually flow, the bridge logs forwarded counts
-every 10 s:
+!!! note "Custom Unitree types are built into the image (full unitree_ros2)"
+    `/sportmodestate` is `unitree_go/msg/SportModeState`, a CUSTOM type — and
+    because the Go2 (Foxy) types are **FINAL** extensibility, CycloneDDS only
+    *delivers* samples when the subscriber's type matches the publisher's
+    **exactly** (a trimmed subset connects but receives **0 msgs**). The image
+    therefore clones the **full [`unitree_ros2`](https://github.com/unitreerobotics/unitree_ros2)**
+    package (`unitree_go` + `unitree_api`) and colcon-builds it; `start.sh`
+    sources the overlay. Pin the version with `UNITREE_ROS2_REF` in `vat.env`.
+    Confirm in the bridge logs: `Registered Zenoh route for: /sportmodestate`
+    then `[forwarded] /sportmodestate=N` (N climbing).
 
-```
-[forwarded] /equirectangular/image=87
-```
-
-If a subscribed topic stays at `0`, it logs `[no data] subscribed to … but
-received 0 msgs` — then it's still QoS/DDS/interface/domain, not the camera.
-
-!!! tip "Raw frames are heavy over a VPN — prefer the decimated view"
-    `/equirectangular/image` is ~**5.5 MB/frame** (1920×960×3). `make
-    test_frames_robot` (raw) pulls that across the link; for normal checks use
-    `make test_frames_server` (the **decimated JPEG**, tens of KB). See
-    *Performance* below — a robot-local Zenoh router keeps the raw frames from
-    crossing the VPN at all.
-
-!!! warning "Custom Unitree types bridge only with their message package"
-    The bridge resolves each topic's type with `get_message(type)`. **Standard**
-    types — including the camera's `sensor_msgs/Image` (`/equirectangular/image`)
-    — work out of the box, so Stage 0/1 (frames) is fine. But **custom** types
-    like `unitree_go/msg/SportModeState` (`/sportmodestate`, needed for Stage 2
-    body/limbs and the pose fuser's camera-height) won't bridge until the
-    `unitree_go` message package is available inside the container. That's a
-    follow-up (install/copy the `unitree_go` msgs into the image); the camera POC
-    does not need it.
-
-**`ros2 topic list` is empty / `package not found` (on the host)**
-Export the CycloneDDS fix (§7) and source the workspace:
-`source ~/ros2_ws/install/setup.bash`.
-
+    If it stays `[no data]` after a rebuild: (1) the publisher's **QoS** — the
+    bridge now defaults a BEST_EFFORT subscriber when it can't read the
+    publisher QoS, which fixes the common case; (2) your **firmware's layout**
+    differs from the pinned `unitree_ros2` — run
+    `ros2 interface show unitree_go/msg/SportModeState` **on the Go2 host** and
+    pin `UNITREE_ROS2_REF` to the matching branch/tag (older defs carry extra
+    fields like `path_point`).
 ---
 
-## 9. Performance — keep raw frames off the VPN (recommended)
+## 5. Performance — keep the robot↔robot hops off the VPN (recommended)
 
-Currently the robot processes (bridge, decimator, fuser) connect **directly to
-the cloud router** over the VPN. That means the bridge→decimator hop also goes
-over the VPN: the decimator pulls the **raw 5.5 MB equirectangular frame back
-from the cloud router** just to compress it locally — ~16 MB/s round-trip that
-never needed to leave the robot.
-
-The fix is the standard Zenoh "router-per-site" topology: run a **local Zenoh
-router on the robot**, point the robot processes at `tcp/127.0.0.1:7447`
-(`ZENOH_CONNECT`), and have that local router `connect` to the cloud router.
-Zenoh only forwards keys that have a *remote* subscriber, so:
-
-* `go2/rt/equirectangular/image` (raw, consumed only by the local decimator) →
-  **stays on the robot**, never crosses the VPN.
-* `go2/prism/camera/frame` (small JPEG, subscribed by the cloud mapping server)
-  and `go2/prism/pose` (subscribed by the client) → forwarded over the VPN.
-
-This makes the only things crossing the link the decimated JPEG and the tiny
-pose stream. (Not wired up yet — it's a small topology change to `run.sh` +
-`vat.env`; ask and it can be added.)
+The robot processes connect **directly to the cloud router** over the VPN. With
+the Theta capture now local (no raw frames on Zenoh), the heaviest remaining
+concern is keeping any robot-internal pub/sub off the link. The standard fix is
+a **local Zenoh router on the robot** that `connect`s to the cloud router; the
+robot processes point at `tcp/127.0.0.1:7447`. Zenoh only forwards keys with a
+*remote* subscriber, so `{robot}/prism/camera/frame` (JPEG → mapping server) and
+`{robot}/prism/pose` (→ client) cross the VPN, while anything robot-only stays
+local. (Not wired up yet — a small change to `run.sh` + `vat.env`; ask and it can
+be added.)

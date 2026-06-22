@@ -1,134 +1,158 @@
+# VAT — Volumetric Asynchronous Teleoperation
 
-```
-py -3.10 -m venv venv-windows
-```
+Live **360° point-cloud + robot pose** from a **Unitree Go2-W** carrying a
+**RICOH Theta X** camera, streamed over [Zenoh](https://zenoh.io) to a
+**PRISM-VGGT** mapping server (GPU), and rendered in a **Rerun** 3D viewer on any
+machine — across the public internet / VPN.
 
+The robot sends a light, real-time stream for online mapping and keeps a
+full-resolution local archive for heavy offline reconstruction (Gaussian splats,
+NeRF) later. Pose is authoritative on the robot: the cloud computes a slow,
+drift-free VGGT pose, the dog fuses it with fast onboard odometry, and the client
+dead-reckons between samples like multiplayer netcode.
 
-# Zenoh for Robotics: Overview & Implementation
-
-Moving from standard IoT protocols (like MQTT) to high-performance robotics (ROS/DDS) often introduces a "broker bottleneck." **Zenoh** is designed to solve this by providing a decentralized, high-throughput, and low-latency data fabric.
-
-## 🚀 Why Zenoh?
-
-In a robotics context, especially when sending heavy data like **Point Clouds** or **Video** to the cloud, Zenoh offers several critical advantages over traditional brokers:
-
-1.  **P2P & Routed Mesh:** Devices can talk directly. A 5MB Point Cloud doesn't have to round-trip through a cloud broker if the server is on the same local network.
-2.  **Unified Fabric (ROS + Native):** Use the `zenoh-bridge-ros2dds` to mirror ROS topics transparently, while allowing non-ROS sensors (like high-speed cameras) to stream data natively into the same ecosystem.
-3.  **Interest Propagation:** If no one is subscribed to a topic (e.g., `/robot/logs`), the data is **dropped at the source**. It never touches the network interface, saving massive amounts of upload bandwidth.
-4.  **Native Fragmentation:** Zenoh automatically handles the chunking and reassembly of large payloads (Lidar scans, images), removing the need for custom "chunking" logic in your code.
+> Status: pre-POC bring-up. Walk the staged tests (`make steps`) until each is
+> green. See `docs/` for the full design and setup.
 
 ---
 
-## 📊 The Big Picture: MQTT vs. Zenoh
+## Data path
 
-| Feature | MQTT | Zenoh |
-| :--- | :--- | :--- |
-| **Topology** | Centralized Broker (Hub & Spoke) | Decentralized (P2P, Routed, or Mesh) |
-| **Efficiency** | High overhead for large data | Ultra-low overhead (5-byte headers) |
-| **Data Handling** | Pub/Sub only | Pub/Sub + Query/Reply + Storage |
-| **Robotics** | Struggles with Point Clouds/Video | Designed for ROS2/Lidar/High-bandwidth |
-| **Network** | Primarily TCP | TCP, UDP, **QUIC**, Serial, Bluetooth |
+```
+RICOH Theta X ──UVC──▶ theta_camera (robot, docker)
+                         ├─ downscale → {robot}/prism/camera/frame  (1036×518 JPEG → server)
+                         └─ full-res 4K twin → local SQLite archive (10 GB rolling, fetch by seq)
+
+dynamic_bridge (robot) ── ROS odometry (/sportmodestate) ──▶ Zenoh
+mapping_server (server, GPU) ── PanoVGGT depth+pose + Nvblox TSDF ──▶ point-cloud deltas + trajectory
+pose path:  server VGGT pose ─▶ dog fuses w/ odometry ─▶ authoritative pose ─▶ client predicts
+prism_rerun_viewer (client) ── point cloud + predicted robot block in Rerun 3D
+```
+
+Three machines:
+
+| Role | Machine | Runs |
+|---|---|---|
+| 🤖 **ROBOT** | Jetson on the Go2-W | Theta UVC feed + Docker container (bridge, camera, pose fuser) |
+| ☁️ **SERVER** | GPU box | Zenoh router + PRISM-VGGT mapping server |
+| 💻 **CLIENT** | your laptop | diagnostic tools + Rerun viewer |
 
 ---
 
-## 🌐 Cloud Deployment & QUIC Support
+## Repository layout
 
-When deploying a robot over the public internet to a cloud server, Zenoh utilizes a **Router (`zenohd`)** to facilitate connection through NAT and firewalls.
-
-### Why use QUIC?
-For internet-facing links (LTE/5G/Starlink), **QUIC** is highly recommended over TCP:
-*   **Connection Migration:** If the robot switches WiFi access points or cellular towers and its IP changes, the QUIC session stays alive.
-*   **No Head-of-Line Blocking:** Unlike TCP, if one packet is lost in a massive Point Cloud, QUIC allows the rest of the data to keep flowing while the missing piece is re-transmitted.
-*   **Performance:** Faster handshakes (0-RTT) for quicker reconnection after signal drops.
-
-
-
-### Configuring the Router (Cloud)
-Run the Zenoh daemon listening for QUIC connections:
-```bash
-zenohd --listen quic/0.0.0.0:7447
+```
+vat-monorepo/
+├── vat.env                 ← single source of public config (router IP, robot name, tuning)
+├── makefile                ← the control file: `make help`, `make steps`
+├── common/
+│   └── vat_protocol.py     ← shared Zenoh key schema + wire formats (pack/unpack)
+├── server/
+│   ├── router/             ← Zenoh router microservice (isolated uv env)
+│   └── mapping/            ← PRISM-VGGT mapping server + PRISM-VGGT/ submodule (CUDA)
+├── client/                 ← Rerun viewer + bring-up tools env
+├── robot/
+│   ├── theta/theta_uvc.sh  ← Theta X UVC → /dev/video10 (gstthetauvc loopback)
+│   ├── docker/             ← bridge + theta_camera + frame_archive + pose_fuser + Dockerfile
+│   ├── unitree_go_msgs/    ← minimal unitree_go interfaces built into the image
+│   └── systemd/            ← auto-start units
+├── tools/                  ← view_frames / view_robot_state / view_poses / theta_pub / fetch_archive …
+└── docs/                   ← mkdocs site (architecture, setup, bring-up runbook)
 ```
 
-### Configuring the Robot (Client)
-Connect via the QUIC protocol in your configuration:
-```python
-import zenoh
-
-conf = zenoh.Config()
-conf.insert_json5("connect/endpoints", '["quic/<CLOUD_IP>:7447"]')
-session = zenoh.open(conf)
-```
+Each runtime piece is its **own isolated [uv](https://docs.astral.sh/uv/)
+project** (`server/router`, `server/mapping`, `client`, `robot`) with its own
+`.venv` — so heavy CUDA deps never clash with the light router/robot envs.
 
 ---
 
-## 🛠 Implementation Checklist
+## Quick start
 
-### 1. Avoid Data Drops
-Zenoh's discovery is asynchronous. To ensure you don't drop the first few packets, use explicit endpoints and verify subscribers before publishing:
-```python
-pub = session.declare_publisher('robot/telemetry')
-while not pub.has_subscribers():
-    time.sleep(0.1)
-```
-
-### 2. Parallel Computation
-You can run multiple independent servers (one for Telemetry, one for Point Clouds). Because of Zenoh's source-side filtering, the robot will only send the specific data requested by each server, fanning it out at the router or via multicast.
-
-### 3. Reliability & Late Joiners
-Use a **Zenoh Storage** plugin. This allows a server that connects *after* an error has occurred to "Query" the last $N$ messages from the robot's local cache.
-
-### 4. Security
-Always wrap internet-facing connections in **TLS**.
-*   **mTLS:** Use mutual TLS certificates to ensure only your specific robots can connect to your cloud router.
-*   **ACLs:** Define policies so robots can only publish to their own specific namespaces.
-
----
-
-## 🤖 Jetson Nano: The Multi-Process "Team" Approach
-
-On the Jetson Nano, Zenoh operates as a layered "team" of processes. This architecture maximizes the hardware capabilities of the Nano (ARM64 + NVENC) while maintaining fault tolerance.
-
-### 1. Layered Architecture
-Instead of one massive script, the robot runs three distinct layers:
-
-*   **Layer A: ROS 2 Nodes (DDS):** Your standard navigation and sensor nodes. They communicate locally using DDS.
-*   **Layer B: Zenoh Bridge (`zenoh-bridge-ros2dds`):** A standalone Rust binary that "listens" to the local DDS chatter and mirrors selected topics (telemetry, point clouds) to the cloud via QUIC.
-*   **Layer C: Video Encoder (Python + GStreamer):** A dedicated script that captures camera frames and uses the Jetson’s **NVENC** hardware encoder to compress video before sending it via the Zenoh Python API.
-
-
-
-### 2. Hardware Acceleration with GStreamer
-To keep CPU usage low on the Jetson Nano, the Video Encoder script should leverage the onboard hardware. 
-
-**Recommended GStreamer Pipeline:**
-```text
-nvarguscamerasrc ! nvv4l2h264enc ! h264parse ! video/x-h264,stream-format=byte-stream ! appsink
-```
-The resulting byte-stream is then pushed to Zenoh using:
-```python
-# Minimal example within your video script
-pub_video = session.declare_publisher("robot/video/h264")
-pub_video.put(frame_bytes)
-```
-
-### 3. Why Multi-Process?
-1.  **Fault Tolerance:** If the video script crashes due to a camera error, the Zenoh Bridge remains active, ensuring you never lose telemetry or the ability to send emergency stop commands.
-2.  **Concurrency:** Each process manages its own resources. Zenoh efficiently multiplexes these different streams over a single QUIC connection to your cloud router.
-3.  **Isolation:** You can update your video processing logic without touching the stable ROS-to-DDS bridge.
-
----
-
-### A Quick Tip for the Jetson Nano:
-Since the Nano's CPU can be a bottleneck, always run the Zenoh Bridge with an **allow list**. This prevents the bridge from "intercepting" internal ROS 2 chatter that you don't need in the cloud, keeping the overhead minimal.
+Everything is driven by the **Makefile** + **`vat.env`**. Edit `vat.env` once
+(set `ROUTER_IP` to the router's reachable address), then per machine:
 
 ```bash
-./zenoh-bridge-ros2dds -e quic/<CLOUD_IP>:7447 --allow "/robot/telemetry|/robot/pc"
+# ☁️ SERVER
+make router            # the Zenoh hub; leave running
+make mapping           # PRISM-VGGT mapping server (needs GPU)
+
+# 🤖 ROBOT  (one-time camera setup: see docs/setup/robot.md)
+make theta-uvc         # Theta X → /dev/video10 (leave running)
+make robot-docker      # bridge + theta_camera + pose_fuser container
+
+# 💻 CLIENT
+make test_link         # transport alive?  bridge + rates
+make viewer            # full POC: point cloud + predicted robot block
 ```
 
-# Documentation
+Walk it up in stages — `make steps` prints the ordered runbook, and
+[`docs/bringup.md`](docs/bringup.md) explains each check:
 
-To run the Mkdocs documentation server, use the following command in the root of the repository:
+| Stage | Command | What it proves |
+|---|---|---|
+| 0 | `make test_link` | router + bridge alive, non-zero rates |
+| 1 | `make test_frames_server` | live 360° frames over Zenoh (decimated) |
+| 1 | `make theta-stream` (robot) | headless camera → Zenoh, no display needed |
+| 2 | `make test_robot_state` | body + leg lines + selfie-stick + live camera |
+| 3 | `make test_poses` | camera trajectory + fused robot pose |
+| 4 | `make viewer` | the full POC |
+| — | `make fetch_frame SEQ=N` | pull one full-res archived frame by seq |
+
+`make help` lists every target.
+
+---
+
+## The camera: real-time + full-res archive
+
+The Theta X isn't a plain webcam — its H.264 UVC stream is decoded on the host by
+[`gstthetauvc`](https://github.com/nickel110/gstthetauvc) into a v4l2 loopback
+(`/dev/video10`), which `theta_camera.py` reads. For each transmitted frame it:
+
+- **downscales** to `TRANSMIT_WIDTH×TRANSMIT_HEIGHT` (default `1036×518`) and
+  publishes that to the mapping server — light and low-latency; and
+- archives the **full-res 4K twin** locally (SQLite index + JPEG files, rolling
+  `ARCHIVE_MAX_BYTES`, default `10 GB`), tagged with the **same seq / timestamp /
+  camera-height** — 1:1 with the live frame.
+
+The server (or you) can fetch any full-res frame on demand by seq via a Zenoh
+queryable (`make fetch_frame SEQ=N`). See [`docs/setup/robot.md`](docs/setup/robot.md).
+
+---
+
+## Configuration (`vat.env`)
+
+Key knobs (all documented inline):
+
+- `ROUTER_IP` / `ROUTER_PORT` — the Zenoh hub everything dials.
+- `ROBOT_NAME` — key-schema prefix (default `go2`).
+- `NET_IFACE` — DDS interface for the bridge; empty = auto-detect (prefers the
+  Go2's `192.168.123.x` subnet).
+- `THETA_MODE` (`2K`/`4K`), `TRANSMIT_WIDTH/HEIGHT`, `THROTTLE_FPS`, `JPEG_QUALITY`.
+- `ARCHIVE_*` — full-res archive location, size cap, quality.
+- `STICK_OFFSET_X/Y/Z` — selfie-stick geometry (measure these).
+
+---
+
+## Why Zenoh
+
+Zenoh is the transport because it fits robot→cloud over flaky links: a
+decentralized fabric (no broker bottleneck) with **interest propagation** (data
+with no subscriber is dropped at the source, saving uplink), native
+**fragmentation** of large payloads, and **query/reply** — which we use for
+retransmitting dropped frames and fetching full-res archive frames on demand.
+
+---
+
+## Documentation
+
+The full design, per-machine setup, and the bring-up runbook live in `docs/`
+(mkdocs):
 
 ```bash
-mkdocs serve
+make docs-serve      # live local docs site
+make docs            # static build
 ```
+
+Start with [`docs/architecture.md`](docs/architecture.md),
+[`docs/streaming_poc.md`](docs/streaming_poc.md), and the setup guides under
+[`docs/setup/`](docs/setup/).

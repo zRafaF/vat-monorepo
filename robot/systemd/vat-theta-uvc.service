@@ -1,0 +1,46 @@
+# VAT Robot — RICOH Theta X UVC → v4l2 loopback (host service)
+# ============================================================
+# Decodes the Theta X UVC stream to /dev/video10 so the container's
+# theta_camera.py can read it. Replaces the old Insta360 host camera unit.
+#
+# Install (edit User/paths to match your robot):
+#   sudo cp robot/systemd/vat-theta-uvc.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vat-theta-uvc.service
+#   sudo journalctl -fu vat-theta-uvc
+#
+# Prereqs: libuvc-theta + gstthetauvc plugin built, v4l2loopback-dkms,
+#          Theta in LIVE STREAMING mode. See docs/setup/robot.md.
+#          (gstthetauvc matches the camera by name, so the Theta X works
+#           without patching any source — unlike stock gst_loopback.)
+
+[Unit]
+Description=VAT Robot — RICOH Theta X UVC v4l2 loopback
+After=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+Group=unitree
+Environment="HOME=/home/unitree"
+# Dedicated loopback node (RealSense claims /dev/video0..N); match THETA_DEVICE.
+Environment="VIDEO_NR=10"
+Environment="THETA_MODE=2K"
+Environment="THETA_BACKEND=gstthetauvc"
+# If gstthetauvc.so is not in the system GStreamer plugin dir, point at it:
+#Environment="GST_PLUGIN_PATH=/home/unitree/gstthetauvc/thetauvc"
+# Fallback only (THETA_BACKEND=loopback): patched libuvc-theta-sample binary:
+#Environment="GST_LOOPBACK_BIN=/home/unitree/libuvc-theta-sample/gst/gst_loopback"
+
+WorkingDirectory=/home/unitree/Desktop/vat-monorepo
+ExecStart=/bin/bash robot/theta/theta_uvc.sh
+
+Restart=on-failure
+RestartSec=5s
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vat-theta-uvc
+
+[Install]
+WantedBy=multi-user.target

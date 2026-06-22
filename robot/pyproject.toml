@@ -1,0 +1,23 @@
+[project]
+name = "vat-robot-tools"
+version = "0.1.0"
+description = "VAT robot host-side tools — headless Theta → Zenoh preview publisher"
+# Standalone, isolated uv project (own robot/.venv + robot/uv.lock), mirroring
+# server/router: a light dependency set for the scripts in ../tools that run on
+# the robot HOST. The heavy capture/bridge/fuser work lives in the Docker
+# container; this env is just for host-side helpers like tools/theta_pub.py.
+#     cd robot && uv sync && uv run python ../tools/theta_pub.py
+requires-python = ">=3.9"
+dependencies = [
+    # Transport
+    "eclipse-zenoh>=1.0",
+    # Capture + JPEG encode. Headless build: the robot publishes frames over
+    # Zenoh and never opens a window, so we don't need the GUI/Qt deps.
+    "opencv-python-headless>=4.9",
+    "numpy>=1.24",
+]
+
+[tool.uv]
+# Virtual project: install deps into robot/.venv, run the ../tools scripts
+# directly (nothing to build/package here).
+package = false

@@ -1,24 +1,27 @@
 # Robot
 
-The robot setup guide now lives in the project documentation (MkDocs), not here:
+The robot setup guide lives in the project documentation (MkDocs):
 
-➡️ **[docs/setup/robot.md](../docs/setup/robot.md)** — Insta360 driver + SDK
-install, build, hardware config, camera bringup, the Zenoh bridge container, the
+➡️ **[docs/setup/robot.md](../docs/setup/robot.md)** — RICOH **Theta X** camera
+over UVC (libuvc-theta → v4l2 loopback → OpenCV), the Zenoh bridge container, the
 CycloneDDS fix, and troubleshooting.
+
+> The camera was switched from the Insta360 (ROS driver, motion artifacts) to the
+> Theta X (clean in-camera-stitched UVC stream). The retired Insta360 setup is
+> archived at [docs/archive/insta360.md](../docs/archive/insta360.md) and on the
+> [`insta360` branch](https://github.com/zRafaF/vat-monorepo/tree/insta360).
 
 Quick start (after the one-time install in the docs), from the repo root on the
 robot:
 
 ```bash
-make robot-ros      # camera: CycloneDDS eth0 fix + insta360 equirectangular
-make robot-docker   # ROS↔Zenoh bridge + frame decimator + pose fuser
+make theta-uvc      # Theta X UVC → /dev/video10 (leave running)
+make robot-docker   # ROS↔Zenoh bridge (odometry) + theta_camera + pose fuser
 ```
 
 Folders here:
 
-- `robot/ros/` — `bringup_camera.sh` (the camera bringup) + the optional
-  `vat_bringup/` launch wrapper.
-- `robot/docker/` — the container (`dynamic_bridge.py`, `frame_decimator.py`,
-  `pose_fuser.py`, `kinematics.py`) + `run.sh`.
-- `robot/systemd/` — boot units for the camera stack and the container.
-- `robot/insta360_ros_driver/` — **do not modify** (vendored hardware driver).
+- `robot/theta/` — `theta_uvc.sh` (Theta UVC → /dev/video10 loopback helper).
+- `robot/docker/` — the container (`dynamic_bridge.py`, `theta_camera.py`,
+  `pose_fuser.py`, `kinematics.py`) + `run.sh` + `start.sh`.
+- `robot/systemd/` — boot units (`vat-theta-uvc.service`, `vat-robot-docker.service`).

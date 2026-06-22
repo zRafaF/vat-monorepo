@@ -63,18 +63,26 @@ class DynamicZenohBridge(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
+        infos = []
         try:
             infos = self.get_publishers_info_by_topic(topic_name)
-            if infos:
-                if any(i.qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
-                       for i in infos):
-                    qos.reliability = ReliabilityPolicy.BEST_EFFORT
-                # Only go transient-local if EVERY publisher is (else incompatible).
-                if all(i.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
-                       for i in infos):
-                    qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         except Exception as e:
             self.get_logger().debug(f"QoS probe failed for {topic_name}: {e}")
+        if infos:
+            if any(i.qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
+                   for i in infos):
+                qos.reliability = ReliabilityPolicy.BEST_EFFORT
+            # Only go transient-local if EVERY publisher is (else incompatible).
+            if all(i.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
+                   for i in infos):
+                qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        else:
+            # No publisher QoS visible (cross-version Foxy↔Humble discovery race,
+            # or the publisher appeared after we probed). A BEST_EFFORT subscriber
+            # is compatible with BOTH reliable and best-effort publishers, so it is
+            # the safe default for *receiving* — a RELIABLE subscriber gets NOTHING
+            # from a best-effort publisher (a common "[no data]" cause).
+            qos.reliability = ReliabilityPolicy.BEST_EFFORT
         return qos
 
     def discover_topics(self):

@@ -1,48 +1,39 @@
 """
-VAT — Frame Decimator
-======================
-Runs inside the robot Docker container alongside ``dynamic_bridge.py`` and
-``pose_fuser.py``.  It is a plain Zenoh client (not a ROS node): the bridge
-already exposes the equirectangular image stream on Zenoh as CDR, so this
-process only needs to subscribe, pick the best frame, and re-publish.
+VAT — Theta Camera (capture + decimate)
+=======================================
+Captures the **RICOH THETA X** 360° stream over **UVC** with OpenCV, picks the
+sharpest frame in a small window, stamps the camera height, and publishes the
+result to Zenoh — all in one process. No ROS camera node, no host-side
+stitching: the Theta X does dynamic stitching + zenith correction *in-camera*
+during live streaming, so the UVC stream is already a clean equirectangular.
 
-Pipeline
---------
-  bridge → {robot}/rt/equirectangular/image  (CDR sensor_msgs/Image, ~30 Hz)
-        → [decimate to throttle_fps, pick sharpest in an N-frame window]
-        → {robot}/prism/camera/frame          (VAT frame: ts + camera_height + JPEG)
+    Theta X --UVC--> [OpenCV capture] --> [best-of-window + camera_height + JPEG]
+                                      --> {robot}/prism/camera/frame
 
-Best-of-window (configurable)
------------------------------
-The camera runs at ~30 Hz but PRISM only wants a few Hz.  Naively grabbing every
-Nth frame risks picking a motion-blurred one.  Instead, for each output tick we
-look at a **window of N consecutive frames centred on the target frame** (e.g.
-3 or 5 frames — the target frame and its immediate neighbours) and emit the
-*sharpest* one.  N is ``window_size`` and is tunable live over Zenoh.
+This replaces both the old Insta360 ROS driver and the separate frame decimator
+(see docs/archive/insta360.md for why we moved away).
 
-  window_size = 1  → no neighbours, emit the frame nearest the tick
-  window_size = 5  → the target frame ± 2 neighbours, sharpest wins
+Capture source (pick one; checked in this order)
+------------------------------------------------
+  THETA_GST_PIPELINE  full GStreamer pipeline → cv2.CAP_GSTREAMER
+                      (needs OpenCV built with GStreamer + the gstthetauvc plugin)
+  THETA_DEVICE        v4l2 device path/index → cv2.CAP_V4L2
+                      (e.g. /dev/video10 fed by `make theta-uvc` (gstthetauvc);
+                       works with the pip OpenCV in the container)
+  (neither set)       a default gstthetauvc pipeline built from THETA_MODE
 
-Sharpness is the variance of the Laplacian (computed only for the N candidates,
-not every incoming frame, to save CPU on the Jetson).
+  THETA_MODE          2K (1920×960) or 4K (3840×1920)   default 2K
 
-Camera height (metric scale for PRISM)
---------------------------------------
-Each emitted frame carries the camera's height above the floor at capture time,
-computed by :mod:`kinematics` from the live body state (``SportModeState`` via
-the bridge) + the selfie-stick geometry.  The Go2-W can lie down / stand up, so
-this is not constant.  The server reads it straight from the frame message.
+See docs/setup/robot.md for the host-side libuvc-theta / gstthetauvc setup.
 
-Live config (Zenoh, plain string payloads)
--------------------------------------------
-  {robot}/rt/prism/config/throttle_fps   float, output rate Hz   (default 3.0)
-  {robot}/rt/prism/config/window_size    int, sharpness window   (default 5, odd)
+Best-of-window, camera height, retransmit, live config: identical to the old
+decimator — only the *input* changed (UVC capture instead of a bridged ROS topic).
 
 Environment
 -----------
-  ROBOT_NAME, ZENOH_CONNECT, THROTTLE_FPS, WINDOW_SIZE, JPEG_QUALITY,
-  CAMERA_FPS, IMAGE_TOPIC, SHARPNESS_DOWNSCALE, STICK_OFFSET_{X,Y,Z},
-  FALLBACK_BODY_HEIGHT
+  ROBOT_NAME, ZENOH_CONNECT, THROTTLE_FPS, WINDOW_SIZE, JPEG_QUALITY, LOSSLESS,
+  CAMERA_FPS, SHARPNESS_DOWNSCALE, FALLBACK_BODY_HEIGHT, STICK_OFFSET_{X,Y,Z},
+  THETA_GST_PIPELINE, THETA_DEVICE, THETA_MODE, CAPTURE_RETRY_S
 """
 
 from __future__ import annotations
@@ -58,40 +49,53 @@ from typing import Optional
 import cv2
 import numpy as np
 import zenoh
-from rosbags.typesys import Stores, get_typestore
 
 import vat_protocol as proto
 from kinematics import build_robot_model, RobotStateTracker
+from frame_archive import FrameArchive
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="[%(asctime)s] [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("frame-decimator")
+log = logging.getLogger("theta-camera")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-ROBOT_NAME     = os.environ.get("ROBOT_NAME",     "go2")
-ZENOH_CONNECT  = os.environ.get("ZENOH_CONNECT",  "tcp/127.0.0.1:7447")
-JPEG_QUALITY   = int(os.environ.get("JPEG_QUALITY",   "85"))
-LOSSLESS       = os.environ.get("LOSSLESS", "").lower() in ("1", "true", "yes")
-CAMERA_FPS     = float(os.environ.get("CAMERA_FPS",   "30.0"))
-IMAGE_TOPIC    = os.environ.get("IMAGE_TOPIC",    "equirectangular/image")
-SHARP_DOWNSCALE = float(os.environ.get("SHARPNESS_DOWNSCALE", "0.5"))  # 0<..<=1
+ROBOT_NAME      = os.environ.get("ROBOT_NAME",      "go2")
+ZENOH_CONNECT   = os.environ.get("ZENOH_CONNECT",   "tcp/127.0.0.1:7447")
+JPEG_QUALITY    = int(os.environ.get("JPEG_QUALITY", "85"))
+LOSSLESS        = os.environ.get("LOSSLESS", "").lower() in ("1", "true", "yes")
+CAMERA_FPS      = float(os.environ.get("CAMERA_FPS", "30.0"))
+SHARP_DOWNSCALE = float(os.environ.get("SHARPNESS_DOWNSCALE", "0.5"))
 FALLBACK_BODY_H = float(os.environ.get("FALLBACK_BODY_HEIGHT", "0.30"))
+RETX_BUFFER     = int(os.environ.get("RETX_BUFFER", "256"))
+CAPTURE_RETRY_S = float(os.environ.get("CAPTURE_RETRY_S", "3.0"))
+
+# Capture source
+THETA_GST_PIPELINE = os.environ.get("THETA_GST_PIPELINE", "").strip()
+THETA_DEVICE       = os.environ.get("THETA_DEVICE", "").strip()
+THETA_MODE         = os.environ.get("THETA_MODE", "2K").strip()
+
+# Real-time transmit downscale (0/unset → send the capture resolution as-is)
+TRANSMIT_WIDTH  = int(os.environ.get("TRANSMIT_WIDTH", "0"))
+TRANSMIT_HEIGHT = int(os.environ.get("TRANSMIT_HEIGHT", "0"))
+
+# Full-res frame archive (written off the real-time path; see frame_archive.py)
+ARCHIVE_ENABLE       = os.environ.get("ARCHIVE_ENABLE", "").lower() in ("1", "true", "yes")
+ARCHIVE_DIR          = os.environ.get("ARCHIVE_DIR", "/archive")
+ARCHIVE_MAX_BYTES    = os.environ.get("ARCHIVE_MAX_BYTES", "10GB")
+ARCHIVE_JPEG_QUALITY = int(os.environ.get("ARCHIVE_JPEG_QUALITY", "92"))
 
 _KEYS = proto.keys(ROBOT_NAME)
-KEY_IMAGE        = f"{ROBOT_NAME}/rt/{IMAGE_TOPIC}"
 KEY_OUTPUT       = _KEYS["camera_frame"]
 KEY_FRAME_GET    = _KEYS["camera_frame_get"]
+KEY_ARCHIVE_GET  = _KEYS["camera_archive_get"]
 KEY_THROTTLE_FPS = _KEYS["cfg_throttle_fps"]
 KEY_WINDOW_SIZE  = _KEYS["cfg_window_size"]
-
-# How many recently-emitted frames to keep buffered for on-demand retransmit.
-RETX_BUFFER = int(os.environ.get("RETX_BUFFER", "256"))
 
 # Mutable, live-tunable config
 _throttle_fps: float = float(os.environ.get("THROTTLE_FPS", "3.0"))
@@ -104,46 +108,6 @@ def _get_config():
         return _throttle_fps, _window_size
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ROS2 image CDR decode
-# ─────────────────────────────────────────────────────────────────────────────
-
-_typestore = get_typestore(Stores.ROS2_HUMBLE)
-
-
-def decode_ros_image(cdr_bytes: bytes) -> Optional[tuple[int, np.ndarray]]:
-    """Deserialise a CDR sensor_msgs/Image → (timestamp_ns, bgr).  None on failure."""
-    try:
-        msg = _typestore.deserialize_cdr(cdr_bytes, "sensor_msgs/msg/Image")
-    except Exception as e:
-        log.warning(f"CDR decode failed: {e}")
-        return None
-
-    sec     = int(getattr(msg.header.stamp, "sec", 0))
-    nanosec = int(getattr(msg.header.stamp, "nanosec", 0))
-    ts_ns   = sec * 1_000_000_000 + nanosec or time.time_ns()
-
-    h, w = int(msg.height), int(msg.width)
-    enc  = str(msg.encoding).lower().strip()
-    data = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-    try:
-        if enc in ("rgb8", "rgb"):
-            bgr = cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
-        elif enc in ("bgr8", "bgr"):
-            bgr = data.reshape(h, w, 3).copy()
-        elif enc in ("mono8", "8uc1"):
-            bgr = cv2.cvtColor(data.reshape(h, w), cv2.COLOR_GRAY2BGR)
-        elif enc in ("rgba8",):
-            bgr = cv2.cvtColor(data.reshape(h, w, 4), cv2.COLOR_RGBA2BGR)
-        else:
-            log.warning(f"Unsupported encoding '{enc}' — skipping frame")
-            return None
-    except Exception as e:
-        log.warning(f"Image reshape failed (enc={enc} {w}x{h}): {e}")
-        return None
-    return ts_ns, bgr
-
-
 def sharpness(bgr: np.ndarray) -> float:
     """Variance of Laplacian (higher = sharper).  Downscaled for speed."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -154,7 +118,77 @@ def sharpness(bgr: np.ndarray) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Decimator
+# UVC capture (the Theta-specific part)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _default_gst_pipeline(mode: str) -> str:
+    """A portable (software-decode) gstthetauvc pipeline. For Jetson HW decode,
+    set THETA_GST_PIPELINE with `nvv4l2decoder`/`nvvidconv` instead."""
+    return (f"thetauvcsrc mode={mode} ! queue ! h264parse ! decodebin ! "
+            f"videoconvert ! video/x-raw,format=BGR ! "
+            f"appsink drop=true max-buffers=2 sync=false")
+
+
+def open_capture() -> cv2.VideoCapture:
+    """Open the Theta UVC stream. Tries the configured source; raises on failure."""
+    if THETA_GST_PIPELINE:
+        log.info(f"[Capture] GStreamer pipeline: {THETA_GST_PIPELINE}")
+        return cv2.VideoCapture(THETA_GST_PIPELINE, cv2.CAP_GSTREAMER)
+    if THETA_DEVICE:
+        dev = int(THETA_DEVICE) if THETA_DEVICE.isdigit() else THETA_DEVICE
+        log.info(f"[Capture] v4l2 device: {THETA_DEVICE}")
+        return cv2.VideoCapture(dev, cv2.CAP_V4L2)
+    pipeline = _default_gst_pipeline(THETA_MODE)
+    log.info(f"[Capture] default gstthetauvc pipeline (mode={THETA_MODE}): {pipeline}")
+    return cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+
+
+class ThetaCapture(threading.Thread):
+    """Reads frames from the Theta and pushes them into the decimator."""
+
+    def __init__(self, decimator: "FrameDecimator"):
+        super().__init__(daemon=True)
+        self._decimator = decimator
+        self._stop = threading.Event()
+        self._frames = 0
+
+    def stop(self):
+        self._stop.set()
+
+    @property
+    def frames(self):
+        return self._frames
+
+    def run(self):
+        while not self._stop.is_set():
+            cap = None
+            try:
+                cap = open_capture()
+                if not cap or not cap.isOpened():
+                    log.warning("[Capture] could not open Theta stream — retrying "
+                                f"in {CAPTURE_RETRY_S}s. Is the camera in LIVE mode "
+                                "and the UVC source available? (see docs/setup/robot.md)")
+                    time.sleep(CAPTURE_RETRY_S)
+                    continue
+                log.info("[Capture] Theta stream open. Streaming…")
+                while not self._stop.is_set():
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        log.warning("[Capture] read failed — reopening stream")
+                        break
+                    self._frames += 1
+                    self._decimator.push(time.time_ns(), frame)
+            except Exception as e:
+                log.warning(f"[Capture] error: {e}")
+            finally:
+                if cap is not None:
+                    cap.release()
+            if not self._stop.is_set():
+                time.sleep(CAPTURE_RETRY_S)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Best-of-window decimator  (unchanged logic — input is now UVC, not a ROS topic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -167,12 +201,12 @@ class FrameEntry:
 class FrameDecimator:
     """Best-of-N-frame-window decimator with live camera-height tagging."""
 
-    def __init__(self, z: zenoh.Session, state: RobotStateTracker, model):
+    def __init__(self, z: zenoh.Session, state: RobotStateTracker, model,
+                 archive=None):
         self._z = z
         self._state = state
         self._model = model
-        # Reliable transport: every frame matters for pose estimation, so we
-        # prefer back-pressure (BLOCK) over silent drops.
+        self._archive = archive
         self._pub = self._declare_reliable_publisher(z, KEY_OUTPUT)
         self._buf: deque[FrameEntry] = deque()
         self._lock = threading.Lock()
@@ -180,20 +214,23 @@ class FrameDecimator:
         self._published = 0
         self._skipped = 0
         self._seq = 0
-        # Ring buffer of recently emitted payloads, keyed by seq, for retransmit.
         self._retx: dict[int, bytes] = {}
         self._retx_order: deque[int] = deque()
         self._retx_lock = threading.Lock()
-        # Queryable so the server can re-request a dropped frame by seq.
         try:
             z.declare_queryable(KEY_FRAME_GET, self._on_frame_get)
             log.info(f"[Decimator] retransmit queryable on '{KEY_FRAME_GET}'")
         except Exception as e:
             log.warning(f"[Decimator] could not declare retransmit queryable: {e}")
+        if self._archive is not None:
+            try:
+                z.declare_queryable(KEY_ARCHIVE_GET, self._on_archive_get)
+                log.info(f"[Decimator] archive queryable on '{KEY_ARCHIVE_GET}'")
+            except Exception as e:
+                log.warning(f"[Decimator] could not declare archive queryable: {e}")
 
     @staticmethod
     def _declare_reliable_publisher(z, key):
-        # Newer zenoh supports a reliability kwarg; fall back gracefully.
         for kwargs in (
             dict(congestion_control=zenoh.CongestionControl.BLOCK,
                  reliability=zenoh.Reliability.RELIABLE,
@@ -209,7 +246,6 @@ class FrameDecimator:
         return z.declare_publisher(key)
 
     def _on_frame_get(self, query):
-        """Reply with a buffered frame payload for the requested ?seq=N."""
         try:
             params = query.parameters if hasattr(query, "parameters") else \
                 query.selector.parameters
@@ -227,69 +263,76 @@ class FrameDecimator:
             except Exception:
                 pass
 
+    def _on_archive_get(self, query):
+        try:
+            params = query.parameters if hasattr(query, "parameters") else \
+                query.selector.parameters
+            seq = int(params["seq"]) if "seq" in params else -1
+            payload = self._archive.get(seq) if self._archive is not None else None
+            if payload is not None:
+                query.reply(KEY_ARCHIVE_GET, payload)
+                log.debug(f"[Archive] served seq={seq} ({len(payload)//1024}kB)")
+            else:
+                query.reply_err(f"archive seq {seq} not found".encode())
+        except Exception as e:
+            try:
+                query.reply_err(str(e).encode())
+            except Exception:
+                pass
+
     def push(self, ts_ns: int, bgr: np.ndarray):
         fps, ws = _get_config()
-        ws = max(1, ws | 1)                 # force odd, >=1
+        ws = max(1, ws | 1)
         half = ws // 2
         interval_ns = int(1e9 / max(fps, 0.1))
-        # generous bound on how long to wait for the lookahead half-window
         lookahead_ns = int((half + 0.5) / max(CAMERA_FPS, 1.0) * 1e9)
 
         with self._lock:
             self._buf.append(FrameEntry(ts_ns, bgr))
             if self._next_tick_ns is None:
                 self._next_tick_ns = ts_ns
-
-            # Emit every tick for which we have a complete forward half-window.
             while self._next_tick_ns is not None:
-                emitted = self._try_emit_tick(half, interval_ns, lookahead_ns, ts_ns)
-                if not emitted:
+                if not self._try_emit_tick(half, interval_ns, lookahead_ns, ts_ns):
                     break
-
-            # Bound memory: keep a little more than two windows + one interval.
             max_keep = max(ws + 4, int(2 * CAMERA_FPS / max(fps, 0.1)))
             while len(self._buf) > max_keep:
                 self._buf.popleft()
 
-    def _try_emit_tick(self, half: int, interval_ns: int,
-                       lookahead_ns: int, newest_ns: int) -> bool:
+    def _try_emit_tick(self, half, interval_ns, lookahead_ns, newest_ns) -> bool:
         tick = self._next_tick_ns
         buf = self._buf
         if not buf:
             return False
-
-        # Index of the frame closest in time to this tick.
         center = min(range(len(buf)), key=lambda i: abs(buf[i].ts_ns - tick))
         frames_after = len(buf) - 1 - center
-
-        # Wait for a full forward half-window UNLESS the stream has already moved
-        # well past the tick (avoid stalling if the camera slows/stops).
         have_lookahead = frames_after >= half
         timed_out = newest_ns >= tick + interval_ns + lookahead_ns
         if not have_lookahead and not timed_out:
             return False
-
         lo = max(0, center - half)
         hi = min(len(buf), center + half + 1)
         candidates = list(buf)[lo:hi]
         best = max(candidates, key=lambda e: sharpness(e.bgr))
-
         self._emit(best, n_candidates=len(candidates))
         self._next_tick_ns = tick + interval_ns
         return True
 
     def _emit(self, entry: FrameEntry, n_candidates: int):
+        # Real-time TRANSMIT copy: downscale (if configured) then encode small.
+        tx = entry.bgr
+        if TRANSMIT_WIDTH > 0 and TRANSMIT_HEIGHT > 0:
+            tx = cv2.resize(entry.bgr, (TRANSMIT_WIDTH, TRANSMIT_HEIGHT),
+                            interpolation=cv2.INTER_AREA)
         if LOSSLESS:
-            ok, jbuf = cv2.imencode(".png", entry.bgr)
+            ok, jbuf = cv2.imencode(".png", tx)
         else:
-            ok, jbuf = cv2.imencode(".jpg", entry.bgr,
+            ok, jbuf = cv2.imencode(".jpg", tx,
                                     [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if not ok or jbuf is None:
             log.warning("encode failed — skipping tick")
             self._skipped += 1
             return
 
-        # Camera height at capture time (kinematics + live body state).
         body = self._state.get()
         cam_h = self._model.camera_height(body.body_height, body.rotation)
 
@@ -297,7 +340,6 @@ class FrameDecimator:
         self._seq = (self._seq + 1) & 0xFFFFFFFF
         payload = proto.pack_frame(entry.ts_ns, seq, cam_h, jbuf.tobytes())
 
-        # Buffer for retransmit before publishing.
         with self._retx_lock:
             self._retx[seq] = payload
             self._retx_order.append(seq)
@@ -307,11 +349,16 @@ class FrameDecimator:
         try:
             self._pub.put(payload, encoding=proto.ENC_FRAME)
         except TypeError:
-            self._pub.put(payload)           # older zenoh without encoding kwarg
+            self._pub.put(payload)
         self._published += 1
+
+        # Full-res TWIN → archive (same seq/ts/cam_h). The heavy full-res encode
+        # and disk I/O run on the archive's own thread; submit() never blocks us.
+        if self._archive is not None:
+            self._archive.submit(seq, entry.ts_ns, cam_h, entry.bgr)
+
         log.debug(f"emit seq={seq} ts={entry.ts_ns//1_000_000}ms cam_h={cam_h:.2f}m "
-                  f"cands={n_candidates} size={len(payload)//1024}kB "
-                  f"total={self._published}")
+                  f"cands={n_candidates} tx={len(payload)//1024}kB total={self._published}")
 
     def stats(self) -> str:
         fps, ws = _get_config()
@@ -343,7 +390,7 @@ def _on_window_size(sample):
         val = int(float(bytes(sample.payload).decode().strip()))
         if 1 <= val <= 31:
             with _config_lock:
-                _window_size = val | 1       # force odd
+                _window_size = val | 1
             log.info(f"[Config] window_size → {_window_size}")
         else:
             log.warning(f"[Config] window_size {val} out of range [1, 31]")
@@ -372,35 +419,44 @@ def main():
     z = _open_session()
     fps, ws = _get_config()
     enc_label = "PNG (lossless)" if LOSSLESS else f"JPEG q={JPEG_QUALITY}"
-    log.info(f"Connected. '{KEY_IMAGE}' → '{KEY_OUTPUT}'  @ {fps}Hz  "
+    log.info(f"Connected. Theta UVC → '{KEY_OUTPUT}'  @ {fps}Hz  "
              f"window={ws}  encode={enc_label}")
+    _tx = f"{TRANSMIT_WIDTH}x{TRANSMIT_HEIGHT}" if TRANSMIT_WIDTH > 0 else "capture-res"
+    log.info(f"Transmit={_tx}  archive="
+             f"{('on → ' + ARCHIVE_DIR) if ARCHIVE_ENABLE else 'off'}")
 
     model = build_robot_model()
     state = RobotStateTracker(z, ROBOT_NAME, fallback_body_height=FALLBACK_BODY_H)
-    decimator = FrameDecimator(z, state, model)
 
-    def on_image(sample):
+    archive = None
+    if ARCHIVE_ENABLE:
         try:
-            result = decode_ros_image(bytes(sample.payload))
-            if result is not None:
-                decimator.push(*result)
+            archive = FrameArchive(ARCHIVE_DIR, ARCHIVE_MAX_BYTES,
+                                   jpeg_quality=ARCHIVE_JPEG_QUALITY)
         except Exception as e:
-            log.warning(f"frame handling error: {e}")
+            log.warning(f"[archive] disabled — init failed: {e}")
+            archive = None
+    decimator = FrameDecimator(z, state, model, archive=archive)
 
-    z.declare_subscriber(KEY_IMAGE, on_image)
+    capture = ThetaCapture(decimator)
+    capture.start()
+
     z.declare_subscriber(KEY_THROTTLE_FPS, _on_throttle_fps)
     z.declare_subscriber(KEY_WINDOW_SIZE, _on_window_size)
 
     try:
         while True:
             time.sleep(10)
-            log.info(decimator.stats())
+            extra = f"  {archive.stats()}" if archive is not None else ""
+            log.info(f"{decimator.stats()} captured={capture.frames}{extra}")
     except KeyboardInterrupt:
         pass
     finally:
+        capture.stop()
+        if archive is not None:
+            archive.close()
         z.close()
 
 
 if __name__ == "__main__":
     main()
-# end of frame_decimator.py
