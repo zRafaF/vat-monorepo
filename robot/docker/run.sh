@@ -70,6 +70,7 @@ docker run -d --name "${NAME}" --restart unless-stopped \
     -e ARCHIVE_MAX_BYTES="${ARCHIVE_MAX_BYTES:-10GB}" \
     -e ARCHIVE_JPEG_QUALITY="${ARCHIVE_JPEG_QUALITY:-92}" \
     -e PUBLISH_HZ="${PUBLISH_HZ:-50.0}" \
+    -e SPORT_TOPIC="${SPORT_TOPIC:-lf/sportmodestate}" \
     -e STICK_OFFSET_X="${STICK_OFFSET_X:--0.20}" \
     -e STICK_OFFSET_Y="${STICK_OFFSET_Y:-0.0}" \
     -e STICK_OFFSET_Z="${STICK_OFFSET_Z:-0.55}" \

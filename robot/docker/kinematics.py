@@ -279,8 +279,15 @@ class RobotStateTracker:
     downstream consumers never block or crash."""
 
     def __init__(self, zenoh_session, robot_name: str,
-                 sport_topic: str = "sportmodestate",
+                 sport_topic: Optional[str] = None,
                  fallback_body_height: float = 0.30):
+        # Which sport-state topic to track. The Go2 publishes a high-rate
+        # `/sportmodestate` ONLY while the motion service is active, but always
+        # publishes a low-frequency `/lf/sportmodestate` (~10 Hz). Default to the
+        # always-on lf copy so body/limb state is available even at rest; override
+        # with SPORT_TOPIC=sportmodestate when the high-rate stream is wanted.
+        if sport_topic is None:
+            sport_topic = os.environ.get("SPORT_TOPIC", "lf/sportmodestate")
         self._lock = threading.Lock()
         self._fallback_h = fallback_body_height
         self._state = BodyState(

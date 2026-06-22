@@ -31,6 +31,9 @@ ROUTER     = os.environ.get("ZENOH_ROUTER", "tcp/127.0.0.1:7447")
 ROBOT_NAME = os.environ.get("ROBOT_NAME", "go2")
 SERVER_PREFIX = os.environ.get("SERVER_PREFIX", "server/prism")
 WATCH_S    = float(os.environ.get("WATCH_S", "4.0"))
+# Match the fuser/camera: the high-rate `sportmodestate` only streams while the
+# motion service is active; `lf/sportmodestate` (~10 Hz) is always on.
+SPORT_TOPIC = os.environ.get("SPORT_TOPIC", "lf/sportmodestate")
 
 K = proto.keys(ROBOT_NAME, SERVER_PREFIX)
 
@@ -72,7 +75,7 @@ def discover_topics(z):
 def measure_rates(z):
     keys = {
         "equirectangular/image": f"{ROBOT_NAME}/rt/equirectangular/image",
-        "sportmodestate":        f"{ROBOT_NAME}/rt/sportmodestate",
+        f"{SPORT_TOPIC}":        f"{ROBOT_NAME}/rt/{SPORT_TOPIC}",
         "camera/frame (decim.)": K["camera_frame"],
         "pose (fused)":          K["pose"],
         "pose_correction":       K["pose_correction"],

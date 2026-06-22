@@ -104,6 +104,7 @@ ENV ROBOT_NAME="go2" \
     JPEG_QUALITY="85" \
     CAMERA_FPS="30.0" \
     PUBLISH_HZ="50.0" \
+    SPORT_TOPIC="lf/sportmodestate" \
     ROBOT_MODEL="selfie_stick" \
     STICK_OFFSET_X="-0.20" \
     STICK_OFFSET_Y="0.0" \
