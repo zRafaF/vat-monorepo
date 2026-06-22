@@ -43,6 +43,22 @@ ENV RMW_IMPLEMENTATION="rmw_cyclonedds_cpp"
 COPY robot/docker/requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
+# ── unitree_go messages (so the bridge can forward /sportmodestate) ───────────
+# /sportmodestate is unitree_go/msg/SportModeState — a CUSTOM type. rclpy can
+# only subscribe to a type it can load, so we build a minimal unitree_go
+# interface package (subset matching the firmware layout the client decodes).
+# Best-effort: if the build fails the image still works — the bridge just skips
+# /sportmodestate (Stage 2); standard-typed topics are unaffected.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-colcon-common-extensions \
+        ros-humble-rosidl-default-generators \
+        build-essential cmake \
+    && rm -rf /var/lib/apt/lists/* || true
+COPY robot/docker/unitree_go_msgs /opt/unitree_ws/src/unitree_go
+RUN bash -lc 'source /opt/ros/humble/setup.bash && cd /opt/unitree_ws && \
+        colcon build --packages-select unitree_go' \
+    || echo '[build] WARNING: unitree_go build failed — bridge will skip /sportmodestate'
+
 # Shared wire protocol (single source of truth — lives in repo /common)
 COPY common/vat_protocol.py     /app/
 # Robot-side processes

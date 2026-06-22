@@ -273,8 +273,15 @@ sudo systemctl enable --now vat-theta-uvc.service vat-robot-docker.service
 
 ## 3. Known issue — CycloneDDS interface
 
-On our Go2, ROS failed at startup with `ros2: eth1: does not match an available
-interface`. Pin CycloneDDS to the real interface before any ROS command:
+On our Go2, ROS fails at startup with `<iface>: does not match an available
+interface` when CycloneDDS is bound to a NIC that doesn't exist — this
+crash-loops the bridge (`rcl node's rmw handle is invalid`). **The container
+now auto-detects the interface** (`start.sh` prefers the NIC on the Unitree
+subnet `192.168.123.x`, then the default route, then the first UP NIC), so
+`make robot-docker` should just work. If auto-detect picks the wrong one
+(bridge logs `[no data]`), pin it: set `NET_IFACE=<iface>` in `vat.env`
+(find it with `ip -br addr` on the robot). For ad-hoc `ros2` commands on the
+host, export it manually:
 
 ```bash
 export CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="eth0"/></Interfaces></General></Domain></CycloneDDS>'
@@ -338,12 +345,16 @@ mismatch. The container is built with `rmw_cyclonedds_cpp` + `CYCLONEDDS_URI`;
 /opt/ros/humble/setup.bash && ros2 topic list'`. The bridge logs forwarded
 counts every 10 s (`[forwarded] …`); `[no data]` means QoS/DDS/interface/domain.
 
-!!! warning "Custom Unitree types need their message package in the container"
-    `/sportmodestate` is `unitree_go/msg/SportModeState` (a custom type). The
-    bridge can only forward it once the `unitree_go` messages are available inside
-    the container — needed for Stage 2 (body/limbs) and the live camera-height.
-    Standard types (the camera path) are unaffected. (Follow-up: add `unitree_go`
-    msgs to the image.)
+!!! note "Custom Unitree types are built into the image"
+    `/sportmodestate` is `unitree_go/msg/SportModeState` (a custom type), and
+    the bridge can only forward a type it can load. The image now **builds a
+    minimal `unitree_go` interface package** (`robot/docker/unitree_go_msgs/`,
+    colcon-built and sourced by `start.sh`) so Stage 2 (body/limbs) works.
+    The build is best-effort: if it fails the image still runs and simply
+    skips `/sportmodestate` (the camera path is unaffected). Confirm it works
+    in the bridge logs: `Registered Zenoh route for: /sportmodestate` then
+    `[forwarded] /sportmodestate=N` (N climbing). If you see `[no data]`, it
+    is a DDS interface/QoS issue — see §3.
 
 ---
 

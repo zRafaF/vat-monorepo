@@ -113,16 +113,27 @@ zenoh put -k go2/rt/prism/config/window_size  -v 5     # best-of-5 sharpest
 
 ## Stage 2 — See the body & limbs
 
+Needs the robot container running (`make robot-docker`) — the bridge forwards
+`/sportmodestate` over Zenoh. Nothing else changes on the robot.
+
 **💻 CLIENT:**
 
 ```bash
 make test_robot_state
 ```
 
-✅ Expect: the body frame tilts with the real robot, four feet (FR/FL/RR/RL)
-move in real time, and `body_height` changes when the Go2-W stands/lies. If
-decode fails, your firmware's `unitree_go/SportModeState` layout differs — fix
-the embedded defs in `robot/docker/kinematics.py`.
+✅ Expect a live Rerun view: the body frame tilts with the real robot; the
+**four legs draw as lines** (body → each foot) with FR/FL/RR/RL foot markers;
+the **selfie-stick** shows as a line on the back with the camera at its tip;
+the **live 360° image** renders in the `camera/equirect` panel; and
+`body_height` changes when the Go2-W stands/lies.
+
+If decode fails, your firmware's `unitree_go/SportModeState` layout differs —
+fix the embedded defs in `robot/docker/kinematics.py` (and the matching
+`robot/docker/unitree_go_msgs/msg/SportModeState.msg`). If you see **no** limb
+data at all, the bridge isn't forwarding `/sportmodestate` — check
+`docker logs vat-robot` for the unitree_go overlay + DDS interface (see
+[robot setup §3](setup/robot.md)).
 
 ---
 
