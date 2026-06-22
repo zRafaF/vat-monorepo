@@ -59,18 +59,30 @@ ARG UNITREE_ROS2_REF=master
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git python3-colcon-common-extensions \
         ros-humble-rosidl-default-generators \
+        ros-humble-rosidl-generator-dds-idl \
         build-essential cmake \
     && rm -rf /var/lib/apt/lists/* || true
+# Only unitree_go is needed — it carries SportModeState (odometry/limbs), the
+# single custom type the fuser decodes. unitree_api (the /api/sport/* Request/
+# Response types) is NOT used by VAT and is intentionally not built. unitree_go
+# does not depend on unitree_api, so it builds standalone.
+# NOTE: unitree_go's CMake does find_package(rosidl_generator_dds_idl) — hence
+# ros-humble-rosidl-generator-dds-idl above. Without it the build fails and
+# /sportmodestate silently never forwards. We therefore HARD-FAIL the build if
+# the type can't be imported afterwards, so a broken image never ships quietly.
 RUN git clone --depth 1 --branch "${UNITREE_ROS2_REF}" \
         https://github.com/unitreerobotics/unitree_ros2 /tmp/unitree_ros2 \
     && mkdir -p /opt/unitree_ws/src \
     && cp -r /tmp/unitree_ros2/cyclonedds_ws/src/unitree/unitree_go \
-            /tmp/unitree_ros2/cyclonedds_ws/src/unitree/unitree_api \
             /opt/unitree_ws/src/ \
     && rm -rf /tmp/unitree_ros2 \
     && bash -lc 'source /opt/ros/humble/setup.bash && cd /opt/unitree_ws && \
-        colcon build --packages-select unitree_api unitree_go' \
-    || echo '[build] WARNING: unitree_ros2 msgs unavailable — bridge will skip /sportmodestate'
+        colcon build --packages-select unitree_go' \
+    && bash -lc 'source /opt/ros/humble/setup.bash && \
+        source /opt/unitree_ws/install/setup.bash && \
+        python3 -c "from rosidl_runtime_py.utilities import get_message; \
+        get_message(\"unitree_go/msg/SportModeState\"); \
+        print(\"[build] unitree_go OK — SportModeState importable\")"'
 
 # Shared wire protocol (single source of truth — lives in repo /common)
 COPY common/vat_protocol.py     /app/

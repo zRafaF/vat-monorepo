@@ -78,10 +78,18 @@ source /opt/ros/humble/setup.bash
 # subscribe to /sportmodestate. Best-effort: absent if the build was skipped.
 if [ -f /opt/unitree_ws/install/setup.bash ]; then
     source /opt/unitree_ws/install/setup.bash
-    echo "[start] unitree_go overlay sourced (custom msgs available)"
+fi
+# Verify the TYPE actually imports — a present install/setup.bash does NOT mean
+# the package built (colcon writes it even when 0 packages succeed). This is the
+# real Stage-2 gate: if SportModeState can't load, the bridge silently skips
+# /sportmodestate.
+if python3 -c "from rosidl_runtime_py.utilities import get_message; get_message('unitree_go/msg/SportModeState')" 2>/dev/null; then
+    echo "[start] unitree_go overlay OK — SportModeState importable (/sportmodestate will forward)"
 else
-    echo "[start] NOTE: unitree_go overlay not found — /sportmodestate won't forward"
-    echo "[start]       (Stage 2). Standard-typed topics are unaffected."
+    echo "[start] WARNING: unitree_go/msg/SportModeState NOT importable — /sportmodestate won't"
+    echo "[start]          forward (Stage 2). Rebuild the image; check the unitree_go colcon"
+    echo "[start]          build (needs ros-humble-rosidl-generator-dds-idl). Standard-typed"
+    echo "[start]          topics are unaffected."
 fi
 echo "[start] RMW=$RMW_IMPLEMENTATION  iface=$NET_IFACE  domain=${ROS_DOMAIN_ID:-0}"
 
