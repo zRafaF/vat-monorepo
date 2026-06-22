@@ -44,21 +44,33 @@ ENV RMW_IMPLEMENTATION="rmw_cyclonedds_cpp"
 COPY robot/docker/requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# ── unitree_go messages (so the bridge can forward /sportmodestate) ───────────
+# ── unitree_go / unitree_api messages (so the bridge can forward Go2 topics) ──
 # /sportmodestate is unitree_go/msg/SportModeState — a CUSTOM type. rclpy can
-# only subscribe to a type it can load, so we build a minimal unitree_go
-# interface package (subset matching the firmware layout the client decodes).
-# Best-effort: if the build fails the image still works — the bridge just skips
+# only subscribe to a type it can load, AND because the Go2's Foxy types are
+# FINAL extensibility, CycloneDDS only DELIVERS samples when the subscriber's
+# type matches the publisher's EXACTLY. So we build the REAL, complete message
+# packages from unitree_ros2 — a hand-written subset connects but receives 0
+# msgs. If your firmware's layout still differs (older defs with extra fields
+# like path_point), pin the matching version:
+#   UNITREE_ROS2_REF=<branch|tag> sudo make robot-docker
+# Best-effort: if the clone/build fails the image still runs and just skips
 # /sportmodestate (Stage 2); standard-typed topics are unaffected.
+ARG UNITREE_ROS2_REF=master
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3-colcon-common-extensions \
+        git python3-colcon-common-extensions \
         ros-humble-rosidl-default-generators \
         build-essential cmake \
     && rm -rf /var/lib/apt/lists/* || true
-COPY robot/docker/unitree_go_msgs /opt/unitree_ws/src/unitree_go
-RUN bash -lc 'source /opt/ros/humble/setup.bash && cd /opt/unitree_ws && \
-        colcon build --packages-select unitree_go' \
-    || echo '[build] WARNING: unitree_go build failed — bridge will skip /sportmodestate'
+RUN git clone --depth 1 --branch "${UNITREE_ROS2_REF}" \
+        https://github.com/unitreerobotics/unitree_ros2 /tmp/unitree_ros2 \
+    && mkdir -p /opt/unitree_ws/src \
+    && cp -r /tmp/unitree_ros2/cyclonedds_ws/src/unitree/unitree_go \
+            /tmp/unitree_ros2/cyclonedds_ws/src/unitree/unitree_api \
+            /opt/unitree_ws/src/ \
+    && rm -rf /tmp/unitree_ros2 \
+    && bash -lc 'source /opt/ros/humble/setup.bash && cd /opt/unitree_ws && \
+        colcon build --packages-select unitree_api unitree_go' \
+    || echo '[build] WARNING: unitree_ros2 msgs unavailable — bridge will skip /sportmodestate'
 
 # Shared wire protocol (single source of truth — lives in repo /common)
 COPY common/vat_protocol.py     /app/

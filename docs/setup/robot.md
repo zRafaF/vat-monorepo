@@ -345,17 +345,24 @@ mismatch. The container is built with `rmw_cyclonedds_cpp` + `CYCLONEDDS_URI`;
 /opt/ros/humble/setup.bash && ros2 topic list'`. The bridge logs forwarded
 counts every 10 s (`[forwarded] …`); `[no data]` means QoS/DDS/interface/domain.
 
-!!! note "Custom Unitree types are built into the image"
-    `/sportmodestate` is `unitree_go/msg/SportModeState` (a custom type), and
-    the bridge can only forward a type it can load. The image now **builds a
-    minimal `unitree_go` interface package** (`robot/docker/unitree_go_msgs/`,
-    colcon-built and sourced by `start.sh`) so Stage 2 (body/limbs) works.
-    The build is best-effort: if it fails the image still runs and simply
-    skips `/sportmodestate` (the camera path is unaffected). Confirm it works
-    in the bridge logs: `Registered Zenoh route for: /sportmodestate` then
-    `[forwarded] /sportmodestate=N` (N climbing). If you see `[no data]`, it
-    is a DDS interface/QoS issue — see §3.
+!!! note "Custom Unitree types are built into the image (full unitree_ros2)"
+    `/sportmodestate` is `unitree_go/msg/SportModeState`, a CUSTOM type — and
+    because the Go2 (Foxy) types are **FINAL** extensibility, CycloneDDS only
+    *delivers* samples when the subscriber's type matches the publisher's
+    **exactly** (a trimmed subset connects but receives **0 msgs**). The image
+    therefore clones the **full [`unitree_ros2`](https://github.com/unitreerobotics/unitree_ros2)**
+    package (`unitree_go` + `unitree_api`) and colcon-builds it; `start.sh`
+    sources the overlay. Pin the version with `UNITREE_ROS2_REF` in `vat.env`.
+    Confirm in the bridge logs: `Registered Zenoh route for: /sportmodestate`
+    then `[forwarded] /sportmodestate=N` (N climbing).
 
+    If it stays `[no data]` after a rebuild: (1) the publisher's **QoS** — the
+    bridge now defaults a BEST_EFFORT subscriber when it can't read the
+    publisher QoS, which fixes the common case; (2) your **firmware's layout**
+    differs from the pinned `unitree_ros2` — run
+    `ros2 interface show unitree_go/msg/SportModeState` **on the Go2 host** and
+    pin `UNITREE_ROS2_REF` to the matching branch/tag (older defs carry extra
+    fields like `path_point`).
 ---
 
 ## 5. Performance — keep the robot↔robot hops off the VPN (recommended)
