@@ -108,6 +108,7 @@ ENV ROBOT_NAME="go2" \
     CAMERA_FPS="30.0" \
     PUBLISH_HZ="50.0" \
     SPORT_TOPIC="lf/sportmodestate" \
+    ODOM_TOPIC="utlidar/robot_odom" \
     TELEOP_RATE_HZ="20.0" \
     TELEOP_TIMEOUT_S="0.3" \
     TELEOP_MAX_VX="0.3" \

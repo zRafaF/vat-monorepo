@@ -538,6 +538,79 @@ class LowStateTracker:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Odometry tracker  (nav_msgs/Odometry — the fuser's propagation source)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class OdometryTracker:
+    """Tracks the robot's onboard odometry (``nav_msgs/Odometry``, default
+    ``/utlidar/robot_odom``) — an always-on, already-integrated pose + twist.
+
+    This is the fuser's propagation source. It is far more reliable than
+    integrating ``SportModeState.velocity``: the low-frequency ``lf/`` relay
+    zeros that field (just as it zeros ``foot_position_body``), and the high-rate
+    copy is only alive while the motion service drives. ``robot_odom`` is a
+    standard ROS type, so it decodes with the built-in typestore (no custom
+    defs), and it carries a real integrated position that drifts slowly — exactly
+    the odometry the EKF/placeholder wants."""
+
+    def __init__(self, zenoh_session, robot_name: str,
+                 odom_topic: str = "utlidar/robot_odom"):
+        self._lock = threading.Lock()
+        self._pose = Transform()           # T_odom_base
+        self._lin = np.zeros(3)            # body-frame linear velocity (m/s)
+        self._ang = np.zeros(3)            # body-frame angular velocity (rad/s)
+        self._valid = False
+        self._stamp_ns = 0
+        self._decode = self._build_decoder()
+        self._logged_failure = False
+
+        key = f"{robot_name}/rt/{odom_topic}"
+        try:
+            zenoh_session.declare_subscriber(key, self._on_odom)
+            log.info(f"[OdomTracker] Subscribed to '{key}'")
+        except Exception as e:
+            log.warning(f"[OdomTracker] Could not subscribe to '{key}': {e}")
+
+    def _build_decoder(self):
+        try:
+            from rosbags.typesys import Stores, get_typestore
+            ts = get_typestore(Stores.ROS2_HUMBLE)   # nav_msgs/Odometry is built in
+            return lambda cdr: ts.deserialize_cdr(cdr, "nav_msgs/msg/Odometry")
+        except Exception as e:
+            log.warning(f"[OdomTracker] Decoder unavailable ({e}); odom off.")
+            return None
+
+    def _on_odom(self, sample):
+        if self._decode is None:
+            return
+        try:
+            m = self._decode(bytes(sample.payload))
+            p = m.pose.pose.position
+            q = m.pose.pose.orientation
+            tl = m.twist.twist.linear
+            ta = m.twist.twist.angular
+            pose = Transform.from_xyz_quat([p.x, p.y, p.z], [q.x, q.y, q.z, q.w])
+            with self._lock:
+                self._pose = pose
+                self._lin = np.array([tl.x, tl.y, tl.z], dtype=np.float64)
+                self._ang = np.array([ta.x, ta.y, ta.z], dtype=np.float64)
+                self._valid = True
+                self._stamp_ns = time.time_ns()
+        except Exception as e:
+            if not self._logged_failure:
+                log.warning(f"[OdomTracker] Odometry decode failed ({e}); "
+                            "odom disabled. (logged once)")
+                self._logged_failure = True
+
+    def get(self):
+        """Returns (T_odom_base, lin_vel_body, ang_vel_body, valid)."""
+        with self._lock:
+            return (Transform(self._pose.rotation.copy(), self._pose.translation.copy()),
+                    self._lin.copy(), self._ang.copy(), self._valid)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Self-test:  python kinematics.py
 # ─────────────────────────────────────────────────────────────────────────────
 

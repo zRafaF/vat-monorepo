@@ -94,7 +94,7 @@ def main():
             if bgr is not None:
                 rr.log("camera/equirect", rr.Image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
             if cam_h >= 0:
-                rr.log("state/camera_height_m", rr.Scalar(float(cam_h)))
+                rr.log("state/camera_height_m", rr.Scalars(float(cam_h)))
         except Exception as e:
             print(f"  camera decode error: {e}")
 
@@ -152,10 +152,10 @@ def main():
             # ── scalars ─────────────────────────────────────────────────────
             speed = float(np.linalg.norm(body.linear_velocity))
             drift = float(np.hypot(px, py))   # distance from start (= drift, no GT)
-            rr.log("state/body_height_m", rr.Scalar(z_h))
-            rr.log("state/speed_mps", rr.Scalar(speed))
-            rr.log("state/drift_m", rr.Scalar(drift))
-            rr.log("state/fix_corrected", rr.Scalar(1.0 if fix_corrected else 0.0))
+            rr.log("state/body_height_m", rr.Scalars(z_h))
+            rr.log("state/speed_mps", rr.Scalars(speed))
+            rr.log("state/drift_m", rr.Scalars(drift))
+            rr.log("state/fix_corrected", rr.Scalars(1.0 if fix_corrected else 0.0))
 
             n += 1
             if n % 60 == 0:
