@@ -41,7 +41,7 @@ import zenoh
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "common"))
 import vat_protocol as proto  # noqa: E402
-from vat_protocol import quat_identity, quat_normalize, quat_slerp, integrate_pose  # noqa: E402
+from vat_protocol import quat_identity, quat_normalize, quat_mul, quat_slerp, integrate_pose  # noqa: E402
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -58,6 +58,19 @@ SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))  # reconciliati
 
 _KEYS = proto.keys(ROBOT_NAME, SERVER_PREFIX)
 RESET_KEY = f"{SERVER_PREFIX}/cmd/reset"   # viewer → server: wipe the map
+
+
+def _yaw_quat(deg: float) -> np.ndarray:
+    """Quaternion (xyzw) for a yaw of ``deg`` about world +Z."""
+    r = np.deg2rad(deg)
+    return np.array([0.0, 0.0, np.sin(r / 2), np.cos(r / 2)], dtype=np.float32)
+
+
+def _rot_z(deg: float, v: np.ndarray) -> np.ndarray:
+    """Rotate vector ``v`` about world +Z by ``deg`` (for the alignment knob)."""
+    r = np.deg2rad(deg)
+    c, s = np.cos(r), np.sin(r)
+    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1], v[2]], dtype=np.float32)
 
 # Go2-W footprint (approx, metres): length × width × height
 ROBOT_HALF = np.array([0.35, 0.16, 0.18], dtype=np.float32)
@@ -195,6 +208,12 @@ class PRISMViewer:
 
         self._cloud = LocalCloud()
         self._predictor = PosePredictor()
+        # client-side frame-alignment + telemetry state
+        self._yaw_offset_deg = float(os.environ.get("CLOUD_YAW_OFFSET_DEG", "0"))
+        self._last_cloud_t = 0.0
+        self._last_pose_t = 0.0
+        self._cloud_count = 0
+        self._last_tel_t = 0.0
 
         log.info(f"[Viewer] Connecting to Zenoh at {ZENOH_ROUTER}...")
         conf = zenoh.Config()
@@ -213,8 +232,9 @@ class PRISMViewer:
 
         self._pub_reset = self._z.declare_publisher(RESET_KEY)
         threading.Thread(target=self._stdin_loop, daemon=True).start()
-        log.info("[Viewer] Press 'r' + Enter to RESET the map "
-                 "(clears the server TSDF and every client's cloud).")
+        log.info("[Viewer] Controls (type then Enter): 'r' reset map | "
+                 "'y <deg>' set cloud↔robot yaw | '+'/'-' nudge yaw ±5°  "
+                 f"(start {self._yaw_offset_deg:.0f}°)")
 
         if request_snapshot:
             self._request_snapshot()
@@ -240,6 +260,8 @@ class PRISMViewer:
         except proto.ProtocolError as e:
             log.warning(f"[Viewer] pcd decode: {e}")
             return
+        self._last_cloud_t = time.monotonic()
+        self._cloud_count += 1
         if is_snap:
             self._cloud.apply_snapshot(v, xyz, rgb)
         else:
@@ -260,6 +282,7 @@ class PRISMViewer:
         except proto.ProtocolError as e:
             log.warning(f"[Viewer] pose decode: {e}")
             return
+        self._last_pose_t = time.monotonic()
         self._predictor.on_pose(pose)
 
     def _on_status(self, sample):
@@ -270,13 +293,31 @@ class PRISMViewer:
             pass
 
     def _stdin_loop(self):
-        """Read simple keyboard commands from the terminal. 'r' resets the map."""
+        """Keyboard control: 'r' reset · 'y <deg>' set yaw · '+'/'-' nudge yaw."""
         try:
             for line in sys.stdin:
-                if line.strip().lower() in ("r", "reset"):
+                cmd = line.strip().lower()
+                if cmd in ("r", "reset"):
                     self._reset_map()
+                elif cmd in ("+", "="):
+                    self._set_yaw(self._yaw_offset_deg + 5)
+                elif cmd in ("-", "_"):
+                    self._set_yaw(self._yaw_offset_deg - 5)
+                elif cmd.startswith("y"):
+                    rest = cmd[1:].strip()
+                    if rest in ("", "?"):
+                        log.info(f"[Viewer] yaw offset = {self._yaw_offset_deg:.0f}°")
+                    else:
+                        try:
+                            self._set_yaw(float(rest))
+                        except ValueError:
+                            log.warning("[Viewer] usage: 'y <deg>' | '+'/'-' ±5° | 'r' reset")
         except Exception:
             pass
+
+    def _set_yaw(self, deg: float):
+        self._yaw_offset_deg = float(deg)
+        log.info(f"[Viewer] cloud↔robot yaw offset = {self._yaw_offset_deg:.0f}°")
 
     def _reset_map(self):
         log.info("[Viewer] RESET → clearing local cloud + asking server to wipe map")
@@ -319,15 +360,32 @@ class PRISMViewer:
                 colors = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
                 rr.log(RR_PCD, rr.Points3D(positions=xyz, colors=colors, radii=0.01))
 
-            # robot avatar (every frame, predicted)
+            # robot avatar (every frame, predicted) — apply the manual yaw knob
+            # so the operator can align the robot frame with the cloud frame.
             pred = self._predictor.step(dt)
             if pred is not None:
                 pos, quat, fix, age = pred
+                yo = self._yaw_offset_deg
+                if yo:
+                    pos = _rot_z(yo, pos)
+                    quat = quat_normalize(quat_mul(_yaw_quat(yo), quat)).astype(np.float32)
                 rr.log(RR_ROBOT, rr.Transform3D(
                     translation=pos, rotation=rr.Quaternion(xyzw=quat)))
                 color = [80, 220, 120] if fix == proto.FIX_CORRECTED else [255, 190, 60]
                 rr.log(f"{RR_ROBOT}/body",
                        rr.Boxes3D(half_sizes=[ROBOT_HALF], colors=[color]))
+
+            # telemetry (throttled ~5 Hz): freshness of the two streams + knob.
+            if now - self._last_tel_t > 0.2:
+                self._last_tel_t = now
+                cloud_age = (now - self._last_cloud_t) if self._last_cloud_t else -1.0
+                pose_age = (now - self._last_pose_t) if self._last_pose_t else -1.0
+                rr.log("telemetry/cloud_age_s", rr.Scalars(max(cloud_age, 0.0)))
+                rr.log("telemetry/pose_age_s", rr.Scalars(max(pose_age, 0.0)))
+                rr.log("telemetry/yaw_offset_deg", rr.Scalars(self._yaw_offset_deg))
+                rr.log("telemetry/log", rr.TextLog(
+                    f"cloud_age={cloud_age:5.1f}s  pose_age={pose_age:5.1f}s  "
+                    f"clouds={self._cloud_count}  yaw={self._yaw_offset_deg:+.0f}°"))
 
             time.sleep(max(0.0, period - (time.monotonic() - now)))
 

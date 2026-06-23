@@ -259,9 +259,13 @@ def _camera_pose_from_matrix(M):
     if M is None:
         return None
     M = np.asarray(M, dtype=np.float64)
-    if M.shape != (4, 4):
+    if M.shape != (4, 4) or not np.all(np.isfinite(M)):
         return None
-    return M[:3, 3].astype(np.float32), _rotmat_to_quat(M[:3, :3]).astype(np.float32)
+    pos = M[:3, 3]
+    quat = _rotmat_to_quat(M[:3, :3])
+    if not (np.all(np.isfinite(pos)) and np.all(np.isfinite(quat))):
+        return None      # degenerate extrinsics → fall back to heading-from-tangent
+    return pos.astype(np.float32), quat.astype(np.float32)
 
 
 def _camera_pose_from_trajectory(traj: np.ndarray):
