@@ -57,6 +57,7 @@ DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))    # then ramp velo
 SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))  # reconciliation time const
 
 _KEYS = proto.keys(ROBOT_NAME, SERVER_PREFIX)
+RESET_KEY = f"{SERVER_PREFIX}/cmd/reset"   # viewer → server: wipe the map
 
 # Go2-W footprint (approx, metres): length × width × height
 ROBOT_HALF = np.array([0.35, 0.16, 0.18], dtype=np.float32)
@@ -78,13 +79,31 @@ class LocalCloud:
         self._blocks: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self._version = 0
         self._dirty = False
+        self._cleared = False
 
     def apply_snapshot(self, version, xyz, rgb):
+        if xyz.shape[0] == 0:        # server sent an empty snapshot → reset signal
+            self.clear()
+            log.info(f"[Cloud] empty snapshot v{version} → cleared")
+            return
         with self._lock:
             self._blocks = {0: (xyz, rgb)}
             self._version = version
             self._dirty = True
         log.info(f"[Cloud] snapshot v{version}: {xyz.shape[0]} pts")
+
+    def clear(self):
+        with self._lock:
+            self._blocks = {}
+            self._version = 0
+            self._dirty = False
+            self._cleared = True
+
+    def pop_cleared(self) -> bool:
+        with self._lock:
+            c = self._cleared
+            self._cleared = False
+            return c
 
     def apply_delta(self, version, xyz, rgb, since_version):
         if xyz.shape[0] == 0:
@@ -192,6 +211,11 @@ class PRISMViewer:
         log.info(f"[Viewer] subscribed: pcd, trajectory, status, pose "
                  f"('{_KEYS['pose']}')")
 
+        self._pub_reset = self._z.declare_publisher(RESET_KEY)
+        threading.Thread(target=self._stdin_loop, daemon=True).start()
+        log.info("[Viewer] Press 'r' + Enter to RESET the map "
+                 "(clears the server TSDF and every client's cloud).")
+
         if request_snapshot:
             self._request_snapshot()
 
@@ -245,6 +269,23 @@ class PRISMViewer:
         except Exception:
             pass
 
+    def _stdin_loop(self):
+        """Read simple keyboard commands from the terminal. 'r' resets the map."""
+        try:
+            for line in sys.stdin:
+                if line.strip().lower() in ("r", "reset"):
+                    self._reset_map()
+        except Exception:
+            pass
+
+    def _reset_map(self):
+        log.info("[Viewer] RESET → clearing local cloud + asking server to wipe map")
+        try:
+            self._pub_reset.put(b"reset")
+        except Exception as e:
+            log.warning(f"[Viewer] reset publish failed: {e}")
+        self._cloud.clear()
+
     def _request_snapshot(self):
         log.info(f"[Viewer] requesting snapshot from '{_KEYS['pcd_snapshot']}'...")
         try:
@@ -266,6 +307,10 @@ class PRISMViewer:
             now = time.monotonic()
             dt = now - last
             last = now
+
+            # map reset → drop the rendered cloud
+            if self._cloud.pop_cleared():
+                rr.log(RR_PCD, rr.Clear(recursive=True))
 
             # point cloud (only when changed)
             cloud = self._cloud.take_if_dirty()

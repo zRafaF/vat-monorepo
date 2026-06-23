@@ -106,6 +106,9 @@ NADIR_LIMIT   = float(os.environ.get("NADIR_LIMIT", "-70"))
 
 _KEYS = proto.keys(ROBOT_NAME, SERVER_PREFIX)
 
+# Client → server command: wipe the TSDF map + frame buffer and start fresh.
+RESET_KEY = f"{SERVER_PREFIX}/cmd/reset"
+
 
 @dataclass
 class IncomingFrame:
@@ -146,6 +149,16 @@ class OnlinePRISMSession:
         self._frames: dict[int, FrameInput] = {}
         self._lock = threading.Lock()
         self._last_processed_seq = -1
+
+    def reset_map(self):
+        """Wipe all accumulated state: clears the frame buffer and rebuilds the
+        engine (fresh nvblox TSDF + colorizer). Caller must ensure no window is
+        being processed concurrently (the server gates this on ``_processing``)."""
+        with self._lock:
+            self._frames.clear()
+            self._last_processed_seq = -1
+        self.engine.reset()
+        log.info("[PRISM] Map reset — TSDF + colorizer + frame buffer cleared.")
 
     def add_frame(self, seq: int, frame: IncomingFrame) -> bool:
         """Store a frame by seq.  Returns True if it was new."""
@@ -234,6 +247,7 @@ class MappingServer:
         self._gap_count = 0
         self._frame_rx = 0
         self._last_hb = time.time()
+        self._reset_requested = False
         self._mask = get_spherical_valid_mask(
             TARGET_HEIGHT, TARGET_WIDTH, zenith_deg=ZENITH_LIMIT, nadir_deg=NADIR_LIMIT)
 
@@ -265,6 +279,7 @@ class MappingServer:
 
         self._z.declare_subscriber(_KEYS["camera_frame"], self._on_camera_frame)
         self._z.declare_queryable(_KEYS["pcd_snapshot"], self._on_snapshot_query)
+        self._z.declare_subscriber(RESET_KEY, self._on_reset)
 
         # Batching driver: N-frames-or-timeout, whichever first.
         threading.Thread(target=self._batch_loop, daemon=True).start()
@@ -358,6 +373,34 @@ class MappingServer:
         except Exception:
             log.error(f"[Server] snapshot query error:\n{traceback.format_exc()}")
 
+    # ── map reset (client command) ────────────────────────────────────────────
+
+    def _on_reset(self, sample):
+        log.info("[Server] reset command received.")
+        self._reset_requested = True
+
+    def _do_reset(self):
+        """Wipe the map. Runs from the batch loop only when no window is being
+        processed, so it can't race process_sequence."""
+        self._reset_requested = False
+        log.info("[Server] >> RESET: clearing TSDF map + frame buffer…")
+        try:
+            self._prism.reset_map()
+        except Exception:
+            log.error(f"[Server] reset failed:\n{traceback.format_exc()}")
+            return
+        self._max_seq_seen = -1
+        self._gap_count = 0
+        self._last_window_t = time.time()
+        # Tell every connected client to drop its cloud: an empty snapshot (v0).
+        try:
+            empty = np.zeros((0, 3), dtype=np.float32)
+            self._pub_snapshot.put(proto.pack_pcd(0, empty, empty, is_snapshot=True))
+        except Exception:
+            log.error(f"[Server] reset clear-publish failed:\n{traceback.format_exc()}")
+        self._publish_status("reset")
+        log.info("[Server] >> RESET done. Rebuilding from new frames.")
+
     # ── frame-drop recovery ───────────────────────────────────────────────────
 
     def _recover_gaps(self):
@@ -393,6 +436,9 @@ class MappingServer:
         while True:
             time.sleep(0.1)
             if self._prism is None or self._processing:
+                continue
+            if self._reset_requested:
+                self._do_reset()
                 continue
             total, _lo, _hi, new = self._prism.stats()
             now = time.time()

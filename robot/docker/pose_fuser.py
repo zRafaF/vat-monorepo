@@ -42,7 +42,7 @@ import zenoh
 
 import vat_protocol as proto
 from vat_protocol import PoseState, FIX_CORRECTED, FIX_DEADRECKON
-from kinematics import build_robot_model, LowStateTracker, Transform
+from kinematics import build_robot_model, LowStateTracker, RobotStateTracker, Transform
 from estimator import WheelInertialEstimator
 
 logging.basicConfig(
@@ -73,6 +73,11 @@ class PoseFuser:
         self._z = z
         self._model = build_robot_model()
         self._low = LowStateTracker(z, ROBOT_NAME)            # IMU + wheel odom
+        # Body height (stand↔prone) from SportModeState — the vertical channel the
+        # planar wheel/IMU dead-reckoner can't provide. Drives the published Z.
+        self._body = RobotStateTracker(
+            z, ROBOT_NAME,
+            fallback_body_height=float(os.environ.get("FALLBACK_BODY_HEIGHT", "0.30")))
         self._est = WheelInertialEstimator(att_gain=ATT_GAIN,
                                            pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
         self._lock = threading.Lock()
@@ -113,12 +118,16 @@ class PoseFuser:
     def _publish_once(self):
         now = time.time_ns()
         imu_quat, gyro, body_vx, valid = self._low.get_odom()
+        body = self._body.get()
         with self._lock:
             dt = (now - self._last_pub_ns) * 1e-9
             self._last_pub_ns = now
             self._est.predict(imu_quat, gyro, body_vx, valid, dt)
             self._seq += 1
             pos, quat, world_vel = self._est.state()
+            # Vertical comes from body height (map floor = Z 0), so the avatar
+            # rises/lowers with the dog's stance instead of staying pinned.
+            pos[2] = body.body_height
             corrected = (now - self._est.last_correction_ns) < FIX_HOLD_S * 1e9
             fix = FIX_CORRECTED if (self._est.have_vggt and corrected) else FIX_DEADRECKON
 
