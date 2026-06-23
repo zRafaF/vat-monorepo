@@ -114,7 +114,20 @@ zenoh put -k go2/rt/prism/config/window_size  -v 5     # best-of-5 sharpest
 ## Stage 2 — See the body & limbs
 
 Needs the robot container running (`make robot-docker`) — the bridge forwards
-`/sportmodestate` over Zenoh. Nothing else changes on the robot.
+`lf/sportmodestate` (body state) and `/lowstate` (joint angles) over Zenoh.
+Nothing else changes on the robot.
+
+> **State topic — `lf/` by default.** The Go2-W only publishes the high-rate
+> `/sportmodestate` while the *motion service is actively driving*; at rest it is
+> silent. It always publishes the low-frequency `lf/sportmodestate` (~10 Hz), so
+> `SPORT_TOPIC` defaults to that in `vat.env`. Set `SPORT_TOPIC=sportmodestate`
+> for the full-rate stream once the dog is up and being driven.
+>
+> **Limbs come from `/lowstate` FK, not `foot_position_body`.** On the Go2-W
+> `SportModeState.foot_position_body` is all zeros, so the viz computes each
+> leg's hip→thigh→knee→foot from the `/lowstate` joint angles via forward
+> kinematics (`leg_fk` in `robot/docker/kinematics.py`, geometry from
+> `go2_description`).
 
 **💻 CLIENT:**
 
@@ -123,17 +136,70 @@ make test_robot_state
 ```
 
 ✅ Expect a live Rerun view: the body frame tilts with the real robot; the
-**four legs draw as lines** (body → each foot) with FR/FL/RR/RL foot markers;
+**four legs draw as lines** (hip→knee→foot) with FR/FL/RR/RL foot markers;
 the **selfie-stick** shows as a line on the back with the camera at its tip;
 the **live 360° image** renders in the `camera/equirect` panel; and
 `body_height` changes when the Go2-W stands/lies.
 
-If decode fails, your firmware's `unitree_go/SportModeState` layout differs —
-fix the embedded defs in `robot/docker/kinematics.py` (and the matching
-`robot/docker/unitree_go_msgs/msg/SportModeState.msg`). If you see **no** limb
-data at all, the bridge isn't forwarding `/sportmodestate` — check
-`docker logs vat-robot` for the unitree_go overlay + DDS interface (see
-[robot setup §3](setup/robot.md)).
+If you see **no** limb data, check that `/lowstate` is flowing
+(`docker logs vat-robot`, and the unitree_go overlay built — Stage 0). If body
+state is missing, the bridge isn't forwarding `lf/sportmodestate` — check the
+unitree_go overlay + DDS interface (see [robot setup §3](setup/robot.md)).
+
+---
+
+## Stage 2.5 — Dead-reckoned motion (no cloud yet)
+
+Still only the robot container — **no mapping server required.** The on-robot
+fuser (`pose_fuser.py`) runs a placeholder estimator: it takes the body attitude
+from the IMU (complementary-filtered with the gyro) and **integrates the leg/
+wheel-odometry velocity** to produce a dead-reckoned global pose, published at
+`PUBLISH_HZ` (50 Hz default) on `go2/prism/pose`. The same `make test_robot_state`
+view now places the avatar at that pose and draws a **trail**.
+
+```bash
+make test_robot_state      # then drive with `make teleop` in another shell
+```
+
+✅ Expect: as you drive, the robot avatar **moves and leaves a trail**, coloured
+**amber** (dead-reckoning on odometry only — no VGGT correction yet). `drift_m`
+grows; with no ground truth this drift is exactly what we want to observe — it
+shows how well the odometry + attitude estimate holds before the cloud anchors
+it. Returning to the start should bring the avatar *roughly* back; the gap is the
+accumulated drift. When Stage 3's mapping server is added, corrections turn the
+avatar **green** and pull the drift out.
+
+> This is intentionally a placeholder, not an EKF. The data path and message
+> contract (`go2/prism/pose`, full pose+velocity payload) are what matter; a real
+> filter drops in behind the same Zenoh key. See `docs/architecture.md` →
+> *Estimator choice*.
+
+---
+
+## Teleop — driving the robot 🕹️
+
+Drive the Go2-W from the client over Zenoh, with a deadman + e-stop. Needs the
+robot container running (it supervises `teleop_bridge.py`).
+
+```bash
+# 💻 CLIENT
+make teleop
+#   W/S = forward/back   A/D = turn   Q/E = strafe
+#   SPACE = e-stop (latched)   R = re-arm   -/= = speed   Ctrl-C = quit
+```
+
+How it works: the client streams `cmd_vel` (`go2/teleop/cmd_vel`) at ~20 Hz; the
+robot's `teleop_bridge` relays it to the Go2 sport `Move` API
+(`/api/sport/request`, api_id 1008). **Safety is layered:**
+
+- **Deadman** — if the command stream pauses for `TELEOP_TIMEOUT_S` (0.3 s) the
+  bridge sends `StopMove`. Release the keys / drop the link → the robot stops.
+- **E-stop** — `SPACE` latches a flag that forces `Damp` (compliant); `R` re-arms.
+- **Clamps** — `TELEOP_MAX_VX/VY/VYAW` in `vat.env` hard-cap speed on the robot.
+- **Hardware** — the physical Unitree remote always overrides; keep it in hand.
+
+Driving also activates the motion service, which brings up the high-rate
+`/sportmodestate` (useful if you switch `SPORT_TOPIC` for a faster state feed).
 
 ---
 
@@ -187,7 +253,8 @@ moves smoothly (predicted between pose samples), green/amber by fix quality.
 | 🤖 ROBOT | `make robot-docker` | 0+ |
 | 💻 CLIENT | `make test_link` | 0 |
 | 🤖 ROBOT `make test_frames_robot` / 💻 CLIENT `make test_frames_server` | | 1 |
-| 💻 CLIENT | `make test_robot_state` | 2 |
+| 💻 CLIENT | `make test_robot_state` (body + FK limbs + dead-reckoned trail) | 2 / 2.5 |
+| 💻 CLIENT | `make teleop` (drive the robot — deadman + e-stop) | 2.5 |
 | 💻 CLIENT | `make test_poses` | 3 |
 | 💻 CLIENT | `make viewer` | 4 |
 

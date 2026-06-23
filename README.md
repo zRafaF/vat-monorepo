@@ -23,9 +23,10 @@ RICOH Theta X ──UVC──▶ theta_camera (robot, docker)
                          ├─ downscale → {robot}/prism/camera/frame  (1036×518 JPEG → server)
                          └─ full-res 4K twin → local SQLite archive (10 GB rolling, fetch by seq)
 
-dynamic_bridge (robot) ── ROS odometry (/sportmodestate) ──▶ Zenoh
+dynamic_bridge (robot) ── ROS state (lf/sportmodestate, /lowstate) ──▶ Zenoh
 mapping_server (server, GPU) ── PanoVGGT depth+pose + Nvblox TSDF ──▶ point-cloud deltas + trajectory
 pose path:  server VGGT pose ─▶ dog fuses w/ odometry ─▶ authoritative pose ─▶ client predicts
+control path:  client cmd_vel ─▶ teleop_bridge ─▶ Go2 sport Move API (deadman + e-stop)
 prism_rerun_viewer (client) ── point cloud + predicted robot block in Rerun 3D
 ```
 
@@ -53,10 +54,10 @@ vat-monorepo/
 ├── client/                 ← Rerun viewer + bring-up tools env
 ├── robot/
 │   ├── theta/theta_uvc.sh  ← Theta X UVC → /dev/video10 (gstthetauvc loopback)
-│   ├── docker/             ← bridge + theta_camera + frame_archive + pose_fuser + Dockerfile
+│   ├── docker/             ← bridge + theta_camera + frame_archive + pose_fuser + teleop_bridge + Dockerfile
 │   ├── unitree_go_msgs/    ← minimal unitree_go interfaces built into the image
 │   └── systemd/            ← auto-start units
-├── tools/                  ← view_frames / view_robot_state / view_poses / theta_pub / fetch_archive …
+├── tools/                  ← view_frames / view_robot_state / view_poses / teleop_keyboard / theta_pub / fetch_archive …
 └── docs/                   ← mkdocs site (architecture, setup, bring-up runbook)
 ```
 
@@ -93,10 +94,18 @@ Walk it up in stages — `make steps` prints the ordered runbook, and
 | 0 | `make test_link` | router + bridge alive, non-zero rates |
 | 1 | `make test_frames_server` | live 360° frames over Zenoh (decimated) |
 | 1 | `make theta-stream` (robot) | headless camera → Zenoh, no display needed |
-| 2 | `make test_robot_state` | body + leg lines + selfie-stick + live camera |
+| 2 | `make test_robot_state` | body + FK leg lines + selfie-stick + live camera |
+| 2.5 | `make test_robot_state` + `make teleop` | dead-reckoned motion + drift trail while driving |
 | 3 | `make test_poses` | camera trajectory + fused robot pose |
 | 4 | `make viewer` | the full POC |
 | — | `make fetch_frame SEQ=N` | pull one full-res archived frame by seq |
+
+> **Driving the robot:** `make teleop` streams `cmd_vel` from your keyboard
+> (WASD) to the on-robot `teleop_bridge`, which relays to the Go2 sport `Move`
+> API. It is safe by construction — a **deadman** stops the robot the instant the
+> command stream pauses, `SPACE` is a latched **e-stop**, and speeds are clamped
+> (`TELEOP_MAX_*`). Keep the physical remote in hand. See
+> [`docs/bringup.md`](docs/bringup.md) → *Teleop*.
 
 `make help` lists every target.
 
