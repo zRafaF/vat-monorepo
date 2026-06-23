@@ -38,10 +38,18 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 export PATH="/root/.local/bin:${PATH}"
 
-# ── 4. Repo + submodules (PRISM-VGGT) ───────────────────────────────────────
+# ── 4. Repo refresh + submodules (PRISM-VGGT) ───────────────────────────────
+# The clone is persisted in ./container_workspace, so pull on every boot —
+# otherwise pushed fixes never reach a long-lived container.
 cd "$REPO"
 git config --global --add safe.directory "$REPO" || true
+REF="${GIT_REF:-main}"
+log "Refreshing repo to '${REF}'..."
+git fetch origin "$REF" || git fetch origin || true
+git reset --hard FETCH_HEAD 2>/dev/null || git reset --hard "origin/${REF}" 2>/dev/null || \
+  log "WARN: could not fast-forward to ${REF}; using existing checkout."
 log "Updating submodules (PRISM-VGGT)..."
+git submodule sync --recursive || true
 git submodule update --init --recursive
 
 # ── 5. Python envs (prebuilt nvblox = default; already validated on this box) ─

@@ -44,10 +44,19 @@ services:
       - NET_ADMIN          # required for Tailscale kernel-mode networking
     devices:
       - /dev/net/tun:/dev/net/tun
+    # Bootstrap: clone on first boot, else hard-refresh to the latest GIT_REF —
+    # so pushed fixes (incl. an updated entrypoint.sh) always take effect on
+    # `docker compose up -d`, with no host-side volume deletion needed.
     command: >
       bash -c "set -e;
       command -v git >/dev/null 2>&1 || (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates);
-      if [ ! -d /root/vat-monorepo/.git ]; then git clone --recurse-submodules --branch \"$$GIT_REF\" \"$$GIT_REPO_URL\" /root/vat-monorepo; fi;
+      if [ ! -d /root/vat-monorepo/.git ]; then
+        git clone --recurse-submodules --branch \"$$GIT_REF\" \"$$GIT_REPO_URL\" /root/vat-monorepo;
+      else
+        git config --global --add safe.directory /root/vat-monorepo;
+        git -C /root/vat-monorepo fetch origin \"$$GIT_REF\" && git -C /root/vat-monorepo reset --hard FETCH_HEAD;
+        git -C /root/vat-monorepo submodule update --init --recursive;
+      fi;
       exec bash /root/vat-monorepo/server/deploy/entrypoint.sh"
     deploy:
       resources:
