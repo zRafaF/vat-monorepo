@@ -1,0 +1,58 @@
+# VAT — Server deployment (GPU workstation)
+# =========================================================================
+# Self-contained: copy ONLY this file (+ a .env, see .env.example) onto the lab
+# workstation and run `docker compose up -d`. The container then clones
+# vat-monorepo, installs everything, joins Tailscale as its OWN node, and starts
+# the Zenoh router. Nothing is installed on the host — not even the repo.
+#
+#   - Tailscale runs INSIDE the container (kernel mode, own state, own node).
+#     It does NOT touch any Tailscale instance already running on the host.
+#   - The Zenoh router auto-starts and listens on :7447 over the container's
+#     Tailscale interface. Robot + client dial this node.
+#   - The GPU mapping server is MANUAL: SSH in and run `make mapping` (below).
+#
+# Required: a Tailscale auth key in .env (TS_AUTHKEY). See .env.example.
+# =========================================================================
+services:
+  vat-server:
+    image: nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
+    container_name: vat-server
+    hostname: vat-server
+    restart: unless-stopped
+    ports:
+      - "2222:22"          # local host-port SSH fallback. Tailscale SSH also enabled.
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      # nvblox ships a non-manylinux wheel; let uv accept it (prebuilt = default).
+      - UV_SKIP_WHEEL_FILENAME_CHECK=1
+      # Use the apt-installed Python 3.12, not a uv-managed download.
+      - UV_PYTHON_PREFERENCE=system
+      # ---- deployment knobs (override in .env next to this file) ----
+      - GIT_REPO_URL=${GIT_REPO_URL:-https://github.com/zRafaF/vat-monorepo.git}
+      - GIT_REF=${GIT_REF:-main}
+      - TS_AUTHKEY=${TS_AUTHKEY:?Set TS_AUTHKEY in .env (Tailscale auth key)}
+      - TS_HOSTNAME=${TS_HOSTNAME:-vat-server}
+      - ROUTER_PORT=${ROUTER_PORT:-7447}
+      - ROOT_PASSWORD=${ROOT_PASSWORD:-lab_password}
+    volumes:
+      # Container home — cloned repo, uv cache, venvs and model weights persist
+      # on the host across restarts (but the host never reads/uses them).
+      - ./container_workspace:/root
+      # Tailscale node identity persists, so restarts don't burn a new auth.
+      - ./tailscale_state:/var/lib/tailscale
+    cap_add:
+      - NET_ADMIN          # required for Tailscale kernel-mode networking
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    command: >
+      bash -c "set -e;
+      command -v git >/dev/null 2>&1 || (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates);
+      if [ ! -d /root/vat-monorepo/.git ]; then git clone --recurse-submodules --branch \"$$GIT_REF\" \"$$GIT_REPO_URL\" /root/vat-monorepo; fi;
+      exec bash /root/vat-monorepo/server/deploy/entrypoint.sh"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

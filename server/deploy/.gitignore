@@ -1,0 +1,5 @@
+# Local secrets and runtime state — never commit
+.env
+container_workspace/
+tailscale_state/
+*.log
