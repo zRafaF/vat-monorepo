@@ -12,6 +12,66 @@ clashes with the mapper's CUDA stack.
 
 ---
 
+## Containerized deployment (GPU workstation — recommended)
+
+On the lab GPU workstation both microservices run inside **one self-contained
+Docker container** defined in [`server/deploy/`](https://github.com/zRafaF/vat-monorepo/tree/main/server/deploy)
+(see its `README.md`). You copy **only** `docker-compose.yml` (+ a `.env`) onto
+the workstation — the container then clones the repo, installs everything, joins
+Tailscale as its **own node**, and starts the router. Nothing lands on the host.
+
+```bash
+# on the workstation, in an empty dir holding docker-compose.yml + .env
+docker compose up -d
+docker compose logs -f          # first run is slow: clone + uv sync + weights
+```
+
+What it does:
+
+- **Tailscale runs *inside* the container** (kernel mode, own state, own node),
+  so it never touches a Tailscale instance already on the host. The container
+  shows up in the admin console as `vat-server` (set via `TS_HOSTNAME`).
+- **The Zenoh router auto-starts** on `:7447` over the container's Tailscale
+  interface. Robot and client dial this node — set `ROUTER_IP=vat-server` (or its
+  `100.x` Tailscale IP) in the **robot's** and **client's** `vat.env`.
+- **The GPU mapping server is manual.** SSH in and run it from the repo; inside
+  the container the router is local, so point the mapper at localhost:
+
+```bash
+tailscale ssh root@vat-server            # or: ssh root@<host> -p 2222
+cd /root/vat-monorepo
+make mapping ROUTER_IP=127.0.0.1
+```
+
+!!! tip "Applying updates / clearing the container"
+    The bootstrap **hard-refreshes the clone to the latest `GIT_REF` on every
+    boot**, so after you push a fix, just recreate the container:
+
+    ```bash
+    docker compose up -d --force-recreate
+    ```
+
+    This re-runs the bootstrap (`git fetch origin && git reset --hard FETCH_HEAD`)
+    and picks up pushed changes — no host-side file deletion needed. The cloned
+    repo and venvs live in the root-owned `./container_workspace/` volume, so if
+    you ever must wipe it, do it from a throwaway root container:
+
+    ```bash
+    docker compose down
+    docker run --rm -v "$PWD/container_workspace:/w" \
+      nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04 rm -rf /w/vat-monorepo
+    docker compose up -d
+    ```
+
+> Requires the NVIDIA Container Toolkit on the host (GPU passthrough) and
+> `/dev/net/tun` + `NET_ADMIN` (for in-container Tailscale). `nvblox` installs
+> from the **prebuilt** wheel (the default), validated on this workstation.
+
+The sections below describe the **manual / bare-metal** alternative (router and
+mapper run directly on the host), useful for a non-containerized server.
+
+---
+
 ## 1. Zenoh router microservice
 
 We run the router from **pure Python** (a `router`-mode Zenoh session) rather

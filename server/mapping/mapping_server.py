@@ -81,6 +81,14 @@ FACE_SIZE     = int(os.environ.get("FACE_SIZE",    "512"))
 WINDOW_SIZE   = int(os.environ.get("WINDOW_SIZE",  "10"))
 OVERLAP       = int(os.environ.get("OVERLAP",      "3"))
 
+# Stopgap (rolling local map): StreamingWindowEngine.process_sequence() resets
+# per call, so replaying the WHOLE buffer each cycle is O(N) and grows without
+# bound (latency + snapshot size). Until the engine gets an online add_frame()/
+# step() API, cap the replay to the last REPLAY_TAIL frames so each cycle stays
+# bounded and the viewer is real-time — at the cost of a rolling (not globally
+# accumulated) map. Set REPLAY_TAIL=0 to restore the old full-replay behaviour.
+REPLAY_TAIL   = int(os.environ.get("REPLAY_TAIL",  str(WINDOW_SIZE * 3)))
+
 # Batching: process when N new frames arrive OR this many seconds elapse.
 WINDOW_TIMEOUT_S = float(os.environ.get("WINDOW_TIMEOUT_S", "2.0"))
 MIN_NEW_FRAMES   = int(os.environ.get("MIN_NEW_FRAMES", "1"))
@@ -137,7 +145,7 @@ class OnlinePRISMSession:
 
         self._frames: dict[int, FrameInput] = {}
         self._lock = threading.Lock()
-        self._last_processed_count = 0
+        self._last_processed_seq = -1
 
     def add_frame(self, seq: int, frame: IncomingFrame) -> bool:
         """Store a frame by seq.  Returns True if it was new."""
@@ -156,9 +164,9 @@ class OnlinePRISMSession:
         with self._lock:
             if not self._frames:
                 return 0, None, None, 0
-            seqs = self._frames.keys()
-            return (len(self._frames), min(seqs), max(seqs),
-                    len(self._frames) - self._last_processed_count)
+            seqs = sorted(self._frames)
+            new = sum(1 for s in seqs if s > self._last_processed_seq)
+            return len(self._frames), seqs[0], seqs[-1], new
 
     def missing_seqs(self, lo: int, hi: int) -> list[int]:
         with self._lock:
@@ -166,9 +174,11 @@ class OnlinePRISMSession:
 
     def run_until_latest(self):
         with self._lock:
-            n = len(self._frames)
-            frames = [self._frames[s] for s in sorted(self._frames)]
-        if n < WINDOW_SIZE:
+            all_seqs = sorted(self._frames)
+            tail_seqs = all_seqs[-REPLAY_TAIL:] if REPLAY_TAIL > 0 else all_seqs
+            frames = [self._frames[s] for s in tail_seqs]
+            max_seq = tail_seqs[-1] if tail_seqs else -1
+        if len(frames) < WINDOW_SIZE:
             return None
 
         last_pcd_dict, last_traj = None, None
@@ -184,7 +194,14 @@ class OnlinePRISMSession:
             return None
 
         with self._lock:
-            self._last_processed_count = n
+            self._last_processed_seq = max_seq
+            # Prune old frames so memory + replay stay bounded (rolling stopgap),
+            # keeping enough history for gap recovery (_recover_gaps looks back
+            # ~2×WINDOW_SIZE).
+            keep = max(REPLAY_TAIL, WINDOW_SIZE * 2) + WINDOW_SIZE
+            if len(self._frames) > keep:
+                for s in sorted(self._frames)[:-keep]:
+                    del self._frames[s]
         return last_pcd_dict, last_traj
 
 
@@ -403,8 +420,10 @@ class MappingServer:
         self._processing = True
         t0 = time.time()
         total, _lo, _hi, _new = self._prism.stats()
-        log.info(f"[Server] >> mapping ({trigger}): running PRISM on {total} frames "
-                 f"(window={WINDOW_SIZE}, overlap={OVERLAP})…")
+        processing = min(total, REPLAY_TAIL) if REPLAY_TAIL > 0 else total
+        log.info(f"[Server] >> mapping ({trigger}): replaying last {processing} of "
+                 f"{total} buffered frames (window={WINDOW_SIZE}, overlap={OVERLAP}, "
+                 f"tail={REPLAY_TAIL})…")
         try:
             self._recover_gaps()           # fill dropped frames before processing
             t_infer = time.time()
