@@ -5,7 +5,7 @@ description = "VAT mapping server — runs the PRISM-VGGT pipeline and streams p
 # A STANDALONE microservice (excluded from the root workspace) with its own
 # isolated env, so its heavy CUDA/torch stack never touches the client/router.
 #   cd server/mapping && uv sync && uv run python mapping_server.py
-requires-python = ">=3.10"
+requires-python = "==3.12.*"   # match PRISM-VGGT (PanoVGGT/torch cu128 stack is 3.12-only)
 dependencies = [
     # Transport
     "eclipse-zenoh>=1.0",
@@ -27,18 +27,21 @@ dependencies = [
 # build/package mapping_server.py — it's run as a script (uv run python …).
 package = false
 
-# ── PRISM-VGGT as a local editable path dep ───────────────────────────────────
-# The submodule now lives at server/mapping/PRISM-VGGT.  After cloning:
+# ── PyTorch CUDA index ────────────────────────────────────────────────────────
+# torch/vision/audio are transitive deps of prism-vggt, but uv only honours the
+# index/sources of the ROOT project being synced — NOT those of a path dep. So
+# we must re-declare the cu128 index here (mirrors PRISM-VGGT/pyproject.toml),
+# or torch resolves to the CPU wheel and the prebuilt nvblox ABI mismatches.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+# ── PRISM-VGGT as a local editable path dep + torch routed to the cu128 index ─
+# The submodule lives at server/mapping/PRISM-VGGT.  After cloning:
 #   git submodule update --init server/mapping/PRISM-VGGT
 [tool.uv.sources]
 prism-vggt = { path = "PRISM-VGGT", editable = true }
-
-# ── PyTorch CUDA index (uncomment + adjust for your CUDA version) ─────────────
-# [[tool.uv.index]]
-# name = "pytorch-cu121"
-# url = "https://download.pytorch.org/whl/cu121"
-# explicit = true
-#
-# [tool.uv.sources]
-# torch = { index = "pytorch-cu121" }
-# torchvision = { index = "pytorch-cu121" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
