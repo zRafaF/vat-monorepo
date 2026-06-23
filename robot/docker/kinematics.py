@@ -215,10 +215,19 @@ def build_robot_model() -> RobotModel:
             base_link=os.environ.get("BASE_LINK", "base"),
         )
     # selfie_stick (default)
-    ox = float(os.environ.get("STICK_OFFSET_X", "-0.20"))
+    ox = float(os.environ.get("STICK_OFFSET_X", "0.0"))
     oy = float(os.environ.get("STICK_OFFSET_Y", "0.0"))
-    oz = float(os.environ.get("STICK_OFFSET_Z", "0.55"))
-    return SelfieStickModel(offset_xyz=(ox, oy, oz))
+    oz = float(os.environ.get("STICK_OFFSET_Z", "0.80"))
+    # Camera→base rotation. PanoVGGT reports the camera in an OPTICAL frame
+    # (x right, y down, z forward = equirect centre), but the base is REP-103
+    # (x forward, y left, z up). The default maps optical→base. If the panorama's
+    # "front" isn't the robot's forward, dial STICK_YAW_TRIM_DEG until the avatar's
+    # heading lines up with the cloud.
+    r, p, y = (float(v) for v in
+               os.environ.get("STICK_MOUNT_RPY_DEG", "-90,0,-90").split(","))
+    yaw_trim = float(os.environ.get("STICK_YAW_TRIM_DEG", "0"))
+    mount_rpy = (np.deg2rad(r), np.deg2rad(p), np.deg2rad(y + yaw_trim))
+    return SelfieStickModel(offset_xyz=(ox, oy, oz), mount_rpy=mount_rpy)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

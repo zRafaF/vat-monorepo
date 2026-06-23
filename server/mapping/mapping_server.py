@@ -206,6 +206,16 @@ class OnlinePRISMSession:
             log.error(f"[PRISM] Engine error:\n{traceback.format_exc()}")
             return None
 
+        # Real camera extrinsics for the orientation correction (true VGGT pose,
+        # not the trajectory tangent). Same leveled world frame as the cloud.
+        last_cam = None
+        try:
+            _ts, _poses = self.engine.get_poses()
+            if len(_poses):
+                last_cam = np.asarray(_poses[-1], dtype=np.float64)
+        except Exception:
+            last_cam = None
+
         with self._lock:
             self._last_processed_seq = max_seq
             # Prune old frames so memory + replay stay bounded (rolling stopgap),
@@ -215,12 +225,48 @@ class OnlinePRISMSession:
             if len(self._frames) > keep:
                 for s in sorted(self._frames)[:-keep]:
                     del self._frames[s]
-        return last_pcd_dict, last_traj
+        return last_pcd_dict, last_traj, last_cam
+
+
+def _rotmat_to_quat(R: np.ndarray) -> np.ndarray:
+    """3x3 rotation matrix → quaternion (x, y, z, w)."""
+    R = np.asarray(R, dtype=np.float64)
+    t = np.trace(R)
+    if t > 0.0:
+        s = np.sqrt(t + 1.0) * 2.0
+        w, x, y, z = (0.25 * s, (R[2, 1] - R[1, 2]) / s,
+                      (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s)
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        w, x, y, z = ((R[2, 1] - R[1, 2]) / s, 0.25 * s,
+                      (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s)
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        w, x, y, z = ((R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s,
+                      0.25 * s, (R[1, 2] + R[2, 1]) / s)
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        w, x, y, z = ((R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s,
+                      (R[1, 2] + R[2, 1]) / s, 0.25 * s)
+    q = np.array([x, y, z, w], dtype=np.float64)
+    return q / (np.linalg.norm(q) + 1e-12)
+
+
+def _camera_pose_from_matrix(M):
+    """Real camera pose (position + orientation) from a 4x4 camera-to-world
+    matrix — the TRUE VGGT extrinsics, in the same leveled world frame as the
+    cloud. This is the proper correction; heading-from-tangent was a placeholder."""
+    if M is None:
+        return None
+    M = np.asarray(M, dtype=np.float64)
+    if M.shape != (4, 4):
+        return None
+    return M[:3, 3].astype(np.float32), _rotmat_to_quat(M[:3, :3]).astype(np.float32)
 
 
 def _camera_pose_from_trajectory(traj: np.ndarray):
-    """Best-effort camera pose for the correction (position + heading-from-tangent
-    orientation placeholder).  TODO: use true VGGT per-keyframe extrinsics."""
+    """Fallback only: position + heading-from-tangent orientation (used when the
+    engine hasn't produced full extrinsics yet)."""
     traj = np.asarray(traj, dtype=np.float64)
     if traj.ndim != 2 or traj.shape[0] == 0:
         return None
@@ -480,7 +526,7 @@ class MappingServer:
                 log.info(f"[Server] submap skipped — engine returned nothing "
                          f"({total} frames, {infer_s:.2f}s)")
                 return
-            pcd_dict, traj = result
+            pcd_dict, traj, cam_pose = result
             if pcd_dict is None:
                 log.info(f"[Server] no point cloud yet — PRISM warming up "
                          f"({total} frames, {infer_s:.2f}s)")
@@ -502,7 +548,7 @@ class MappingServer:
             if traj is not None and len(traj) > 0:
                 traj_np = np.asarray(traj, dtype=np.float32)
                 self._pub_traj.put(proto.pack_trajectory(traj_np))
-                self._publish_pose_correction(version, traj_np)
+                self._publish_pose_correction(version, cam_pose, traj_np)
 
             elapsed = time.time() - t0
             self._publish_status("processing", {
@@ -517,8 +563,12 @@ class MappingServer:
         finally:
             self._processing = False
 
-    def _publish_pose_correction(self, version, traj_np):
-        pose = _camera_pose_from_trajectory(traj_np)
+    def _publish_pose_correction(self, version, cam_pose, traj_np):
+        # Prefer the real VGGT extrinsics; fall back to heading-from-tangent only
+        # if the engine hasn't exposed a full pose yet.
+        pose = _camera_pose_from_matrix(cam_pose)
+        if pose is None:
+            pose = _camera_pose_from_trajectory(traj_np)
         if pose is None:
             return
         pos, quat = pose
