@@ -258,7 +258,110 @@ MSG: unitree_go/msg/TimeSpec
 int32 sec
 uint32 nanosec
 """,
+    # LowState carries the per-joint motor angles (q) at ~500 Hz — we use the 12
+    # leg joints for forward kinematics (the Go2-W does NOT populate
+    # SportModeState.foot_position_body, so FK is the only way to draw limbs).
+    "unitree_go/msg/LowState": """
+uint8[2] head
+uint8 level_flag
+uint8 frame_reserve
+uint32[2] sn
+uint32[2] version
+uint16 bandwidth
+IMUState imu_state
+MotorState[20] motor_state
+BmsState bms_state
+int16[4] foot_force
+int16[4] foot_force_est
+uint32 tick
+uint8[40] wireless_remote
+uint8 bit_flag
+float32 adc_reel
+int8 temperature_ntc1
+int8 temperature_ntc2
+float32 power_v
+float32 power_a
+uint16[4] fan_frequency
+uint32 reserve
+uint32 crc
+================================================================================
+MSG: unitree_go/msg/IMUState
+float32[4] quaternion
+float32[3] gyroscope
+float32[3] accelerometer
+float32[3] rpy
+int8 temperature
+================================================================================
+MSG: unitree_go/msg/MotorState
+uint8 mode
+float32 q
+float32 dq
+float32 ddq
+float32 tau_est
+float32 q_raw
+float32 dq_raw
+float32 ddq_raw
+int8 temperature
+uint32 lost
+uint32[2] reserve
+================================================================================
+MSG: unitree_go/msg/BmsState
+uint8 version_high
+uint8 version_low
+uint8 status
+uint8 soc
+int32 current
+uint16 cycle
+int8[2] bq_ntc
+int8[2] mcu_ntc
+uint16[15] cell_vol
+""",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Go2 / Go2-W leg forward kinematics  (draw the limbs from /lowstate joint angles)
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometry from go2_description/xacro/const.xacro (metres). Same for Go2 and the
+# wheeled Go2-W hip→thigh→calf chain; on the Go2-W the calf tip is the wheel hub.
+_L_ABD   = 0.0955    # thigh_offset: hip abduction link, along ±y
+_L_THIGH = 0.213     # thigh_length
+_L_CALF  = 0.213     # calf_length
+# Hip joint origins in the base frame (x fwd, y left, z up — REP-103).
+_HIP_OFFSET = {
+    "FR": np.array([ 0.1934, -0.0465, 0.0]),
+    "FL": np.array([ 0.1934,  0.0465, 0.0]),
+    "RR": np.array([-0.1934, -0.0465, 0.0]),
+    "RL": np.array([-0.1934,  0.0465, 0.0]),
+}
+_SIDE_SIGN = {"FR": -1.0, "FL": 1.0, "RR": -1.0, "RL": 1.0}
+# unitree_go LowState.motor_state index order: FR(0-2) FL(3-5) RR(6-8) RL(9-11),
+# each [hip, thigh, calf]. (Go2-W wheels are 12-15; we ignore them for FK.)
+LEG_ORDER = ["FR", "FL", "RR", "RL"]
+
+
+def leg_fk(leg: str, q_hip: float, q_thigh: float, q_calf: float) -> dict:
+    """Forward kinematics for one Go2 leg.
+
+    Returns the hip, thigh-root, knee and foot/wheel points in the **base frame**
+    (metres). Standard Unitree quadruped chain: hip rotates the leg about +x,
+    thigh and calf are pitch joints about +y."""
+    s = _SIDE_SIGN[leg]
+    c1, s1 = np.cos(q_hip),   np.sin(q_hip)
+    c2, s2 = np.cos(q_thigh), np.sin(q_thigh)
+    c23, s23 = np.cos(q_thigh + q_calf), np.sin(q_thigh + q_calf)
+    L1 = _L_ABD * s
+    # points in the hip frame
+    thigh_root = np.array([0.0, L1 * c1, L1 * s1])
+    knee = np.array([-_L_THIGH * s2,
+                     L1 * c1 + _L_THIGH * s1 * c2,
+                     L1 * s1 - _L_THIGH * c1 * c2])
+    foot = np.array([-_L_CALF * s23 - _L_THIGH * s2,
+                     L1 * c1 + _L_CALF * s1 * c23 + _L_THIGH * s1 * c2,
+                     L1 * s1 - _L_CALF * c1 * c23 - _L_THIGH * c1 * c2])
+    hip = _HIP_OFFSET[leg]
+    return {"hip": hip, "thigh_root": hip + thigh_root,
+            "knee": hip + knee, "foot": hip + foot}
 
 
 @dataclass
@@ -367,6 +470,74 @@ class RobotStateTracker:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Low-level joint tracker  (per-leg FK from /lowstate, for limb visualisation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class LowStateTracker:
+    """Tracks the 12 leg joint angles from the bridged ``LowState`` and exposes
+    each leg's hip→thigh→knee→foot points in the base frame via :func:`leg_fk`.
+
+    Best-effort, like :class:`RobotStateTracker`: if the message can't be decoded
+    it simply reports ``valid=False`` and empty legs — never raises. Used by the
+    Stage-2 viz to draw the limbs on the Go2-W (whose SportModeState foot array
+    is zero)."""
+
+    def __init__(self, zenoh_session, robot_name: str,
+                 lowstate_topic: str = "lowstate"):
+        self._lock = threading.Lock()
+        self._legs: dict = {}        # leg → {hip,thigh_root,knee,foot}
+        self._valid = False
+        self._stamp_ns = 0
+        self._decode = self._build_decoder()
+        self._logged_failure = False
+
+        key = f"{robot_name}/rt/{lowstate_topic}"
+        try:
+            zenoh_session.declare_subscriber(key, self._on_lowstate)
+            log.info(f"[LowStateTracker] Subscribed to '{key}' (leg FK)")
+        except Exception as e:
+            log.warning(f"[LowStateTracker] Could not subscribe to '{key}': {e}")
+
+    def _build_decoder(self):
+        try:
+            from rosbags.typesys import Stores, get_typestore, get_types_from_msg
+            ts = get_typestore(Stores.ROS2_HUMBLE)
+            registered = {}
+            for name, definition in _UNITREE_MSG_DEFS.items():
+                registered.update(get_types_from_msg(definition, name))
+            ts.register(registered)
+            return lambda cdr: ts.deserialize_cdr(cdr, "unitree_go/msg/LowState")
+        except Exception as e:
+            log.warning(f"[LowStateTracker] Decoder unavailable ({e}); legs off.")
+            return None
+
+    def _on_lowstate(self, sample):
+        if self._decode is None:
+            return
+        try:
+            msg = self._decode(bytes(sample.payload))
+            q = [float(m.q) for m in msg.motor_state[:12]]
+            legs = {}
+            for i, leg in enumerate(LEG_ORDER):
+                legs[leg] = leg_fk(leg, q[3 * i], q[3 * i + 1], q[3 * i + 2])
+            with self._lock:
+                self._legs = legs
+                self._valid = True
+                self._stamp_ns = time.time_ns()
+        except Exception as e:
+            if not self._logged_failure:
+                log.warning(f"[LowStateTracker] LowState decode failed ({e}); "
+                            "legs disabled. Check the unitree_go layout. (once)")
+                self._logged_failure = True
+
+    def get(self):
+        """Returns (legs_dict, valid). legs_dict maps leg→{hip,thigh_root,knee,foot}."""
+        with self._lock:
+            return dict(self._legs), self._valid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Self-test:  python kinematics.py
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -400,7 +571,23 @@ def _selftest():
     pitch = quat_from_rotvec([0, np.pi / 2, 0])
     h_pitched = model.camera_height(0.30, pitch)
     assert abs(h_pitched - (0.30 + (-(-0.2)) * 0 + 0.0)) < 0.3  # roughly body height + stick x-proj
-    print(f"kinematics self-test OK  (h_level={h_level:.3f}m  h_pitched={h_pitched:.3f}m)")
+
+    # 5) Leg FK: all joints zero → leg hangs straight down from the hip.
+    fr = leg_fk("FR", 0.0, 0.0, 0.0)
+    assert np.allclose(fr["hip"], [0.1934, -0.0465, 0.0], atol=1e-6), fr["hip"]
+    # foot directly below the hip in x, ~0.426 m below in z (thigh+calf straight)
+    assert abs(fr["foot"][0] - fr["hip"][0]) < 1e-6, fr["foot"]
+    assert abs(fr["foot"][2] - (-(_L_THIGH + _L_CALF))) < 1e-6, fr["foot"]
+    assert fr["foot"][1] < fr["hip"][1]            # FR abduction link points -y (right)
+    assert fr["knee"][2] > fr["foot"][2]           # knee sits above the foot
+    # FL mirrors FR across the body centreline (y=0)
+    fl = leg_fk("FL", 0.0, 0.0, 0.0)
+    assert abs(fr["foot"][1] + fl["foot"][1]) < 1e-6, (fr["foot"][1], fl["foot"][1])
+    # a bent stance (thigh fwd, calf back) lifts the foot toward the body
+    stance = leg_fk("FR", 0.0, 0.8, -1.5)
+    assert stance["foot"][2] > fr["foot"][2], stance["foot"]
+    print(f"kinematics self-test OK  (h_level={h_level:.3f}m  h_pitched={h_pitched:.3f}m  "
+          f"FR foot@zero={np.round(fr['foot'],3)}  stance_z={stance['foot'][2]:.3f})")
 
 
 if __name__ == "__main__":

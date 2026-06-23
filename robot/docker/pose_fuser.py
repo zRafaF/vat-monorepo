@@ -35,7 +35,7 @@ import os
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -60,6 +60,7 @@ ZENOH_CONNECT = os.environ.get("ZENOH_CONNECT", "tcp/127.0.0.1:7447")
 PUBLISH_HZ    = float(os.environ.get("PUBLISH_HZ",          "50.0"))
 POS_GAIN      = float(os.environ.get("CORRECTION_POS_GAIN", "0.5"))   # 0..1 blend
 ROT_GAIN      = float(os.environ.get("CORRECTION_ROT_GAIN", "0.5"))   # 0..1 slerp
+ATT_GAIN      = float(os.environ.get("ATTITUDE_GAIN",       "0.08"))  # gyro→IMU blend
 FIX_HOLD_S    = float(os.environ.get("FIX_HOLD_S",          "1.0"))
 
 _KEYS = proto.keys(ROBOT_NAME)
@@ -74,6 +75,7 @@ _KEYS = proto.keys(ROBOT_NAME)
 class FuseState:
     position: np.ndarray            # world frame
     orientation: np.ndarray         # world frame, xyzw
+    world_lin_vel: np.ndarray = field(default_factory=lambda: np.zeros(3))  # last world vel
     seq: int = 0
     have_anchor: bool = False       # has a VGGT correction ever arrived?
     last_correction_ns: int = 0
@@ -82,13 +84,28 @@ class FuseState:
     def initial() -> "FuseState":
         return FuseState(np.zeros(3), quat_identity())
 
-    def predict(self, world_lin_vel: np.ndarray, body_ang_vel: np.ndarray,
-                dt: float):
-        """Dead-reckon forward by dt (the part a real EKF would do better)."""
+    def predict(self, imu_quat: np.ndarray, body_ang_vel: np.ndarray,
+                body_lin_vel: np.ndarray, valid: bool, dt: float):
+        """Odometry dead-reckoning, the placeholder's core estimate.
+
+        Orientation: integrate the gyro for a smooth high-rate step, then
+        complementary-blend toward the IMU's gravity-referenced absolute attitude
+        (``imu_quat``) — drift-free in roll/pitch, only yaw slowly wanders.
+        Position: integrate the body-frame odometry velocity rotated into the
+        world frame. With no global (VGGT) correction yet, position accumulates
+        drift — which is exactly the Stage-2.5 signal: see *how* it drifts.
+        """
         if dt <= 0:
             return
-        self.position, self.orientation = integrate_pose(
-            self.position, self.orientation, world_lin_vel, body_ang_vel, dt)
+        # gyro-integrated orientation (q ⊗ Δq); reuse integrate_pose for the quat
+        _, q_gyro = integrate_pose(self.position, self.orientation,
+                                   np.zeros(3), body_ang_vel, dt)
+        if valid:
+            self.orientation = quat_slerp(q_gyro, imu_quat, ATT_GAIN).astype(np.float32)
+        else:
+            self.orientation = np.asarray(q_gyro, dtype=np.float32)
+        self.world_lin_vel = quat_rotate(self.orientation, body_lin_vel).astype(np.float32)
+        self.position = (self.position + self.world_lin_vel * dt).astype(np.float32)
 
     def correct(self, base_world: Transform, now_ns: int):
         """Anchor the dead-reckoned pose to the VGGT-derived base pose."""
@@ -157,12 +174,12 @@ class PoseFuser:
             dt = (now - self._last_pub_ns) * 1e-9
             self._last_pub_ns = now
 
-            # body-frame linear velocity → world frame using current orientation
-            world_lin_vel = quat_rotate(self._fuse.orientation, body.linear_velocity)
-            body_ang_vel = body.angular_velocity
-
-            self._fuse.predict(world_lin_vel, body_ang_vel, dt)
+            # complementary attitude (gyro + IMU absolute) + odometry position
+            self._fuse.predict(body.rotation, body.angular_velocity,
+                               body.linear_velocity, body.valid, dt)
             self._fuse.seq += 1
+            world_lin_vel = self._fuse.world_lin_vel
+            body_ang_vel = body.angular_velocity
 
             corrected = (now - self._fuse.last_correction_ns) < FIX_HOLD_S * 1e9
             fix = FIX_CORRECTED if (self._fuse.have_anchor and corrected) else FIX_DEADRECKON
