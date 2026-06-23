@@ -71,7 +71,7 @@ docker run -d --name "${NAME}" --restart unless-stopped \
     -e ARCHIVE_JPEG_QUALITY="${ARCHIVE_JPEG_QUALITY:-92}" \
     -e PUBLISH_HZ="${PUBLISH_HZ:-50.0}" \
     -e SPORT_TOPIC="${SPORT_TOPIC:-lf/sportmodestate}" \
-    -e ODOM_TOPIC="${ODOM_TOPIC:-utlidar/robot_odom}" \
+    -e WHEEL_RADIUS="${WHEEL_RADIUS:-0.085}" \
     -e TELEOP_RATE_HZ="${TELEOP_RATE_HZ:-20.0}" \
     -e TELEOP_TIMEOUT_S="${TELEOP_TIMEOUT_S:-0.3}" \
     -e TELEOP_MAX_VX="${TELEOP_MAX_VX:-0.3}" \

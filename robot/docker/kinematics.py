@@ -336,8 +336,13 @@ _HIP_OFFSET = {
 }
 _SIDE_SIGN = {"FR": -1.0, "FL": 1.0, "RR": -1.0, "RL": 1.0}
 # unitree_go LowState.motor_state index order: FR(0-2) FL(3-5) RR(6-8) RL(9-11),
-# each [hip, thigh, calf]. (Go2-W wheels are 12-15; we ignore them for FK.)
+# each [hip, thigh, calf]. On the Go2-W the 4 wheel motors are 12-15 (FR,FL,RR,RL).
 LEG_ORDER = ["FR", "FL", "RR", "RL"]
+WHEEL_IDX = [12, 13, 14, 15]   # FR, FL, RR, RL wheel motors (Go2-W)
+# Wheel rolling radius (m). 7-inch tire ≈ 0.089 m nominal; loaded ≈ 0.085 m.
+# CALIBRATE: drive a known distance and scale this so the dead-reckon matches.
+# (Flip its sign if driving forward moves the estimate backward.)
+WHEEL_RADIUS = float(os.environ.get("WHEEL_RADIUS", "0.085"))
 
 
 def leg_fk(leg: str, q_hip: float, q_thigh: float, q_calf: float) -> dict:
@@ -489,6 +494,10 @@ class LowStateTracker:
         self._legs: dict = {}        # leg → {hip,thigh_root,knee,foot}
         self._valid = False
         self._stamp_ns = 0
+        # odometry fields (for the fuser's dead-reckoner)
+        self._imu_quat = quat_identity()    # body attitude, xyzw
+        self._gyro = np.zeros(3)            # body angular rate, rad/s
+        self._body_vx = 0.0                 # wheel-odometry forward speed, m/s
         self._decode = self._build_decoder()
         self._logged_failure = False
 
@@ -517,12 +526,25 @@ class LowStateTracker:
             return
         try:
             msg = self._decode(bytes(sample.payload))
-            q = [float(m.q) for m in msg.motor_state[:12]]
+            ms = msg.motor_state
+            q = [float(m.q) for m in ms[:12]]
             legs = {}
             for i, leg in enumerate(LEG_ORDER):
                 legs[leg] = leg_fk(leg, q[3 * i], q[3 * i + 1], q[3 * i + 2])
+            # --- odometry: IMU attitude/rate + wheel-odometry forward speed ---
+            q_wxyz = np.asarray(msg.imu_state.quaternion, dtype=np.float64)
+            imu_quat = quat_normalize(
+                np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]]))   # wxyz→xyzw
+            gyro = np.asarray(msg.imu_state.gyroscope, dtype=np.float64).reshape(3)
+            # mean wheel angular velocity × radius → forward ground speed; the
+            # wheels are non-holonomic so lateral speed is taken as ~0.
+            wheel_dq = [float(ms[i].dq) for i in WHEEL_IDX if i < len(ms)]
+            body_vx = (float(np.mean(wheel_dq)) * WHEEL_RADIUS) if wheel_dq else 0.0
             with self._lock:
                 self._legs = legs
+                self._imu_quat = imu_quat
+                self._gyro = gyro
+                self._body_vx = body_vx
                 self._valid = True
                 self._stamp_ns = time.time_ns()
         except Exception as e:
@@ -535,6 +557,12 @@ class LowStateTracker:
         """Returns (legs_dict, valid). legs_dict maps leg→{hip,thigh_root,knee,foot}."""
         with self._lock:
             return dict(self._legs), self._valid
+
+    def get_odom(self):
+        """Returns (imu_quat_xyzw, gyro_body, body_vx, valid) for the fuser."""
+        with self._lock:
+            return (self._imu_quat.copy(), self._gyro.copy(),
+                    self._body_vx, self._valid)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

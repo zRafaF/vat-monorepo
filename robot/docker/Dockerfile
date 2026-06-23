@@ -94,6 +94,7 @@ COPY robot/docker/theta_camera.py     /app/
 COPY robot/docker/frame_archive.py    /app/
 COPY robot/docker/pose_fuser.py       /app/
 COPY robot/docker/kinematics.py       /app/
+COPY robot/docker/estimator.py        /app/
 COPY robot/docker/teleop_bridge.py    /app/
 COPY robot/docker/start.sh            /app/
 RUN chmod +x /app/start.sh
@@ -108,7 +109,7 @@ ENV ROBOT_NAME="go2" \
     CAMERA_FPS="30.0" \
     PUBLISH_HZ="50.0" \
     SPORT_TOPIC="lf/sportmodestate" \
-    ODOM_TOPIC="utlidar/robot_odom" \
+    WHEEL_RADIUS="0.085" \
     TELEOP_RATE_HZ="20.0" \
     TELEOP_TIMEOUT_S="0.3" \
     TELEOP_MAX_VX="0.3" \

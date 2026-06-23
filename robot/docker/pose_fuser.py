@@ -6,9 +6,10 @@ process realises the ``server (pose) → dog → server (router) → client`` pa
 
   * subscribes to the **VGGT camera-pose correction** the server sends DOWN
         server/prism/pose_correction           (slow, drift-free, laggy)
-  * subscribes (via the bridge) to the robot's **onboard odometry**
-        {robot}/rt/utlidar/robot_odom          (nav_msgs/Odometry, always-on)
-  * converts the camera pose to a **base** pose with :mod:`kinematics`
+  * runs our own **dead-reckoning estimator** over the always-on ``/lowstate``
+    (IMU attitude + wheel odometry — see :mod:`estimator`), because the Go2-W
+    publishes no ``robot_odom`` and the ``lf/sportmodestate`` velocity is zeroed
+  * converts the camera correction to a **base** pose with :mod:`kinematics`
         T_world_base = T_world_camera ∘ inverse(T_base_camera)
   * publishes the **authoritative** pose UP, which the server's router relays
     to the client
@@ -16,24 +17,17 @@ process realises the ``server (pose) → dog → server (router) → client`` pa
 
 ⚠️  PLACEHOLDER FUSION
 ---------------------
-This is **not** a real EKF.  It is the robot's onboard odometry re-expressed in
-the map frame: the published pose is ``T_world_odom ∘ T_odom_base``, where the
-**anchor** ``T_world_odom`` is set so the pose starts at the origin and is
-re-anchored each time a VGGT correction lands.  Between corrections the pose is
-pure odometry — it drifts, which is exactly the Stage-2.5 signal.  A production
-estimator (NumPy/`filterpy` EKF) drops in by replacing the anchor snap with a
-proper fusion of odom + correction, keeping the same inputs, outputs, Zenoh key
-and wire format.
-
-Why odometry and not ``SportModeState.velocity``?  The low-frequency
-``lf/sportmodestate`` relay zeros the ``velocity`` field (just as it zeros
-``foot_position_body``), so integrating it never moves.  ``robot_odom`` carries a
-real, already-integrated position.
+The estimator is a wheel-odometry + IMU dead-reckoner, re-anchored by the VGGT
+correction.  Between corrections the pose is pure odometry and drifts — the
+expected Stage-2.5 signal.  Swap :class:`estimator.WheelInertialEstimator` for a
+full EKF / factor-graph later behind the same interface; the fuser, wire format
+and Zenoh keys are unchanged.
 
 Environment
 -----------
-  ROBOT_NAME, ZENOH_CONNECT, PUBLISH_HZ, ODOM_TOPIC, FIX_HOLD_S,
-  plus the kinematics STICK_* vars (for the camera→base correction transform).
+  ROBOT_NAME, ZENOH_CONNECT, PUBLISH_HZ, FIX_HOLD_S, ATTITUDE_GAIN,
+  CORRECTION_POS_GAIN, CORRECTION_ROT_GAIN, WHEEL_RADIUS (kinematics),
+  plus the STICK_* vars (for the camera→base correction transform).
 """
 
 from __future__ import annotations
@@ -47,10 +41,9 @@ import numpy as np
 import zenoh
 
 import vat_protocol as proto
-from vat_protocol import (
-    quat_rotate, PoseState, FIX_CORRECTED, FIX_DEADRECKON,
-)
-from kinematics import build_robot_model, OdometryTracker, Transform
+from vat_protocol import PoseState, FIX_CORRECTED, FIX_DEADRECKON
+from kinematics import build_robot_model, LowStateTracker, Transform
+from estimator import WheelInertialEstimator
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -61,15 +54,17 @@ log = logging.getLogger("pose-fuser")
 
 ROBOT_NAME    = os.environ.get("ROBOT_NAME",    "go2")
 ZENOH_CONNECT = os.environ.get("ZENOH_CONNECT", "tcp/127.0.0.1:7447")
-PUBLISH_HZ    = float(os.environ.get("PUBLISH_HZ",  "50.0"))
-ODOM_TOPIC    = os.environ.get("ODOM_TOPIC",        "utlidar/robot_odom")
-FIX_HOLD_S    = float(os.environ.get("FIX_HOLD_S",  "1.0"))
+PUBLISH_HZ    = float(os.environ.get("PUBLISH_HZ",          "50.0"))
+ATT_GAIN      = float(os.environ.get("ATTITUDE_GAIN",       "0.08"))
+POS_GAIN      = float(os.environ.get("CORRECTION_POS_GAIN", "0.5"))
+ROT_GAIN      = float(os.environ.get("CORRECTION_ROT_GAIN", "0.5"))
+FIX_HOLD_S    = float(os.environ.get("FIX_HOLD_S",          "1.0"))
 
 _KEYS = proto.keys(ROBOT_NAME)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fuser node  (odometry → map frame, re-anchored by VGGT corrections)
+# Fuser node
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -77,18 +72,13 @@ class PoseFuser:
     def __init__(self, z: zenoh.Session):
         self._z = z
         self._model = build_robot_model()
-        self._odom = OdometryTracker(z, ROBOT_NAME, ODOM_TOPIC)
+        self._low = LowStateTracker(z, ROBOT_NAME)            # IMU + wheel odom
+        self._est = WheelInertialEstimator(att_gain=ATT_GAIN,
+                                           pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
         self._lock = threading.Lock()
-
-        # T_world_odom — maps the robot's odom frame into the map frame.
-        # None until the first odom sample (then set to zero the start to origin);
-        # overwritten whenever a VGGT correction re-anchors the pose.
-        self._anchor: Transform | None = None
-        self._have_vggt = False
-        self._last_correction_ns = 0
+        self._last_pub_ns = time.time_ns()
         self._corrections = 0
         self._seq = 0
-        self._last_pos = np.zeros(3)
 
         self._pub = z.declare_publisher(
             _KEYS["pose"],
@@ -101,7 +91,7 @@ class PoseFuser:
             self._live = None
 
         z.declare_subscriber(_KEYS["pose_correction"], self._on_correction)
-        log.info(f"[Fuser] odom←'{ROBOT_NAME}/rt/{ODOM_TOPIC}'  "
+        log.info(f"[Fuser] odom←'{ROBOT_NAME}/rt/lowstate' (IMU+wheels)  "
                  f"correction←'{_KEYS['pose_correction']}'  "
                  f"pose→'{_KEYS['pose']}'  @ {PUBLISH_HZ}Hz")
 
@@ -114,45 +104,31 @@ class PoseFuser:
         # camera pose (map) → base pose (map) via kinematics
         cam_world = Transform.from_xyz_quat(c.position, c.quaternion)
         base_world = self._model.base_from_camera_world(cam_world)
-        odom_pose, _, _, valid = self._odom.get()
-        if not valid:
-            return
-        # Re-anchor so the published pose matches VGGT now and keeps tracking odom:
-        #   T_world_odom = T_world_base ∘ inverse(T_odom_base)
         with self._lock:
-            self._anchor = base_world.compose(odom_pose.inverse())
-            self._have_vggt = True
-            self._last_correction_ns = time.time_ns()
+            self._est.correct(base_world, time.time_ns())
             self._corrections += 1
         log.debug(f"[Fuser] correction v{c.map_version} → base "
                   f"{np.round(base_world.translation, 3)}")
 
     def _publish_once(self):
         now = time.time_ns()
-        odom_pose, lin_body, ang_body, valid = self._odom.get()
-        if not valid:
-            return    # no odometry yet — nothing to publish
-
+        imu_quat, gyro, body_vx, valid = self._low.get_odom()
         with self._lock:
-            if self._anchor is None:
-                # first sample: zero the odom origin so the pose starts at [0,0,0]
-                self._anchor = odom_pose.inverse()
-            world = self._anchor.compose(odom_pose)        # T_world_base
+            dt = (now - self._last_pub_ns) * 1e-9
+            self._last_pub_ns = now
+            self._est.predict(imu_quat, gyro, body_vx, valid, dt)
             self._seq += 1
-            corrected = (now - self._last_correction_ns) < FIX_HOLD_S * 1e9
-            fix = FIX_CORRECTED if (self._have_vggt and corrected) else FIX_DEADRECKON
-            pos = world.translation.astype(np.float32)
-            quat = world.rotation.astype(np.float32)
-            self._last_pos = pos
+            pos, quat, world_vel = self._est.state()
+            corrected = (now - self._est.last_correction_ns) < FIX_HOLD_S * 1e9
+            fix = FIX_CORRECTED if (self._est.have_vggt and corrected) else FIX_DEADRECKON
 
-        world_lin_vel = quat_rotate(quat, lin_body).astype(np.float32)
         pose = PoseState(
             timestamp_ns=now,
             seq=self._seq,
-            position=pos,
-            quaternion=quat,
-            linear_velocity=world_lin_vel,
-            angular_velocity=np.asarray(ang_body, dtype=np.float32),
+            position=pos.astype(np.float32),
+            quaternion=quat.astype(np.float32),
+            linear_velocity=world_vel.astype(np.float32),
+            angular_velocity=np.asarray(gyro, dtype=np.float32),
             fix_quality=fix,
         )
         try:
@@ -170,10 +146,11 @@ class PoseFuser:
             except Exception as e:
                 log.warning(f"[Fuser] publish error: {e}")
             if time.time() - last_log > 10:
-                anchored = self._anchor is not None
-                log.info(f"[Fuser] seq={self._seq} odom_anchored={anchored} "
-                         f"vggt={self._have_vggt} corrections={self._corrections} "
-                         f"pos={np.round(self._last_pos, 2)}")
+                pos, _, vel = self._est.state()
+                _, _, body_vx, valid = self._low.get_odom()
+                log.info(f"[Fuser] seq={self._seq} odom_valid={valid} "
+                         f"vggt={self._est.have_vggt} corrections={self._corrections} "
+                         f"body_vx={body_vx:+.2f}m/s pos={np.round(pos, 2)}")
                 last_log = time.time()
             time.sleep(max(0.0, period - (time.time() - t0)))
 
