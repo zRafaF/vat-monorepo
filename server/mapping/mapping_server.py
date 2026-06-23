@@ -215,6 +215,8 @@ class MappingServer:
         self._last_window_t = time.time()
         self._max_seq_seen = -1
         self._gap_count = 0
+        self._frame_rx = 0
+        self._last_hb = time.time()
         self._mask = get_spherical_valid_mask(
             TARGET_HEIGHT, TARGET_WIDTH, zenith_deg=ZENITH_LIMIT, nadir_deg=NADIR_LIMIT)
 
@@ -312,6 +314,14 @@ class MappingServer:
         if self._prism is None:
             return
         self._prism.add_frame(seq, frame)
+        self._frame_rx += 1
+        total, _lo, _hi, new = self._prism.stats()
+        if total < WINDOW_SIZE:
+            log.info(f"[Server] frame seq={seq} received — accumulating "
+                     f"{total}/{WINDOW_SIZE} (first map needs {WINDOW_SIZE})")
+        else:
+            log.info(f"[Server] frame seq={seq} received — buffer {total} | "
+                     f"new since last map: {new}")
         # gap detection (recovery happens in the batch loop before processing)
         if self._max_seq_seen >= 0 and seq > self._max_seq_seen + 1:
             self._gap_count += seq - self._max_seq_seen - 1
@@ -368,6 +378,15 @@ class MappingServer:
             if self._prism is None or self._processing:
                 continue
             total, _lo, _hi, new = self._prism.stats()
+            now = time.time()
+            if now - self._last_hb >= 5.0:
+                self._last_hb = now
+                if total == 0:
+                    log.info("[Server] waiting for first frame… "
+                             "(is the robot streaming go2/prism/camera/frame?)")
+                elif total < WINDOW_SIZE:
+                    log.info(f"[Server] accumulating {total}/{WINDOW_SIZE} frames "
+                             f"before first map…")
             if total < WINDOW_SIZE:
                 continue
             by_frames = new >= (WINDOW_SIZE - OVERLAP)
@@ -383,14 +402,23 @@ class MappingServer:
             return
         self._processing = True
         t0 = time.time()
+        total, _lo, _hi, _new = self._prism.stats()
+        log.info(f"[Server] >> mapping ({trigger}): running PRISM on {total} frames "
+                 f"(window={WINDOW_SIZE}, overlap={OVERLAP})…")
         try:
             self._recover_gaps()           # fill dropped frames before processing
+            t_infer = time.time()
             result = self._prism.run_until_latest()
+            infer_s = time.time() - t_infer
             self._last_window_t = time.time()
             if not result:
+                log.info(f"[Server] submap skipped — engine returned nothing "
+                         f"({total} frames, {infer_s:.2f}s)")
                 return
             pcd_dict, traj = result
             if pcd_dict is None:
+                log.info(f"[Server] no point cloud yet — PRISM warming up "
+                         f"({total} frames, {infer_s:.2f}s)")
                 return
             snap = pcd_dict["snapshot"]
             version = pcd_dict["version"]
@@ -414,10 +442,11 @@ class MappingServer:
             elapsed = time.time() - t0
             self._publish_status("processing", {
                 "map_version": version, "n_points": int(xyz.shape[0]),
-                "elapsed_s": round(elapsed, 2), "trigger": trigger,
-                "seq_gaps": self._gap_count})
+                "elapsed_s": round(elapsed, 2), "infer_s": round(infer_s, 2),
+                "n_frames": total, "trigger": trigger, "seq_gaps": self._gap_count})
             log.info(f"[Server] ✓ submap v{version} ({trigger}): {xyz.shape[0]} pts | "
-                     f"{elapsed:.2f}s | delta={d_xyz.shape[0]} | gaps={self._gap_count}")
+                     f"infer+map {infer_s:.2f}s / total {elapsed:.2f}s | "
+                     f"delta={d_xyz.shape[0]} pts | frames={total} | gaps={self._gap_count}")
         except Exception:
             log.error(f"[Server] PRISM run failed:\n{traceback.format_exc()}")
         finally:
