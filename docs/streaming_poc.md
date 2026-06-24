@@ -300,12 +300,15 @@ make viewer-rerun      # legacy Rerun viewer (debug/compare)
 The POC viewer is **VisPy** (native-OpenGL GPU point scatter; the earlier Rerun
 build froze on the stream and Open3D was finicky for live updates). The robot
 block, legs (`/lowstate` FK), selfie-stick and trajectory update continuously from
-the low-latency pose stream; the **point cloud is fetched on demand** — press `1`
-to pull the freshest full snapshot (it *replaces* the local cloud, so nothing
-accumulates or drifts), `R` to reset (wipe the server map + local), `F` to refit
-the view, `,`/`.`/`/` to nudge the cloud↔robot yaw, `N`/`M` for point size. Pose
-and legs run on a separate Zenoh session from the bulky cloud query so a fetch
-never starves them. There is **no video stream** in the viewer (BW only).
+the low-latency pose stream. The **point cloud STREAMS**: the server pushes a full
+compressed snapshot per submap and each one *replaces* the local cloud (always
+aligned, no delta accumulation); decode runs in a worker thread off the GL and
+zenoh-callback threads. A **latency HUD** (top-left) shows pose age / rate /
+capture→display e2e / fix quality and cloud point-count / age / rate. Keys: `1`
+force re-fetch, `R` reset (wipe server map + local), `F` refit, `,`/`.`/`/` cloud↔
+robot yaw, `N`/`M` point size. Pose/legs run on a separate Zenoh session from the
+bulky cloud so the stream never starves them. `POSE_LOOKAHEAD_S` adds dead-reckoning
+look-ahead to hide transport lag. There is **no video stream** (BW only).
 
 ### Tune the frame rate live (from any machine)
 
@@ -605,15 +608,16 @@ re-enable). Combined with a *consistent* stamped camera height
 this fixed the "misaligned" global map. The known-good gradio offline run uses
 `window 16 / overlap 4`; the server defaults match it (`vat.env`).
 
-### Cloud delivery: on-demand full snapshots
+### Cloud delivery: streamed full snapshots (replace, don't accumulate)
 
-The viewer does **not** subscribe to the pushed cloud stream; it fetches a full
-snapshot from the `pcd_snapshot` queryable on demand (key `1`) and replaces its
-local cloud. This sidesteps delta accumulation entirely: the engine's
-`get_point_cloud_delta()` reports changed/added blocks but **not removals** (TSDF
-decay), so accumulating deltas client-side drifts over time. The server still
-supports keyframe+delta push (`PCD_KEYFRAME_EVERY`) for a future always-on client,
-but full-snapshot-on-demand is the drift-free POC default.
+The server pushes a full compressed snapshot every submap (`PCD_KEYFRAME_EVERY=1`)
+on `server/prism/pcd_snapshot`; the viewer **replaces** its cloud with each one.
+This streams continuously yet stays drift-free, because we never accumulate deltas:
+the engine's `get_point_cloud_delta()` reports changed/added blocks but **not
+removals** (TSDF decay), so client-side delta merging drifts over time (this is what
+made the cloud "misalign" on a second on-demand fetch). The keyframe+delta path is
+kept (`PCD_KEYFRAME_EVERY>1`) for a future bandwidth-constrained always-on client.
+The `1` key still force-fetches via the `pcd_snapshot` queryable as a fallback.
 
 ### No navigation or ESDF
 

@@ -10,16 +10,17 @@ It renders:
     between samples), green when VGGT-corrected / amber when coasting;
   * the four **legs** from ``/lowstate`` forward kinematics + the selfie-stick;
   * the camera **trajectory**;
-  * the PRISM **point cloud**, fetched ON DEMAND (press ``1``) — a full freshest
-    snapshot that *replaces* the local cloud (no stale/duplicated delta blocks),
-    16-bit-quantised + zlib on the wire (see vat_protocol).
+  * the PRISM **point cloud**, STREAMED — the server pushes a full (compressed,
+    16-bit-quantised + zlib) snapshot per submap and each one *replaces* the local
+    cloud, so it stays aligned and never accumulates stale/duplicated blocks. Decode
+    runs in a worker thread (off the GL + zenoh-callback threads).
+  * a **latency HUD** (top-left): pose age / rate / capture→display e2e / fix
+    quality, and cloud point-count / age / rate.
 
-Metric scale note: the cloud is anchored to metric scale ONCE at map start (from
-the first frame's camera height); subsequent submaps inherit scale through the
-overlap chain. So there is no per-frame scale to track here — the viewer just
-re-fetches the current map when you ask.
+Metric scale is anchored ONCE at map start (first frame's camera height) and
+carried by the overlap chain, so the streamed snapshots share one consistent frame.
 
-In-window keys: ``1`` fetch cloud · ``R`` reset map · ``F`` refit view ·
+In-window keys: ``1`` force re-fetch · ``R`` reset map · ``F`` refit view ·
 ``,``/``.`` yaw ∓5° · ``/`` yaw 0 · ``N``/``M`` point size ∓.
 
 Usage
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import time
 import logging
 import argparse
@@ -62,6 +64,10 @@ RENDER_HZ     = float(os.environ.get("RENDER_HZ", "60.0"))
 STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))
 SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
+# Extra look-ahead (s) added to the dead-reckoning horizon to hide transport lag:
+# the avatar is otherwise always ~transport-latency behind reality. Dial it up to
+# match the observed lag (or the HUD's pose age). 0 = predict only from receipt.
+POSE_LOOKAHEAD_S = float(os.environ.get("POSE_LOOKAHEAD_S", "0.0"))
 CLOUD_MAX_M   = float(os.environ.get("CLOUD_MAX_M", "50.0"))
 PT_SIZE       = float(os.environ.get("PCD_POINT_SIZE", "3.0"))
 
@@ -189,13 +195,22 @@ class PosePredictor:
         self._have = False
         self._sample = None
         self._recv_monotonic = 0.0
+        self._dt_ema = 0.0                # inter-arrival time EMA → rate
+        self._e2e_ms = float("nan")       # capture→receipt latency (needs clock sync)
         self._disp_pos = np.zeros(3)
         self._disp_quat = quat_identity()
 
     def on_pose(self, pose):
         with self._lock:
+            now = time.monotonic()
+            if self._have and self._recv_monotonic:
+                dt = now - self._recv_monotonic
+                self._dt_ema = dt if self._dt_ema == 0 else 0.9 * self._dt_ema + 0.1 * dt
+            # capture→receipt latency (wall clock; meaningful only if robot/client
+            # clocks are synced — shown on the HUD so you can judge the lag).
+            self._e2e_ms = (time.time_ns() - pose.timestamp_ns) * 1e-6
             self._sample = pose
-            self._recv_monotonic = time.monotonic()
+            self._recv_monotonic = now
             if not self._have:
                 self._disp_pos = pose.position.astype(np.float64)
                 self._disp_quat = quat_normalize(pose.quaternion)
@@ -207,14 +222,24 @@ class PosePredictor:
                 return None
             s = self._sample
             age = time.monotonic() - self._recv_monotonic
+            # extrapolate forward by age + look-ahead to hide transport latency
+            horizon = age + POSE_LOOKAHEAD_S
             scale = 1.0 if age <= STALE_S else max(0.0, 1.0 - (age - STALE_S) / max(DECAY_S, 1e-3))
             tgt_pos, tgt_quat = integrate_pose(
                 s.position, s.quaternion, s.linear_velocity * scale,
-                s.angular_velocity * scale, age)
+                s.angular_velocity * scale, horizon)
             alpha = 1.0 - np.exp(-dt_render / max(SMOOTH_TAU, 1e-3))
             self._disp_pos = (1 - alpha) * self._disp_pos + alpha * tgt_pos
             self._disp_quat = quat_slerp(self._disp_quat, tgt_quat, alpha)
             return self._disp_pos.copy(), self._disp_quat.copy(), s.fix_quality, age
+
+    def telemetry(self):
+        with self._lock:
+            if not self._have:
+                return None
+            age = time.monotonic() - self._recv_monotonic
+            rate = (1.0 / self._dt_ema) if self._dt_ema > 1e-6 else float("nan")
+            return age, rate, self._e2e_ms, self._sample.fix_quality
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,20 +259,43 @@ class PRISMViewer:
         self._cloud_framed = False
         self._pt_size = PT_SIZE
         self._last_tick = time.monotonic()
+        # streamed cloud: callback stashes the latest RAW bytes; a worker decodes
+        # off the GL + zenoh-callback threads and REPLACES the local cloud.
+        self._raw_pcd = None
+        self._raw_lock = threading.Lock()
+        self._raw_evt = threading.Event()
+        self._last_cloud_mono = 0.0
+        self._cloud_n = 0
+        self._cloud_dt_ema = 0.0
+        # throughput counters (cumulative bytes; rates computed in the HUD)
+        self._cloud_bytes = 0
+        self._pose_bytes = 0
+        self._status = {}                # latest server-published metrics (JSON)
+        self._m_prev_t = time.monotonic()
+        self._m_prev_cloud = 0
+        self._m_prev_pose = 0
+        self._m_cloud_bps = 0.0
+        self._m_pose_bps = 0.0
 
         log.info(f"[Viewer] Connecting to Zenoh at {ZENOH_ROUTER}...")
         self._z = self._open(self._conf())
         self._z_fast = self._open(self._conf())          # isolate low-latency pose/legs
         log.info("[Viewer] Connected (2 sessions: bulk + low-latency).")
 
+        # bulk session: STREAMED point cloud (server pushes a full compressed
+        # snapshot per submap; each REPLACES our cloud → always aligned) + trajectory.
+        self._z.declare_subscriber(_KEYS["pcd_snapshot"], self._on_pcd_raw)
         self._z.declare_subscriber(_KEYS["trajectory"], self._on_traj)
+        self._z.declare_subscriber(_KEYS["status"], self._on_status)
         self._pub_reset = self._z.declare_publisher(RESET_KEY)
+        # low-latency session: authoritative pose + leg FK + body height
         self._z_fast.declare_subscriber(_KEYS["pose"], self._on_pose)
         self._body_tracker = RobotStateTracker(self._z_fast, ROBOT_NAME)
         self._leg_tracker = LowStateTracker(self._z_fast, ROBOT_NAME)
-        log.info(f"[Viewer] subscribed: [bulk] trajectory | [fast] pose, "
-                 f"legs←'{ROBOT_NAME}/rt/lowstate'  (cloud is on-demand: press '1')")
+        log.info(f"[Viewer] subscribed: [bulk] pcd stream + trajectory | [fast] pose, "
+                 f"legs←'{ROBOT_NAME}/rt/lowstate'")
 
+        threading.Thread(target=self._decode_worker, daemon=True).start()
         if request_snapshot:
             threading.Thread(target=self._request_snapshot, daemon=True).start()
 
@@ -278,12 +326,53 @@ class PRISMViewer:
                 self._traj = pts.astype(np.float32)
 
     def _on_pose(self, sample):
+        buf = bytes(sample.payload)
+        self._pose_bytes += len(buf)
         try:
-            self._predictor.on_pose(proto.unpack_pose(bytes(sample.payload)))
+            self._predictor.on_pose(proto.unpack_pose(buf))
         except proto.ProtocolError:
             pass
 
-    # ── on-demand cloud fetch (worker thread; heavy decode off the GL loop) ──
+    def _on_status(self, sample):
+        try:
+            self._status = json.loads(bytes(sample.payload).decode())
+        except Exception:
+            pass
+
+    # ── streamed cloud: stash latest raw bytes (callback stays instant) ──────
+    def _on_pcd_raw(self, sample):
+        buf = bytes(sample.payload)
+        self._cloud_bytes += len(buf)
+        with self._raw_lock:
+            self._raw_pcd = buf                       # latest wins; stale dropped
+        self._raw_evt.set()
+
+    def _decode_worker(self):
+        """Decode streamed snapshots off the zenoh-callback AND GL threads, then
+        REPLACE the local cloud (full snapshots only — a delta wouldn't be a whole
+        map). Latest-only: if several arrive while we decode, we skip to the newest."""
+        while True:
+            self._raw_evt.wait()
+            self._raw_evt.clear()
+            with self._raw_lock:
+                raw, self._raw_pcd = self._raw_pcd, None
+            if raw is None or len(raw) <= 24:
+                continue
+            try:
+                v, xyz, rgb, is_snap, _sv = proto.unpack_pcd(raw)
+            except proto.ProtocolError as e:
+                log.warning(f"[Viewer] pcd decode: {e}")
+                continue
+            if not is_snap:
+                continue                              # ignore deltas (we replace wholesale)
+            now = time.monotonic()
+            if self._last_cloud_mono:
+                dt = now - self._last_cloud_mono
+                self._cloud_dt_ema = dt if self._cloud_dt_ema == 0 else 0.8 * self._cloud_dt_ema + 0.2 * dt
+            self._last_cloud_mono = now
+            self._cloud.apply_snapshot(v, xyz, rgb)
+
+    # ── manual force-fetch via the queryable (fallback; '1') ─────────────────
     def _request_snapshot(self):
         if self._fetching:
             return
@@ -339,6 +428,13 @@ class PRISMViewer:
         scene.visuals.XYZAxis(parent=view.scene)
         self._view = view
 
+        # latency HUD — fixed top-left overlay in canvas pixel coords (y-down)
+        self._hud = scene.visuals.Text("", color=(0.8, 1.0, 0.85, 1.0), bold=False,
+                                       font_size=9, anchor_x="left", anchor_y="top",
+                                       parent=canvas.scene)
+        # pushed well below the OS title bar so it isn't occluded
+        self._hud.transform = scene.transforms.STTransform(translate=(12, 40))
+
         @canvas.events.key_press.connect
         def _on_key(ev):
             k = (ev.text or "").lower()
@@ -375,8 +471,9 @@ class PRISMViewer:
 
     @staticmethod
     def _print_controls():
-        log.info("[Viewer] keys:  1 fetch newest cloud | R reset map | F refit | "
-                 ", / .  yaw ∓5 | / yaw 0 | N / M  point size ∓  (mouse: drag rotate, scroll zoom)")
+        log.info("[Viewer] cloud STREAMS automatically. keys:  1 force re-fetch | "
+                 "R reset map | F refit | , / .  yaw ∓5 | / yaw 0 | N / M  point size ∓  "
+                 "(mouse: drag rotate, scroll zoom)")
 
     def _set_yaw(self, deg):
         self._yaw_offset_deg = float(deg)
@@ -401,10 +498,10 @@ class PRISMViewer:
                 rgba[:, 3] = 1.0
                 self._cloud_vis.set_data(xyz.astype(np.float32), face_color=rgba,
                                          size=self._pt_size, edge_width=0)
+                self._cloud_n = int(xyz.shape[0])
                 if not self._cloud_framed:
                     self._view.camera.set_range()
                     self._cloud_framed = True
-                log.info(f"[Viewer] cloud rendered: {xyz.shape[0]} pts")
 
         # trajectory
         with self._traj_lock:
@@ -433,6 +530,51 @@ class PRISMViewer:
             elif not self._legs_warned:
                 log.info("[Viewer] (no leg data yet — /lowstate flowing?)")
                 self._legs_warned = True
+
+        self._update_hud()
+
+    def _update_hud(self):
+        # recompute receive throughput every ~0.5 s (cumulative byte deltas)
+        now = time.monotonic()
+        el = now - self._m_prev_t
+        if el >= 0.5:
+            self._m_cloud_bps = (self._cloud_bytes - self._m_prev_cloud) / el
+            self._m_pose_bps = (self._pose_bytes - self._m_prev_pose) / el
+            self._m_prev_t, self._m_prev_cloud, self._m_prev_pose = \
+                now, self._cloud_bytes, self._pose_bytes
+
+        tel = self._predictor.telemetry()
+        if tel is None:
+            pose_line = "POSE  waiting…"
+        else:
+            age, rate, e2e_ms, fix = tel
+            fixs = "VGGT" if fix == proto.FIX_CORRECTED else "dead-reckon"
+            rate_s = f"{rate:4.1f}Hz" if rate == rate else "  – "
+            e2e_s = f"{e2e_ms:5.0f}ms" if e2e_ms == e2e_ms else "  – "
+            warn = "  ⚠STALE" if age > STALE_S else ""
+            pose_line = (f"POSE  age {age*1000:4.0f}ms  rate {rate_s}  "
+                         f"e2e {e2e_s}  {self._m_pose_bps/1024:5.1f} KB/s  fix {fixs}{warn}")
+
+        c_age = (now - self._last_cloud_mono) if self._last_cloud_mono else -1.0
+        c_rate = (1.0 / self._cloud_dt_ema) if self._cloud_dt_ema > 1e-6 else float("nan")
+        c_age_s = f"{c_age:4.1f}s" if c_age >= 0 else "  – "
+        c_rate_s = f"{c_rate:4.2f}Hz" if c_rate == c_rate else "  – "
+        cloud_line = (f"CLOUD  {self._cloud_n} pts  age {c_age_s}  rate {c_rate_s}  "
+                      f"{self._m_cloud_bps/1e6:5.2f} MB/s recv")
+
+        # server-published metrics (cross-network view → find the bottleneck)
+        s = self._status
+        if s:
+            srv = (f"SERVER  submap {s.get('submap_s', 0):.2f}s  "
+                   f"out {s.get('cloud_mbps', 0):.2f} MB/s  "
+                   f"buf {s.get('frames_buffered', '?')}f  "
+                   f"sent {s.get('n_points_streamed', '?')}/{s.get('n_points', '?')} pts")
+        else:
+            srv = "SERVER  (no status yet)"
+
+        self._hud.text = (pose_line + "\n" + cloud_line + "\n" + srv
+                          + f"\nlook-ahead {POSE_LOOKAHEAD_S*1000:.0f}ms   "
+                          f"(1 re-fetch · R reset · F refit · ,/. yaw · N/M size)")
 
 
 def main():

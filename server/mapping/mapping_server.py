@@ -78,10 +78,11 @@ WEIGHTS_PATH  = os.environ.get("WEIGHTS_PATH",
 VOXEL_SIZE    = float(os.environ.get("VOXEL_SIZE", "0.02"))
 MAX_DEPTH     = float(os.environ.get("MAX_DEPTH",  "4.5"))
 FACE_SIZE     = int(os.environ.get("FACE_SIZE",    "512"))
-# Match the known-good gradio config (window 16 / overlap 4): larger windows give
-# VGGT more multiview context → better submap poses → robust online registration.
-WINDOW_SIZE   = int(os.environ.get("WINDOW_SIZE",  "16"))
+WINDOW_SIZE   = int(os.environ.get("WINDOW_SIZE",  "12"))
 OVERLAP       = int(os.environ.get("OVERLAP",      "4"))
+# Cap points in the STREAMED snapshot to keep the uplink sane (full-res is still
+# available via the on-demand `pcd_snapshot` query). 0 = no cap.
+CLOUD_STREAM_MAX_POINTS = int(os.environ.get("CLOUD_STREAM_MAX_POINTS", "60000"))
 
 # Stopgap (rolling local map): StreamingWindowEngine.process_sequence() resets
 # per call, so replaying the WHOLE buffer each cycle is O(N) and grows without
@@ -299,6 +300,16 @@ def _camera_pose_from_trajectory(traj: np.ndarray):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _subsample(xyz, rgb, max_pts):
+    """Randomly thin a cloud to ``max_pts`` for the bandwidth-limited stream.
+    The points are already one-per-voxel-block, so a random subset keeps coverage."""
+    n = int(xyz.shape[0])
+    if max_pts <= 0 or n <= max_pts:
+        return xyz, rgb
+    idx = np.random.choice(n, max_pts, replace=False)
+    return xyz[idx], rgb[idx]
+
+
 class MappingServer:
     def __init__(self):
         self._processing = False
@@ -312,7 +323,14 @@ class MappingServer:
         # keyframe snapshot every N submaps so late joiners / dropped deltas heal.
         self._last_sent_version = -1
         self._submaps_since_key = 0
-        self._keyframe_every = int(os.environ.get("PCD_KEYFRAME_EVERY", "15"))
+        # 1 = stream a full (compressed) snapshot every submap (the viewer replaces
+        # its cloud wholesale → always aligned, no delta accumulation). Raise it to
+        # re-enable keyframe+delta for a bandwidth-constrained always-on client.
+        self._keyframe_every = int(os.environ.get("PCD_KEYFRAME_EVERY", "1"))
+        # cloud-stream throughput, surfaced in the status message for the client HUD
+        self._last_submap_t = 0.0
+        self._cloud_mbps = 0.0
+        self._last_payload_bytes = 0
         self._mask = get_spherical_valid_mask(
             TARGET_HEIGHT, TARGET_WIDTH, zenith_deg=ZENITH_LIMIT, nadir_deg=NADIR_LIMIT)
 
@@ -540,6 +558,7 @@ class MappingServer:
             self._recover_gaps()           # fill dropped frames before processing
             n_sub, version, last_pts = 0, -1, 0
             for r in self._prism.process_new():          # one iteration per inference
+                t_iter = time.time()
                 version = r["version"]
                 snap = r["snapshot"]
                 full_xyz, full_rgb = snap["points"], snap["colors"]
@@ -552,11 +571,17 @@ class MappingServer:
                 self._submaps_since_key += 1
                 send_key = (self._last_sent_version < 0 or
                             self._submaps_since_key >= self._keyframe_every)
+                payload_bytes = 0
                 if send_key:
-                    self._pub_snapshot.put(
-                        proto.pack_pcd(version, full_xyz, full_rgb, is_snapshot=True))
+                    # Thin the STREAMED cloud to keep the uplink sane; full-res stays
+                    # on the on-demand `pcd_snapshot` query. Payload is zlib+uint8-RGB
+                    # +16-bit-quantised compressed by pack_pcd.
+                    sx, sg = _subsample(full_xyz, full_rgb, CLOUD_STREAM_MAX_POINTS)
+                    payload = proto.pack_pcd(version, sx, sg, is_snapshot=True)
+                    self._pub_snapshot.put(payload)
+                    payload_bytes = len(payload)
                     self._submaps_since_key = 0
-                    kind, sent_pts = "keyframe", int(full_xyz.shape[0])
+                    kind, sent_pts = "stream", int(sx.shape[0])
                 else:
                     try:
                         d = self._prism.engine.get_point_cloud_delta(self._last_sent_version)
@@ -565,11 +590,18 @@ class MappingServer:
                         dxyz = np.zeros((0, 3), np.float32)
                         drgb = dxyz
                     if dxyz.shape[0] > 0:
-                        self._pub_delta.put(proto.pack_pcd(
-                            version, dxyz, drgb, is_snapshot=False,
-                            since_version=self._last_sent_version))
+                        payload = proto.pack_pcd(version, dxyz, drgb, is_snapshot=False,
+                                                 since_version=self._last_sent_version)
+                        self._pub_delta.put(payload)
+                        payload_bytes = len(payload)
                     kind, sent_pts = "delta", int(dxyz.shape[0])
                 self._last_sent_version = version
+                # cloud-stream throughput (payload bytes / wall interval since last submap)
+                _now = time.time()
+                if self._last_submap_t:
+                    dt = max(_now - self._last_submap_t, 1e-3)
+                    self._cloud_mbps = (payload_bytes / dt) / 1e6
+                self._last_submap_t = _now
                 traj = r["trajectory"]
                 if traj is not None and len(traj) > 0:
                     self._pub_traj.put(proto.pack_trajectory(traj))
@@ -580,7 +612,12 @@ class MappingServer:
                 self._last_window_t = time.time()
                 self._publish_status("processing", {
                     "map_version": int(version), "n_points": last_pts,
-                    "submap": n_sub, "trigger": trigger, "seq_gaps": self._gap_count})
+                    "n_points_streamed": sent_pts, "submap": n_sub,
+                    "submap_s": round(time.time() - t_iter, 2),
+                    "cloud_mbps": round(self._cloud_mbps, 3),
+                    "payload_kb": round(payload_bytes / 1024, 1),
+                    "frames_buffered": total, "trigger": trigger,
+                    "seq_gaps": self._gap_count})
                 log.info(f"[Server] ✓ submap v{version}: {kind} {sent_pts} pts "
                          f"(map {last_pts} pts, batch #{n_sub})")
             if n_sub == 0:
