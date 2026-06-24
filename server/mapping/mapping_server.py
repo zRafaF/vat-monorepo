@@ -78,8 +78,10 @@ WEIGHTS_PATH  = os.environ.get("WEIGHTS_PATH",
 VOXEL_SIZE    = float(os.environ.get("VOXEL_SIZE", "0.02"))
 MAX_DEPTH     = float(os.environ.get("MAX_DEPTH",  "4.5"))
 FACE_SIZE     = int(os.environ.get("FACE_SIZE",    "512"))
-WINDOW_SIZE   = int(os.environ.get("WINDOW_SIZE",  "10"))
-OVERLAP       = int(os.environ.get("OVERLAP",      "3"))
+# Match the known-good gradio config (window 16 / overlap 4): larger windows give
+# VGGT more multiview context → better submap poses → robust online registration.
+WINDOW_SIZE   = int(os.environ.get("WINDOW_SIZE",  "16"))
+OVERLAP       = int(os.environ.get("OVERLAP",      "4"))
 
 # Stopgap (rolling local map): StreamingWindowEngine.process_sequence() resets
 # per call, so replaying the WHOLE buffer each cycle is O(N) and grows without
@@ -89,8 +91,10 @@ OVERLAP       = int(os.environ.get("OVERLAP",      "3"))
 # accumulated) map. Set REPLAY_TAIL=0 to restore the old full-replay behaviour.
 REPLAY_TAIL   = int(os.environ.get("REPLAY_TAIL",  str(WINDOW_SIZE * 3)))
 
-# Batching: process when N new frames arrive OR this many seconds elapse.
-WINDOW_TIMEOUT_S = float(os.environ.get("WINDOW_TIMEOUT_S", "2.0"))
+# Batching: process when (WINDOW_SIZE-OVERLAP) new frames arrive OR this many
+# seconds elapse with at least MIN_NEW_FRAMES buffered (watchdog → still map even
+# if frames are slow). Bumped to 5 s to suit the larger window.
+WINDOW_TIMEOUT_S = float(os.environ.get("WINDOW_TIMEOUT_S", "5.0"))
 MIN_NEW_FRAMES   = int(os.environ.get("MIN_NEW_FRAMES", "1"))
 
 # Frame-drop recovery.

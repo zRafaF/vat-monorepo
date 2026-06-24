@@ -51,7 +51,9 @@ import numpy as np
 import zenoh
 
 import vat_protocol as proto
-from kinematics import build_robot_model, RobotStateTracker
+from kinematics import (
+    build_robot_model, RobotStateTracker, LowStateTracker,
+    camera_height_above_ground)
 from frame_archive import FrameArchive
 
 logging.basicConfig(
@@ -72,6 +74,19 @@ LOSSLESS        = os.environ.get("LOSSLESS", "").lower() in ("1", "true", "yes")
 CAMERA_FPS      = float(os.environ.get("CAMERA_FPS", "30.0"))
 SHARP_DOWNSCALE = float(os.environ.get("SHARPNESS_DOWNSCALE", "0.5"))
 FALLBACK_BODY_H = float(os.environ.get("FALLBACK_BODY_HEIGHT", "0.30"))
+
+# Camera height stamped into every frame — drives PRISM's per-submap METRIC SCALE,
+# so it MUST be consistent (a varying/wrong height makes each submap a different
+# scale → the online map misaligns). gradio uses one constant height and aligns
+# perfectly, so 'const' is the default. 'legs' derives a stable, stance-aware
+# height from the leg FK ground plane (correct when the dog crouches/stands).
+CAMERA_HEIGHT_MODE  = os.environ.get("CAMERA_HEIGHT_MODE", "const").strip().lower()
+CAMERA_HEIGHT_CONST = float(os.environ.get("CAMERA_HEIGHT_M", "1.15"))   # measured ground→camera
+STICK = np.array([
+    float(os.environ.get("STICK_OFFSET_X", "-0.65")),
+    float(os.environ.get("STICK_OFFSET_Y", "0.0")),
+    float(os.environ.get("STICK_OFFSET_Z", "0.85")),
+], dtype=np.float64)
 RETX_BUFFER     = int(os.environ.get("RETX_BUFFER", "256"))
 CAPTURE_RETRY_S = float(os.environ.get("CAPTURE_RETRY_S", "3.0"))
 
@@ -202,10 +217,11 @@ class FrameDecimator:
     """Best-of-N-frame-window decimator with live camera-height tagging."""
 
     def __init__(self, z: zenoh.Session, state: RobotStateTracker, model,
-                 archive=None):
+                 archive=None, leg_tracker=None):
         self._z = z
         self._state = state
         self._model = model
+        self._legs = leg_tracker          # only set in CAMERA_HEIGHT_MODE='legs'
         self._archive = archive
         self._pub = self._declare_reliable_publisher(z, KEY_OUTPUT)
         self._buf: deque[FrameEntry] = deque()
@@ -334,7 +350,15 @@ class FrameDecimator:
             return
 
         body = self._state.get()
-        cam_h = self._model.camera_height(body.body_height, body.rotation)
+        # Camera height for PRISM's metric scale. Keep it CONSISTENT across frames
+        # (the cause of the misaligned online map was a varying/wrong height).
+        if CAMERA_HEIGHT_MODE == "legs" and self._legs is not None:
+            legs, ok = self._legs.get()
+            cam_h, _bh, _co = camera_height_above_ground(
+                legs if ok else {}, body.rotation, STICK,
+                fallback_base_height=FALLBACK_BODY_H)
+        else:
+            cam_h = CAMERA_HEIGHT_CONST
 
         seq = self._seq
         self._seq = (self._seq + 1) & 0xFFFFFFFF
@@ -427,6 +451,13 @@ def main():
 
     model = build_robot_model()
     state = RobotStateTracker(z, ROBOT_NAME, fallback_body_height=FALLBACK_BODY_H)
+    leg_tracker = None
+    if CAMERA_HEIGHT_MODE == "legs":
+        leg_tracker = LowStateTracker(z, ROBOT_NAME)          # leg FK → ground plane
+        log.info(f"[cam-height] mode=legs (stance-aware, stick={tuple(STICK)})")
+    else:
+        log.info(f"[cam-height] mode=const → {CAMERA_HEIGHT_CONST:.2f} m "
+                 f"(consistent scale for the online map)")
 
     archive = None
     if ARCHIVE_ENABLE:
@@ -436,7 +467,7 @@ def main():
         except Exception as e:
             log.warning(f"[archive] disabled — init failed: {e}")
             archive = None
-    decimator = FrameDecimator(z, state, model, archive=archive)
+    decimator = FrameDecimator(z, state, model, archive=archive, leg_tracker=leg_tracker)
 
     capture = ThetaCapture(decimator)
     capture.start()
