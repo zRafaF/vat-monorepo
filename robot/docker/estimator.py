@@ -29,16 +29,37 @@ Pure NumPy: no ROS, no Zenoh — so it unit-tests in isolation.
 
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 
 from vat_protocol import (
-    quat_identity, quat_normalize, quat_rotate, quat_slerp, integrate_pose,
+    quat_identity, quat_normalize, quat_rotate, quat_slerp, quat_mul, quat_conj,
+    integrate_pose,
 )
 from kinematics import Transform
 
 
 class WheelInertialEstimator:
-    """Wheel-odometry + IMU dead-reckoner with a VGGT re-anchor.
+    """Wheel-odometry + IMU dead-reckoner with a *delayed* VGGT re-anchor.
+
+    The VGGT global pose the cloud sends down is **stale**: it describes where the
+    camera was at a keyframe captured ~2-4 s ago. Snapping the *current* pose to
+    it would teleport the robot backwards and throw away every metre it travelled
+    since the keyframe. Instead we run an **out-of-sequence (delayed-measurement)
+    correction**, the lightweight form of a fixed-lag pose-graph:
+
+      * the odometry integrator runs in its own slowly-**drifting** frame and we
+        keep a short time-indexed **history** of it;
+      * a VGGT fix stamped at capture time ``t_c`` is matched against the history
+        pose at ``t_c`` to compute the rigid **world←odom** correction transform
+        ``T_corr`` (so ``T_corr ∘ odom(t_c) == vggt(t_c)``);
+      * the *published* pose is always ``T_corr ∘ odom(now)`` — the global anchor
+        is re-based at the right instant while all motion since ``t_c`` is kept.
+
+    This keeps the published pose consistent across many corrections (the raw
+    odometry frame is never mutated) and is a drop-in for a real sliding-window
+    factor-graph smoother behind the same predict/correct/state interface.
 
     Parameters
     ----------
@@ -46,14 +67,27 @@ class WheelInertialEstimator:
         Complementary-filter gain pulling the gyro-integrated attitude toward the
         IMU's absolute attitude each step (0 = gyro only, 1 = IMU only).
     pos_gain, rot_gain : float
-        How hard a VGGT correction pulls position / orientation (0..1).
+        How hard each VGGT correction pulls ``T_corr`` toward the freshly computed
+        offset (0..1). First fix is always applied in full.
+    history_s : float
+        Seconds of odometry history to retain — must exceed the worst-case VGGT
+        correction latency so ``t_c`` is still in the buffer when the fix lands.
     """
 
     def __init__(self, att_gain: float = 0.08,
-                 pos_gain: float = 0.5, rot_gain: float = 0.5):
-        self.position = np.zeros(3, dtype=np.float64)
-        self.orientation = quat_identity()          # xyzw, world
-        self.world_vel = np.zeros(3, dtype=np.float64)
+                 pos_gain: float = 0.5, rot_gain: float = 0.5,
+                 history_s: float = 15.0):
+        # raw odometry-integrated pose, in its own drifting frame
+        self._odom_pos = np.zeros(3, dtype=np.float64)
+        self._odom_quat = quat_identity()           # xyzw
+        self._odom_vel = np.zeros(3, dtype=np.float64)   # world (odom-frame) vel
+        # world←odom correction transform (rotation + translation)
+        self._corr_R = quat_identity()
+        self._corr_p = np.zeros(3, dtype=np.float64)
+        # time-indexed odometry history: (t_ns, odom_pos, odom_quat)
+        self._history: deque = deque()
+        self._history_ns = int(history_s * 1e9)
+        self._last_t_ns = 0
         self.have_vggt = False
         self.last_correction_ns = 0
         self._att_gain = att_gain
@@ -64,46 +98,114 @@ class WheelInertialEstimator:
     # -- high-rate prediction -------------------------------------------------
     def predict(self, imu_quat: np.ndarray, gyro: np.ndarray,
                 body_vx: float, valid: bool, dt: float,
-                body_vy: float = 0.0):
+                body_vy: float = 0.0, now_ns: int | None = None):
         """Advance the state by ``dt`` from one /lowstate sample.
 
         ``imu_quat`` (xyzw) and ``gyro`` (rad/s, body) are the IMU attitude and
         rate; ``body_vx``/``body_vy`` are the wheel-odometry body velocity (m/s).
+        ``now_ns`` stamps the history entry (robot wall clock, same clock the VGGT
+        capture timestamp is on); if omitted it is synthesised from ``dt``.
         Does nothing if ``dt<=0`` or the sample is invalid."""
         if dt <= 0 or not valid:
             return
         imu_quat = quat_normalize(imu_quat)
         if not self._inited:
-            self.orientation = imu_quat
+            self._odom_quat = imu_quat
             self._inited = True
         # attitude: gyro-integrate (smooth) then blend toward the IMU absolute
-        _, q_gyro = integrate_pose(self.position, self.orientation,
+        _, q_gyro = integrate_pose(self._odom_pos, self._odom_quat,
                                    np.zeros(3), gyro, dt)
-        self.orientation = quat_normalize(
+        self._odom_quat = quat_normalize(
             quat_slerp(q_gyro, imu_quat, self._att_gain))
-        # body velocity → world; wheels are non-holonomic so vy defaults to 0
+        # body velocity → odom-world; wheels are non-holonomic so vy defaults to 0
         v_body = np.array([body_vx, body_vy, 0.0], dtype=np.float64)
-        self.world_vel = quat_rotate(self.orientation, v_body)
-        self.position = self.position + self.world_vel * dt
+        self._odom_vel = quat_rotate(self._odom_quat, v_body)
+        self._odom_pos = self._odom_pos + self._odom_vel * dt
+        # advance + record history on the robot clock
+        self._last_t_ns = int(now_ns) if now_ns is not None \
+            else self._last_t_ns + int(dt * 1e9)
+        self._history.append(
+            (self._last_t_ns, self._odom_pos.copy(), self._odom_quat.copy()))
+        while len(self._history) > 2 and \
+                (self._last_t_ns - self._history[0][0]) > self._history_ns:
+            self._history.popleft()
 
-    # -- low-rate global correction ------------------------------------------
-    def correct(self, base_world: Transform, now_ns: int):
-        """Re-anchor to the VGGT-derived base pose in the map frame."""
+    def _odom_at(self, t_ns: int):
+        """Interpolate the drifting odometry pose at past time ``t_ns`` from the
+        history buffer. Clamps to the buffer ends; returns ``(pos, quat)`` or the
+        live odometry pose if there is no history yet."""
+        h = self._history
+        if not h:
+            return self._odom_pos.copy(), self._odom_quat.copy()
+        if t_ns <= h[0][0]:
+            return h[0][1].copy(), h[0][2].copy()
+        if t_ns >= h[-1][0]:
+            return h[-1][1].copy(), h[-1][2].copy()
+        for i in range(len(h) - 1):
+            t0, p0, q0 = h[i]
+            t1, p1, q1 = h[i + 1]
+            if t0 <= t_ns <= t1:
+                a = (t_ns - t0) / max(t1 - t0, 1)
+                return ((1.0 - a) * p0 + a * p1), quat_slerp(q0, q1, a)
+        return h[-1][1].copy(), h[-1][2].copy()
+
+    # -- low-rate, possibly-delayed global correction -------------------------
+    def correct(self, base_world: Transform, capture_ts_ns: int | None = None,
+                now_ns: int | None = None):
+        """Re-anchor on a VGGT base pose captured at ``capture_ts_ns``.
+
+        Computes the world←odom offset that makes the odometry pose *at capture
+        time* equal the VGGT pose, then blends it into the running ``T_corr`` —
+        so the live pose is re-based without teleporting and without discarding
+        the motion accumulated since the keyframe."""
+        now_ns = now_ns if now_ns is not None else (capture_ts_ns or self._last_t_ns)
+        self.last_correction_ns = now_ns
+
+        # where dead-reckoning thought we were at the keyframe's capture time
+        if capture_ts_ns is None:
+            odom_pos_t, odom_quat_t = self._odom_pos.copy(), self._odom_quat.copy()
+        else:
+            odom_pos_t, odom_quat_t = self._odom_at(int(capture_ts_ns))
+
+        R_v = quat_normalize(base_world.rotation)
+        p_v = np.asarray(base_world.translation, dtype=np.float64).reshape(3)
+
+        # offset s.t.  R_corr * odom_quat_t == R_v  and
+        #              R_corr * odom_pos_t + p_corr == p_v
+        R_corr_new = quat_normalize(quat_mul(R_v, quat_conj(quat_normalize(odom_quat_t))))
+        p_corr_new = p_v - quat_rotate(R_corr_new, odom_pos_t)
+
         if not self.have_vggt:
-            self.position = np.asarray(base_world.translation, dtype=np.float64).copy()
-            self.orientation = quat_normalize(base_world.rotation)
+            self._corr_R = R_corr_new
+            self._corr_p = p_corr_new
             self.have_vggt = True
         else:
-            self.position = ((1 - self._pos_gain) * self.position
-                             + self._pos_gain * base_world.translation)
-            self.orientation = quat_normalize(
-                quat_slerp(self.orientation, base_world.rotation, self._rot_gain))
-        self.last_correction_ns = now_ns
+            self._corr_p = (1.0 - self._pos_gain) * self._corr_p \
+                + self._pos_gain * p_corr_new
+            self._corr_R = quat_normalize(
+                quat_slerp(self._corr_R, R_corr_new, self._rot_gain))
 
     # -- accessor -------------------------------------------------------------
     def state(self):
-        """Returns (position(3), orientation_xyzw(4), world_velocity(3))."""
-        return (self.position.copy(), self.orientation.copy(), self.world_vel.copy())
+        """Returns the *published* world pose (position(3), orientation_xyzw(4),
+        world_velocity(3)) = the correction transform applied to live odometry."""
+        pos = quat_rotate(self._corr_R, self._odom_pos) + self._corr_p
+        quat = quat_normalize(quat_mul(self._corr_R, self._odom_quat))
+        vel = quat_rotate(self._corr_R, self._odom_vel)
+        return pos, quat, vel
+
+    # back-compat: some callers/tests read these directly
+    @property
+    def position(self):
+        return self.state()[0]
+
+    @property
+    def orientation(self):
+        return self.state()[1]
+
+    @property
+    def world_vel(self):
+        return self.state()[2]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,17 +231,43 @@ def _selftest():
     pos, _, _ = est.state()
     assert abs(pos[1] - 0.6) < 1e-3 and abs(pos[0]) < 1e-3, pos
 
-    # 3) VGGT correction snaps then holds the anchor.
+    # 3) VGGT correction snaps then holds the anchor (capture == current time).
     est = WheelInertialEstimator()
     est.predict(quat_identity(), np.zeros(3), 0.3, True, 0.02)
     target = Transform.from_xyz_quat([5.0, 2.0, 0.0], quat_identity())
-    est.correct(target, now_ns=1)
+    est.correct(target, capture_ts_ns=est._last_t_ns, now_ns=est._last_t_ns)
     pos, _, _ = est.state()
     assert np.allclose(pos, [5.0, 2.0, 0.0], atol=1e-6), pos
     assert est.have_vggt
 
+    # 4) DELAYED correction must NOT teleport: the robot keeps driving after the
+    #    keyframe, the (stale) fix lands later, and the corrected pose must equal
+    #    truth_at_capture + motion_since_capture — no metres discarded.
+    est = WheelInertialEstimator()
+    t = 0
+    # drive +x at 0.5 m/s for 1.0 s (50 steps @ 20 ms); remember the capture time
+    # and odom pose after 0.4 s, as if a keyframe were captured there.
+    cap_ns, cap_odom_x = None, None
+    for k in range(50):
+        t += 20_000_000                       # +20 ms
+        est.predict(quat_identity(), np.zeros(3), 0.5, True, 0.02, now_ns=t)
+        if k == 19:                            # 0.40 s in
+            cap_ns = t
+            cap_odom_x = est.state()[0][0]
+    # VGGT says that at capture time the TRUE base was at x=10 (we had drifted to
+    # ~0.2). Fix arrives "now" (end of the run) but is stamped at capture time.
+    truth_at_capture = Transform.from_xyz_quat([10.0, 0.0, 0.0], quat_identity())
+    est.correct(truth_at_capture, capture_ts_ns=cap_ns, now_ns=t)
+    pos_now, _, _ = est.state()
+    # expected x = truth_at_capture.x + (odom_now - odom_at_capture)
+    odom_now_x = est._odom_pos[0]
+    expected_x = 10.0 + (odom_now_x - cap_odom_x)
+    assert abs(pos_now[0] - expected_x) < 1e-6, (pos_now[0], expected_x)
+    # and it must be well ahead of the stale anchor (no teleport back to x=10)
+    assert pos_now[0] > 10.0 + 0.25, pos_now[0]
+
     print("estimator self-test OK  "
-          "(straight→x=0.6, yaw→y=0.6, VGGT snap OK)")
+          "(straight→x=0.6, yaw→y=0.6, VGGT snap OK, delayed back-prop OK)")
 
 
 if __name__ == "__main__":

@@ -214,6 +214,7 @@ class PRISMViewer:
         self._last_pose_t = 0.0
         self._cloud_count = 0
         self._last_tel_t = 0.0
+        self._logged_cloud_once = False
 
         log.info(f"[Viewer] Connecting to Zenoh at {ZENOH_ROUTER}...")
         conf = zenoh.Config()
@@ -348,7 +349,17 @@ class PRISMViewer:
             now = time.monotonic()
             dt = now - last
             last = now
+            try:
+                self._render_once(dt, now)
+            except Exception:
+                # A daemon-thread exception used to die SILENTLY and freeze BOTH
+                # the cloud and the robot box. Never let one bad frame kill the
+                # render loop — log it and keep going.
+                import traceback
+                log.error(f"[Viewer] render step failed:\n{traceback.format_exc()}")
+            time.sleep(max(0.0, period - (time.monotonic() - now)))
 
+    def _render_once(self, dt: float, now: float):
             # map reset → drop the rendered cloud
             if self._cloud.pop_cleared():
                 rr.log(RR_PCD, rr.Clear(recursive=True))
@@ -357,8 +368,18 @@ class PRISMViewer:
             cloud = self._cloud.take_if_dirty()
             if cloud is not None:
                 xyz, rgb = cloud
+                # Drop non-finite points: a single NaN/Inf makes Rerun's 3D view
+                # fit an infinite bound and the whole cloud collapses to a dot.
+                finite = np.isfinite(xyz).all(axis=1)
+                xyz = xyz[finite]
+                rgb = rgb[finite]
                 colors = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
                 rr.log(RR_PCD, rr.Points3D(positions=xyz, colors=colors, radii=0.01))
+                if not self._logged_cloud_once:
+                    self._logged_cloud_once = True
+                    log.info(f"[Viewer] rendered first cloud → '{RR_PCD}': "
+                             f"{xyz.shape[0]} finite pts "
+                             f"({int((~finite).sum())} dropped)")
 
             # robot avatar (every frame, predicted) — apply the manual yaw knob
             # so the operator can align the robot frame with the cloud frame.
@@ -386,8 +407,6 @@ class PRISMViewer:
                 rr.log("telemetry/log", rr.TextLog(
                     f"cloud_age={cloud_age:5.1f}s  pose_age={pose_age:5.1f}s  "
                     f"clouds={self._cloud_count}  yaw={self._yaw_offset_deg:+.0f}°"))
-
-            time.sleep(max(0.0, period - (time.monotonic() - now)))
 
     def run(self):
         log.info("[Viewer] Rendering. Ctrl+C to quit.")

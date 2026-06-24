@@ -109,10 +109,15 @@ class PoseFuser:
         # camera pose (map) → base pose (map) via kinematics
         cam_world = Transform.from_xyz_quat(c.position, c.quaternion)
         base_world = self._model.base_from_camera_world(cam_world)
+        now = time.time_ns()
+        # c.timestamp_ns is the keyframe CAPTURE time (robot clock) — the fix is
+        # stale by (now - capture). Hand both to the estimator so it re-anchors at
+        # the right point in its history instead of teleporting the live pose.
         with self._lock:
-            self._est.correct(base_world, time.time_ns())
+            self._est.correct(base_world, capture_ts_ns=c.timestamp_ns, now_ns=now)
             self._corrections += 1
-        log.debug(f"[Fuser] correction v{c.map_version} → base "
+        log.debug(f"[Fuser] correction v{c.map_version} lag="
+                  f"{(now - c.timestamp_ns) * 1e-9:.2f}s → base "
                   f"{np.round(base_world.translation, 3)}")
 
     def _publish_once(self):
@@ -122,7 +127,7 @@ class PoseFuser:
         with self._lock:
             dt = (now - self._last_pub_ns) * 1e-9
             self._last_pub_ns = now
-            self._est.predict(imu_quat, gyro, body_vx, valid, dt)
+            self._est.predict(imu_quat, gyro, body_vx, valid, dt, now_ns=now)
             self._seq += 1
             pos, quat, world_vel = self._est.state()
             # Vertical comes from body height (map floor = Z 0), so the avatar

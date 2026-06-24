@@ -206,17 +206,27 @@ class OnlinePRISMSession:
                 version = self.engine.get_map_version()
                 snap = self.engine.get_point_cloud_snapshot()
                 last_cam = None
+                last_cam_ts = None      # keyframe CAPTURE time (s, robot clock)
                 try:
                     _ts, _poses = self.engine.get_poses()
                     if len(_poses):
-                        last_cam = np.asarray(_poses[-1], dtype=np.float64)
+                        # PRISM hands back MANY poses; pick the NEWEST by capture
+                        # timestamp, not by append order (windows/overlap on the
+                        # persistent trajectory don't guarantee append==time order).
+                        if _ts is not None and len(_ts) == len(_poses):
+                            newest = int(np.argmax(_ts))
+                            last_cam_ts = float(_ts[newest])
+                        else:
+                            newest = len(_poses) - 1
+                        last_cam = np.asarray(_poses[newest], dtype=np.float64)
                 except Exception:
-                    last_cam = None
+                    last_cam, last_cam_ts = None, None
                 yield {
                     "version": version,
                     "snapshot": snap,
                     "trajectory": np.asarray(traj, dtype=np.float32) if traj is not None else None,
                     "cam_pose": last_cam,
+                    "cam_ts": last_cam_ts,
                 }
         except Exception:
             log.error(f"[PRISM] Engine error:\n{traceback.format_exc()}")
@@ -530,7 +540,8 @@ class MappingServer:
                 traj = r["trajectory"]
                 if traj is not None and len(traj) > 0:
                     self._pub_traj.put(proto.pack_trajectory(traj))
-                    self._publish_pose_correction(version, r["cam_pose"], traj)
+                    self._publish_pose_correction(version, r["cam_pose"], traj,
+                                                  r.get("cam_ts"))
                 n_sub += 1
                 last_pts = int(xyz.shape[0])
                 self._last_window_t = time.time()
@@ -549,7 +560,7 @@ class MappingServer:
         finally:
             self._processing = False
 
-    def _publish_pose_correction(self, version, cam_pose, traj_np):
+    def _publish_pose_correction(self, version, cam_pose, traj_np, cam_ts_s=None):
         # Prefer the real VGGT extrinsics; fall back to heading-from-tangent only
         # if the engine hasn't exposed a full pose yet.
         pose = _camera_pose_from_matrix(cam_pose)
@@ -558,7 +569,14 @@ class MappingServer:
         if pose is None:
             return
         pos, quat = pose
-        c = proto.PoseCorrection(timestamp_ns=time.time_ns(), map_version=int(version),
+        # CRITICAL: stamp with the keyframe's CAPTURE time, not now(). This pose
+        # describes where the camera was ~2-4 s ago; the robot needs that capture
+        # time to re-anchor its dead-reckoning history at the right point instead
+        # of teleporting the live pose backwards. cam_ts_s is the robot-clock
+        # capture time (s) carried through from the frame; fall back to now() only
+        # if the engine didn't expose per-pose timestamps.
+        ts_ns = int(round(cam_ts_s * 1e9)) if cam_ts_s else time.time_ns()
+        c = proto.PoseCorrection(timestamp_ns=ts_ns, map_version=int(version),
                                  position=pos, quaternion=quat)
         try:
             self._pub_pose_cor.put(proto.pack_pose_correction(c), encoding=proto.ENC_PCOR)
