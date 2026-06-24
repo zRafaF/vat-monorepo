@@ -157,32 +157,61 @@ def unpack_frame(buf: bytes) -> Tuple[int, int, float, bytes]:
 #   24      …      bytes     body
 #
 # Bodies:
-#   PCD_ENC_RAW_F32  : xyz float32[n,3] (BE) ++ rgb float32[n,3] (BE)  — legacy
-#   PCD_ENC_ZLIB_U8  : zlib( xyz float32[n,3] (BE) ++ rgb uint8[n,3] ) — default
-#       RGB is quantised to 8-bit (lossless vs an 8-bit camera) for a 4× colour
-#       saving; the whole body is zlib-deflated. ~2–4× smaller on the wire.
+#   PCD_ENC_RAW_F32   : xyz float32[n,3] (BE) ++ rgb float32[n,3] (BE)  — legacy
+#   PCD_ENC_ZLIB_U8   : zlib( xyz float32[n,3] (BE) ++ rgb uint8[n,3] ) — lossless-ish
+#   PCD_ENC_ZLIB_QUANT: [bbox_min 3×f32][bbox_span 3×f32] ++
+#                       zlib( xyz uint16[n,3] (BE) ++ rgb uint8[n,3] )  — DEFAULT
+#       Positions are quantised to 16 bits PER AXIS across the cloud's own bounding
+#       box (≈span/65535 resolution → sub-mm at room scale, <1 mm even over tens of
+#       metres) and colour to 8 bits, then deflated. ~5–8× smaller than RAW and the
+#       smooth integer stream deflates far better than float32. This is the practical
+#       sweet spot vs. Draco/G-PCC for ~10⁵ unorganised voxel-centre points without
+#       pulling in a binary codec dependency.
 #
-PCD_ENC_RAW_F32 = 0
-PCD_ENC_ZLIB_U8 = 1
+PCD_ENC_RAW_F32    = 0
+PCD_ENC_ZLIB_U8    = 1
+PCD_ENC_ZLIB_QUANT = 2
 
 _PCD_HDR = "!iiiiii"
 _PCD_HDR_SIZE = struct.calcsize(_PCD_HDR)
-_PCD_ZLIB_LEVEL = 4   # fast; xyz floats don't deflate much, level 4 ≈ level 9 here
+_PCD_QHDR = "!6f"                       # bbox_min(3) + bbox_span(3), for QUANT bodies
+_PCD_QHDR_SIZE = struct.calcsize(_PCD_QHDR)
+_PCD_ZLIB_LEVEL = 6
+_QMAX = 65535.0
+
+
+def _rgb_to_u8(rgb: np.ndarray) -> bytes:
+    u = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+    return np.ascontiguousarray((u * 255.0 + 0.5).astype(np.uint8)).tobytes()
 
 
 def pack_pcd(version: int, xyz: np.ndarray, rgb: np.ndarray,
              is_snapshot: bool, since_version: int = 0,
-             compress: bool = True) -> bytes:
+             compress: bool = True, quantize: bool = True) -> bytes:
+    """Serialise a point cloud. Default = 16-bit-quantised + zlib (smallest).
+    ``compress=False`` → legacy raw float32; ``quantize=False`` → zlib + f32 xyz."""
     n = int(xyz.shape[0])
-    xyz_b = np.ascontiguousarray(xyz, dtype=">f4").tobytes()
-    if compress:
-        rgb_u8 = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
-        rgb_u8 = np.ascontiguousarray((rgb_u8 * 255.0 + 0.5).astype(np.uint8))
-        body = zlib.compress(xyz_b + rgb_u8.tobytes(), _PCD_ZLIB_LEVEL)
+    if compress and quantize:
+        enc = PCD_ENC_ZLIB_QUANT
+        xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+        if n > 0:
+            mn = xyz.min(axis=0)
+            span = np.maximum(xyz.max(axis=0) - mn, 1e-6)   # avoid /0 on flat axes
+            q = np.rint((xyz - mn) / span * _QMAX).astype(">u2")
+            payload = zlib.compress(np.ascontiguousarray(q).tobytes() + _rgb_to_u8(rgb),
+                                    _PCD_ZLIB_LEVEL)
+        else:
+            mn = np.zeros(3); span = np.ones(3); payload = zlib.compress(b"", _PCD_ZLIB_LEVEL)
+        qhdr = struct.pack(_PCD_QHDR, *mn.astype(np.float64), *span.astype(np.float64))
+        body = qhdr + payload
+    elif compress:
         enc = PCD_ENC_ZLIB_U8
+        body = zlib.compress(np.ascontiguousarray(xyz, dtype=">f4").tobytes()
+                             + _rgb_to_u8(rgb), _PCD_ZLIB_LEVEL)
     else:
-        body = xyz_b + np.ascontiguousarray(rgb, dtype=">f4").tobytes()
         enc = PCD_ENC_RAW_F32
+        body = (np.ascontiguousarray(xyz, dtype=">f4").tobytes()
+                + np.ascontiguousarray(rgb, dtype=">f4").tobytes())
     header = struct.pack(_PCD_HDR, MAGIC_PCD, int(version), n,
                          1 if is_snapshot else 0, int(since_version), enc)
     return header + body
@@ -196,7 +225,28 @@ def unpack_pcd(buf: bytes):
     if magic != MAGIC_PCD:
         raise ProtocolError(f"bad pcd magic 0x{magic & 0xFFFFFFFF:08X}")
     body = buf[_PCD_HDR_SIZE:]
-    if enc == PCD_ENC_ZLIB_U8:
+    if enc == PCD_ENC_ZLIB_QUANT:
+        if len(body) < _PCD_QHDR_SIZE:
+            raise ProtocolError("pcd quant header too short")
+        vals = struct.unpack_from(_PCD_QHDR, body, 0)
+        mn = np.array(vals[0:3], dtype=np.float64)
+        span = np.array(vals[3:6], dtype=np.float64)
+        try:
+            raw = zlib.decompress(body[_PCD_QHDR_SIZE:])
+        except zlib.error as e:
+            raise ProtocolError(f"pcd zlib decompress failed: {e}")
+        if n == 0:
+            z = np.zeros((0, 3), np.float32)
+            return version, z, z, bool(is_snap), since_v
+        need = n * 6 + n * 3
+        if len(raw) < need:
+            raise ProtocolError(f"pcd truncated: need {need}, have {len(raw)}")
+        q = np.frombuffer(raw, dtype=">u2", count=n * 3, offset=0).reshape(n, 3).astype(np.float64)
+        xyz = (mn + q / _QMAX * span).astype(np.float32)
+        rgb = (np.frombuffer(raw, dtype=np.uint8, count=n * 3, offset=n * 6
+                             ).reshape(n, 3).astype(np.float32) / 255.0)
+        return version, xyz, rgb, bool(is_snap), since_v
+    elif enc == PCD_ENC_ZLIB_U8:
         try:
             body = zlib.decompress(body)
         except zlib.error as e:
@@ -523,24 +573,29 @@ def _selftest() -> None:
         ts, seq, h, body = unpack_frame(pack_frame(123456789, 77, ch, jpeg))
         assert ts == 123456789 and seq == 77 and abs(h - ch) < 1e-5 and body == jpeg
 
-    # pcd round-trip — compressed (default): xyz lossless, rgb 8-bit quantised
+    # pcd round-trip — DEFAULT = 16-bit-quantised + zlib (xyz lossy ≈ span/65535)
     xyz = rng.random((50, 3), dtype=np.float64).astype(np.float32)
     rgb = rng.random((50, 3), dtype=np.float64).astype(np.float32)
     v, xyz2, rgb2, snap, sv = unpack_pcd(pack_pcd(7, xyz, rgb, True))
     assert v == 7 and snap and sv == 0
-    assert np.allclose(xyz, xyz2, atol=1e-6)           # positions lossless
-    assert np.allclose(rgb, rgb2, atol=1.0 / 255 + 1e-6)  # colour to 8 bits
-    # delta + legacy raw mode round-trip
+    assert np.allclose(xyz, xyz2, atol=1.0 / 65535 + 1e-6)   # 16-bit positions
+    assert np.allclose(rgb, rgb2, atol=1.0 / 255 + 1e-6)     # 8-bit colour
+    # empty cloud (reset signal) round-trips to 0 points
+    ev, ex, er, esnap, _ = unpack_pcd(pack_pcd(0, np.zeros((0, 3), np.float32),
+                                               np.zeros((0, 3), np.float32), True))
+    assert ev == 0 and esnap and ex.shape == (0, 3)
+    # delta header + legacy raw mode round-trip
     vv, x3, r3, snap3, sv3 = unpack_pcd(pack_pcd(9, xyz, rgb, False, since_version=7))
     assert vv == 9 and not snap3 and sv3 == 7
-    v4, x4, r4, snap4, sv4 = unpack_pcd(pack_pcd(7, xyz, rgb, True, compress=False))
-    assert np.allclose(rgb, r4, atol=1e-6)             # raw mode keeps full f32
-    # compression actually shrinks a realistic (spatially-coherent) cloud
+    v4, x4, r4, *_ = unpack_pcd(pack_pcd(7, xyz, rgb, True, compress=False))
+    assert np.allclose(rgb, r4, atol=1e-6) and np.allclose(xyz, x4, atol=1e-6)  # raw f32
+    # quantised+zlib is the smallest of the three encodings on a realistic cloud
     big = (rng.integers(0, 64, (4000, 3)).astype(np.float32) * 0.05)
     bcol = rng.random((4000, 3)).astype(np.float32)
-    comp = len(pack_pcd(1, big, bcol, True))
-    raw = len(pack_pcd(1, big, bcol, True, compress=False))
-    assert comp < raw, (comp, raw)
+    s_q = len(pack_pcd(1, big, bcol, True))                       # quantised (default)
+    s_u8 = len(pack_pcd(1, big, bcol, True, quantize=False))      # zlib + f32 xyz
+    s_raw = len(pack_pcd(1, big, bcol, True, compress=False))     # raw f32
+    assert s_q < s_u8 < s_raw, (s_q, s_u8, s_raw)
 
     # trajectory round-trip
     traj = rng.random((10, 3)).astype(np.float32)

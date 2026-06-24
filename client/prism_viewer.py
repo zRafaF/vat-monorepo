@@ -7,16 +7,18 @@ local window updated from a poll loop, so it stays responsive on flaky/VPN links
 and adds almost no dependencies beyond what the bring-up tools already use.
 
 It renders, live:
-  * the PRISM **point cloud** (full snapshot per submap, versioned);
   * the **robot block** at the client-predicted pose (netcode-style dead reckoning
     between samples), coloured green when VGGT-corrected / amber when coasting;
   * the four **legs** from ``/lowstate`` forward kinematics + the selfie-stick;
   * the camera **trajectory**;
-  * the live 360° **camera** image in a separate OpenCV window.
+  * the PRISM **point cloud**, fetched ON DEMAND (press ``1``) — a full, freshest
+    snapshot that *replaces* the local cloud, so it never floods the link nor
+    accumulates stale/duplicated delta blocks over time. Heavily compressed on the
+    wire (16-bit-quantised + zlib, see vat_protocol).
 
-Controls (type in the terminal, then Enter): ``r`` reset map · ``y <deg>`` set the
-cloud↔robot yaw align · ``+``/``-`` nudge yaw ±5°. Press ``q`` / close the window
-or Ctrl+C to quit.
+In-window keys: ``1`` fetch newest cloud · ``R`` reset map · ``F`` refit view ·
+``,``/``.`` yaw ∓5° · ``/`` yaw 0 · ``N``/``M`` point size ∓. (No video stream — it
+only burned bandwidth.)
 
 Usage
 -----
@@ -35,7 +37,6 @@ import logging
 import argparse
 import threading
 
-import cv2
 import numpy as np
 import open3d as o3d
 import zenoh
@@ -61,7 +62,6 @@ STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))
 SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
 CLOUD_MAX_M   = float(os.environ.get("CLOUD_MAX_M", "50.0"))
-SHOW_CAMERA   = os.environ.get("SHOW_CAMERA", "1") not in ("0", "false", "False")
 
 _KEYS = proto.keys(ROBOT_NAME, SERVER_PREFIX)
 RESET_KEY = f"{SERVER_PREFIX}/cmd/reset"
@@ -256,41 +256,30 @@ class PRISMViewer:
         self._yaw_offset_deg = float(os.environ.get("CLOUD_YAW_OFFSET_DEG", "0"))
         self._traj = None
         self._traj_lock = threading.Lock()
-        self._cam_bgr = None
-        self._cam_lock = threading.Lock()
-        # latest-only RAW payload holders — callbacks just stash bytes (no decode)
-        # so a heavy pcd/jpeg can't hog the Zenoh callback executor and starve the
-        # low-latency pose/leg streams. Decoding happens in the render thread.
-        self._raw_pcd = None
-        self._raw_pcd_lock = threading.Lock()
-        self._raw_jpeg = None
-        self._raw_jpeg_lock = threading.Lock()
         self._legs_warned = False
+        self._fetching = False           # guards the on-demand snapshot fetch
         self._stop = threading.Event()
 
-        # TWO sessions on purpose: the bulky, reliable point-cloud + camera live on
-        # `_z`; the small, latency-critical pose + leg/odom streams live on their
-        # OWN session `_z_fast`, so cloud bursts can't serialize ahead of them on a
-        # single session's receive/callback path (the starvation you observed when
-        # the mapping server was running).
+        # TWO sessions on purpose: the bulky point-cloud query lives on `_z`; the
+        # small, latency-critical pose + leg/odom streams live on their OWN session
+        # `_z_fast`, so a cloud fetch can't serialize ahead of them on a single
+        # session's receive/callback path (the starvation seen earlier).
         log.info(f"[Viewer] Connecting to Zenoh at {ZENOH_ROUTER}...")
         self._z = self._open_with_retry(self._client_conf())
         self._z_fast = self._open_with_retry(self._client_conf())
         log.info("[Viewer] Connected (2 sessions: bulk + low-latency).")
 
-        # bulk session: point cloud, trajectory, status, camera, reset
-        self._z.declare_subscriber(_KEYS["pcd_delta"],    self._on_pcd)
-        self._z.declare_subscriber(_KEYS["pcd_snapshot"], self._on_pcd)
+        # NO pushed point-cloud subscription: the cloud is fetched ON DEMAND via the
+        # snapshot queryable (press '1'), so the heavy stream never floods the link
+        # and the map can't accumulate stale/duplicated delta blocks over time.
         self._z.declare_subscriber(_KEYS["trajectory"],   self._on_traj)
-        self._z.declare_subscriber(_KEYS["status"],       self._on_status)
-        self._z.declare_subscriber(_KEYS["camera_frame"], self._on_frame)
         self._pub_reset = self._z.declare_publisher(RESET_KEY)
         # low-latency session: authoritative pose + leg FK + body height
         self._z_fast.declare_subscriber(_KEYS["pose"],    self._on_pose)
         self._body_tracker = RobotStateTracker(self._z_fast, ROBOT_NAME)
         self._leg_tracker = LowStateTracker(self._z_fast, ROBOT_NAME)
-        log.info(f"[Viewer] subscribed: [bulk] pcd, trajectory, status, camera | "
-                 f"[fast] pose, legs←'{ROBOT_NAME}/rt/lowstate'")
+        log.info(f"[Viewer] subscribed: [bulk] trajectory | [fast] pose, "
+                 f"legs←'{ROBOT_NAME}/rt/lowstate'  (cloud is on-demand: press '1')")
 
         if request_snapshot:
             self._request_snapshot()
@@ -311,20 +300,7 @@ class PRISMViewer:
                 log.warning(f"[Viewer] Zenoh connect failed: {e} — retry in 5s")
                 time.sleep(5)
 
-    # ── subscriber callbacks ────────────────────────────────────────────────
-    # HEAVY streams: stash the latest raw bytes only (no decode here) so the
-    # Zenoh callback returns instantly and never blocks pose/leg delivery.
-    def _on_pcd(self, sample):
-        with self._raw_pcd_lock:
-            self._raw_pcd = bytes(sample.payload)   # latest wins; stale dropped
-
-    def _on_frame(self, sample):
-        if not SHOW_CAMERA:
-            return
-        with self._raw_jpeg_lock:
-            self._raw_jpeg = bytes(sample.payload)
-
-    # LIGHT streams: tiny payloads, safe to decode inline.
+    # ── subscriber callbacks (small payloads, safe to decode inline) ────────
     def _on_traj(self, sample):
         try:
             pts = proto.unpack_trajectory(bytes(sample.payload))
@@ -340,16 +316,27 @@ class PRISMViewer:
         except proto.ProtocolError:
             pass
 
-    def _on_status(self, sample):
-        pass
-
     # ── in-window key controls (bound to the Open3D window) ─────────────────
     @staticmethod
     def _print_controls():
-        log.info("[Viewer] Window keys:  R reset map | F refit view | "
-                 ", / .  yaw -5/+5 | / yaw=0 | "
-                 "N / M  cloud point size -/+ | "
-                 "(Open3D: drag rotate, scroll zoom, H help)")
+        log.info("[Viewer] Window keys:  1 fetch newest cloud | R reset map | "
+                 "F refit view | , / .  yaw -5/+5 | / yaw=0 | "
+                 "N / M  point size -/+ | (Open3D: drag rotate, scroll zoom, H help)")
+
+    def _key_fetch(self, vis):
+        """'1' → fetch the freshest FULL cloud on demand (replaces the local one).
+        Runs in a worker so the z.get() can't block Open3D's render loop."""
+        if self._fetching:
+            return False
+        self._fetching = True
+        threading.Thread(target=self._fetch_snapshot_worker, daemon=True).start()
+        return False
+
+    def _fetch_snapshot_worker(self):
+        try:
+            self._request_snapshot()
+        finally:
+            self._fetching = False
 
     def _key_reset(self, vis):
         self._reset_map();  return False
@@ -427,6 +414,7 @@ class PRISMViewer:
         self._cloud_framed = len(self._pcd.points) > 0
 
         # in-window key bindings (replaces the old stdin loop)
+        vis.register_key_callback(ord('1'), self._key_fetch)
         vis.register_key_callback(ord('R'), self._key_reset)
         vis.register_key_callback(ord('F'), self._refit)
         vis.register_key_callback(ord(','), self._key_yaw_minus)
@@ -446,8 +434,6 @@ class PRISMViewer:
         finally:
             self._stop.set()
             vis.destroy_window()
-            if SHOW_CAMERA:
-                cv2.destroyAllWindows()
             self._z.close()
             self._z_fast.close()
             log.info("[Viewer] Shut down.")
@@ -458,20 +444,9 @@ class PRISMViewer:
         return False
 
     def _decode_pending_cloud(self) -> bool:
-        """Decode the latest raw pcd (render thread) and push it into self._pcd.
-        Returns True if the cloud geometry changed (so the caller can
-        update_geometry). Heavy decode lives here, never in the Zenoh callback."""
-        with self._raw_pcd_lock:
-            raw, self._raw_pcd = self._raw_pcd, None
-        if raw is not None:
-            try:
-                v, xyz, rgb, is_snap, since_v = proto.unpack_pcd(raw)
-                if is_snap:
-                    self._cloud.apply_snapshot(v, xyz, rgb)
-                else:
-                    self._cloud.apply_delta(v, xyz, rgb, since_v)
-            except proto.ProtocolError as e:
-                log.warning(f"[Viewer] pcd decode: {e}")
+        """Push a freshly-fetched cloud into the o3d geometry (render thread). The
+        heavy unpack/decompress happens in the fetch worker (``_request_snapshot``);
+        here we only move the decoded arrays into the GPU geometry on change."""
         changed = False
         if self._cloud.pop_cleared():
             self._pcd.clear()
@@ -494,9 +469,9 @@ class PRISMViewer:
         return changed
 
     def _on_anim(self, vis) -> bool:
-        """Called by Open3D every frame. Pull the latest stashed data, predict
-        the robot pose, refresh geometries + the camera window. Returns True to
-        request a redraw so motion stays smooth between data arrivals."""
+        """Called by Open3D every frame. Push any freshly-fetched cloud, predict
+        the robot pose, refresh geometries. Returns True to request a redraw so
+        motion stays smooth between data arrivals."""
         now = time.monotonic()
         dt = now - self._last_anim
         self._last_anim = now
@@ -542,22 +517,6 @@ class PRISMViewer:
             elif not self._legs_warned:
                 log.info("[Viewer] (no leg data yet — /lowstate flowing?)")
                 self._legs_warned = True
-
-        # camera: decode the latest raw JPEG HERE (render thread), then show it
-        if SHOW_CAMERA:
-            with self._raw_jpeg_lock:
-                raw_jpeg, self._raw_jpeg = self._raw_jpeg, None
-            if raw_jpeg is not None:
-                try:
-                    _, _, _, jpeg = proto.unpack_frame(raw_jpeg)
-                    bgr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-                    if bgr is not None:
-                        self._cam_bgr = bgr
-                except Exception:
-                    pass
-            if self._cam_bgr is not None:
-                cv2.imshow("VAT — 360° camera", self._cam_bgr)
-                cv2.waitKey(1)
 
         return True   # always redraw → predicted motion stays smooth
 
