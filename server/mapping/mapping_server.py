@@ -185,47 +185,43 @@ class OnlinePRISMSession:
         with self._lock:
             return [s for s in range(lo, hi + 1) if s not in self._frames]
 
-    def run_until_latest(self):
+    def process_new(self):
+        """Generator (ONLINE): process every window not yet seen on the current
+        frame buffer, KEEPING the accumulated map (no reset), and yield a per-submap
+        result the server streams. One yield per inference; each non-first window
+        adds WINDOW_SIZE-OVERLAP new poses to the persistent trajectory.
+        """
         with self._lock:
             all_seqs = sorted(self._frames)
-            tail_seqs = all_seqs[-REPLAY_TAIL:] if REPLAY_TAIL > 0 else all_seqs
-            frames = [self._frames[s] for s in tail_seqs]
-            max_seq = tail_seqs[-1] if tail_seqs else -1
-        if len(frames) < WINDOW_SIZE:
-            return None
-
-        last_pcd_dict, last_traj = None, None
+            frames_list = [self._frames[s] for s in all_seqs]
+            max_seq = all_seqs[-1] if all_seqs else -1
+        if len(frames_list) < WINDOW_SIZE:
+            return
         try:
             for _mesh, pcd, traj, _plane in self.engine.process_sequence(
-                    frames, window_size=WINDOW_SIZE, overlap=OVERLAP):
-                if pcd is not None and len(pcd.points) > 0:
-                    last_pcd_dict = {"snapshot": self.engine.get_point_cloud_snapshot(),
-                                     "version": self.engine.get_map_version()}
-                    last_traj = traj.copy() if traj is not None else None
+                    frames_list, window_size=WINDOW_SIZE, overlap=OVERLAP,
+                    reset=False, finalize=False):
+                if pcd is None or len(pcd.points) == 0:
+                    continue
+                version = self.engine.get_map_version()
+                snap = self.engine.get_point_cloud_snapshot()
+                last_cam = None
+                try:
+                    _ts, _poses = self.engine.get_poses()
+                    if len(_poses):
+                        last_cam = np.asarray(_poses[-1], dtype=np.float64)
+                except Exception:
+                    last_cam = None
+                yield {
+                    "version": version,
+                    "snapshot": snap,
+                    "trajectory": np.asarray(traj, dtype=np.float32) if traj is not None else None,
+                    "cam_pose": last_cam,
+                }
         except Exception:
             log.error(f"[PRISM] Engine error:\n{traceback.format_exc()}")
-            return None
-
-        # Real camera extrinsics for the orientation correction (true VGGT pose,
-        # not the trajectory tangent). Same leveled world frame as the cloud.
-        last_cam = None
-        try:
-            _ts, _poses = self.engine.get_poses()
-            if len(_poses):
-                last_cam = np.asarray(_poses[-1], dtype=np.float64)
-        except Exception:
-            last_cam = None
-
         with self._lock:
             self._last_processed_seq = max_seq
-            # Prune old frames so memory + replay stay bounded (rolling stopgap),
-            # keeping enough history for gap recovery (_recover_gaps looks back
-            # ~2×WINDOW_SIZE).
-            keep = max(REPLAY_TAIL, WINDOW_SIZE * 2) + WINDOW_SIZE
-            if len(self._frames) > keep:
-                for s in sorted(self._frames)[:-keep]:
-                    del self._frames[s]
-        return last_pcd_dict, last_traj, last_cam
 
 
 def _rotmat_to_quat(R: np.ndarray) -> np.ndarray:
@@ -516,52 +512,38 @@ class MappingServer:
         self._processing = True
         t0 = time.time()
         total, _lo, _hi, _new = self._prism.stats()
-        processing = min(total, REPLAY_TAIL) if REPLAY_TAIL > 0 else total
-        log.info(f"[Server] >> mapping ({trigger}): replaying last {processing} of "
-                 f"{total} buffered frames (window={WINDOW_SIZE}, overlap={OVERLAP}, "
-                 f"tail={REPLAY_TAIL})…")
+        log.info(f"[Server] >> mapping ({trigger}): {total} frames buffered, "
+                 f"streaming new windows (window={WINDOW_SIZE}, overlap={OVERLAP})…")
         try:
             self._recover_gaps()           # fill dropped frames before processing
-            t_infer = time.time()
-            result = self._prism.run_until_latest()
-            infer_s = time.time() - t_infer
-            self._last_window_t = time.time()
-            if not result:
-                log.info(f"[Server] submap skipped — engine returned nothing "
-                         f"({total} frames, {infer_s:.2f}s)")
-                return
-            pcd_dict, traj, cam_pose = result
-            if pcd_dict is None:
-                log.info(f"[Server] no point cloud yet — PRISM warming up "
-                         f"({total} frames, {infer_s:.2f}s)")
-                return
-            snap = pcd_dict["snapshot"]
-            version = pcd_dict["version"]
-            xyz, rgb = snap["points"], snap["colors"]
-            if xyz.shape[0] == 0:
-                return
-
-            self._pub_snapshot.put(proto.pack_pcd(version, xyz, rgb, is_snapshot=True))
-
-            delta = self._prism.engine.get_point_cloud_delta(version - 1)
-            d_xyz, d_rgb = delta["points"], delta["colors"]
-            if d_xyz.shape[0] > 0:
-                self._pub_delta.put(proto.pack_pcd(
-                    version, d_xyz, d_rgb, is_snapshot=False, since_version=version - 1))
-
-            if traj is not None and len(traj) > 0:
-                traj_np = np.asarray(traj, dtype=np.float32)
-                self._pub_traj.put(proto.pack_trajectory(traj_np))
-                self._publish_pose_correction(version, cam_pose, traj_np)
-
-            elapsed = time.time() - t0
-            self._publish_status("processing", {
-                "map_version": version, "n_points": int(xyz.shape[0]),
-                "elapsed_s": round(elapsed, 2), "infer_s": round(infer_s, 2),
-                "n_frames": total, "trigger": trigger, "seq_gaps": self._gap_count})
-            log.info(f"[Server] ✓ submap v{version} ({trigger}): {xyz.shape[0]} pts | "
-                     f"infer+map {infer_s:.2f}s / total {elapsed:.2f}s | "
-                     f"delta={d_xyz.shape[0]} pts | frames={total} | gaps={self._gap_count}")
+            n_sub, version, last_pts = 0, -1, 0
+            for r in self._prism.process_new():          # one iteration per inference
+                version = r["version"]
+                snap = r["snapshot"]
+                xyz, rgb = snap["points"], snap["colors"]
+                if xyz.shape[0] == 0:
+                    continue
+                # Full snapshot per submap → clients always render the true,
+                # persistent map (no stale/rolling artefacts). Block-hash deltas
+                # are the later bandwidth optimisation.
+                self._pub_snapshot.put(proto.pack_pcd(version, xyz, rgb, is_snapshot=True))
+                traj = r["trajectory"]
+                if traj is not None and len(traj) > 0:
+                    self._pub_traj.put(proto.pack_trajectory(traj))
+                    self._publish_pose_correction(version, r["cam_pose"], traj)
+                n_sub += 1
+                last_pts = int(xyz.shape[0])
+                self._last_window_t = time.time()
+                self._publish_status("processing", {
+                    "map_version": int(version), "n_points": last_pts,
+                    "submap": n_sub, "trigger": trigger, "seq_gaps": self._gap_count})
+                log.info(f"[Server] ✓ stream submap v{version}: {last_pts} pts "
+                         f"(batch #{n_sub})")
+            if n_sub == 0:
+                log.info(f"[Server] no new window yet ({total} frames buffered)")
+            else:
+                log.info(f"[Server] ▣ batch: {n_sub} submap(s) in {time.time()-t0:.2f}s "
+                         f"→ map v{version}, {last_pts} pts, {total} frames buffered")
         except Exception:
             log.error(f"[Server] PRISM run failed:\n{traceback.format_exc()}")
         finally:
