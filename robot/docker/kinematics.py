@@ -378,6 +378,46 @@ def leg_fk(leg: str, q_hip: float, q_thigh: float, q_calf: float) -> dict:
             "knee": hip + knee, "foot": hip + foot}
 
 
+def base_height_above_ground(legs: dict, body_rotation=None) -> Optional[float]:
+    """Vertical distance (m) from the base origin to the ground plane implied by
+    the robot's **feet** — the leg-derived stance height.
+
+    The four feet rest on the floor, so the base sits this far above it. We rotate
+    each foot (base frame, from :func:`leg_fk`) by the body orientation and take
+    its world-up (z) component; the base height is then the negative mean (feet
+    are below the base). This makes the height SHRINK as the dog goes prone (legs
+    fold and the feet rise toward the body) instead of staying pinned at a fixed
+    ``SportModeState.body_height``, and it accounts for body roll/pitch through
+    ``body_rotation`` (xyzw, base→world). Returns None if no feet are available."""
+    if not legs:
+        return None
+    R_q = quat_identity() if body_rotation is None else body_rotation
+    fz = [quat_rotate(R_q, np.asarray(p["foot"], dtype=np.float64))[2]
+          for p in legs.values() if "foot" in p]
+    if not fz:
+        return None
+    return float(max(-np.mean(fz), 0.0))
+
+
+def camera_height_above_ground(legs: dict, body_rotation, stick_xyz,
+                               fallback_base_height: float = 0.30):
+    """Camera optical-centre height above the floor, derived from the legs.
+
+    = (leg-derived base height) + the world-up component of the camera mount
+    offset (``stick_xyz``, base frame) rotated by the body orientation — so it
+    tracks BOTH stance (stand↔prone, via the feet) and tilt (roll/pitch swings
+    the stick, moving the camera up/down and left/right). PanoVGGT gives the
+    *camera* pose; this is the inverse direction used for the metric-scale height
+    and for placing the base under the camera.
+
+    Returns ``(camera_height, base_height, cam_offset_world)``."""
+    base_h = base_height_above_ground(legs, body_rotation)
+    if base_h is None:
+        base_h = float(fallback_base_height)
+    cam_off_world = quat_rotate(body_rotation, np.asarray(stick_xyz, dtype=np.float64))
+    return float(base_h + cam_off_world[2]), base_h, cam_off_world
+
+
 @dataclass
 class BodyState:
     body_height: float
