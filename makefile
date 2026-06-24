@@ -19,7 +19,7 @@ CLIENT_RUN ?= cd client && uv run python
 
 .PHONY: help steps \
         sync-mapping sync-client sync-router sync-robot sync-docs \
-        router mapping theta-uvc theta-stream robot-docker viewer viewer-rerun \
+        router mapping theta-uvc theta-stream robot-docker viewer viewer-rerun record-frames \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         teleop fetch_frame \
         docs docs-serve clean
@@ -42,6 +42,7 @@ help:
 	@echo "  make robot-docker    [ROBOT]  bridge + theta_camera + pose fuser container"
 	@echo "  make viewer          [CLIENT] full POC viewer — Open3D (cloud + robot + legs)"
 	@echo "  make viewer-rerun    [CLIENT] legacy Rerun viewer (debug/compare)"
+	@echo "  make record-frames   [CLIENT] save 360° frames to disk (offline analysis)"
 	@echo ""
 	@echo "Staged pre-POC tests (run in this order — see 'make steps'):"
 	@echo "  make test_link           0  transport alive (router + bridge + rates)"
@@ -139,6 +140,12 @@ viewer: sync-client
 viewer-rerun: sync-client
 	@echo ">> Reminder: router + mapping server must be running."
 	$(CLIENT_RUN) prism_rerun_viewer.py --snapshot
+
+# [CLIENT] Record 360° frames to disk for offline analysis.
+# Opens a folder picker, then saves every incoming JPEG named by timestamp_ns.
+record-frames: sync-client
+	@echo ">> Recording 360° frames — a folder picker will open."
+	$(CLIENT_RUN) ../tools/record_frames.py
 
 # ── Staged pre-POC tests ─────────────────────────────────────────────────────
 # All run in the client's own env; tools live in ../tools relative to client/.
