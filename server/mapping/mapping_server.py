@@ -304,6 +304,11 @@ class MappingServer:
         self._frame_rx = 0
         self._last_hb = time.time()
         self._reset_requested = False
+        # delta streaming: send only changed blocks per submap, with a full
+        # keyframe snapshot every N submaps so late joiners / dropped deltas heal.
+        self._last_sent_version = -1
+        self._submaps_since_key = 0
+        self._keyframe_every = int(os.environ.get("PCD_KEYFRAME_EVERY", "15"))
         self._mask = get_spherical_valid_mask(
             TARGET_HEIGHT, TARGET_WIDTH, zenith_deg=ZENITH_LIMIT, nadir_deg=NADIR_LIMIT)
 
@@ -448,6 +453,9 @@ class MappingServer:
         self._max_seq_seen = -1
         self._gap_count = 0
         self._last_window_t = time.time()
+        # next send must be a fresh keyframe (deltas restart from scratch)
+        self._last_sent_version = -1
+        self._submaps_since_key = 0
         # Tell every connected client to drop its cloud: an empty snapshot (v0).
         try:
             empty = np.zeros((0, 3), dtype=np.float32)
@@ -530,26 +538,47 @@ class MappingServer:
             for r in self._prism.process_new():          # one iteration per inference
                 version = r["version"]
                 snap = r["snapshot"]
-                xyz, rgb = snap["points"], snap["colors"]
-                if xyz.shape[0] == 0:
+                full_xyz, full_rgb = snap["points"], snap["colors"]
+                if full_xyz.shape[0] == 0:
                     continue
-                # Full snapshot per submap → clients always render the true,
-                # persistent map (no stale/rolling artefacts). Block-hash deltas
-                # are the later bandwidth optimisation.
-                self._pub_snapshot.put(proto.pack_pcd(version, xyz, rgb, is_snapshot=True))
+                # Bandwidth: send a full keyframe snapshot on the first send and
+                # every Nth submap; in between send only the blocks CHANGED since
+                # the last send (the snapshots are ~99% redundant frame-to-frame).
+                # Payloads are zlib+uint8-RGB compressed by pack_pcd.
+                self._submaps_since_key += 1
+                send_key = (self._last_sent_version < 0 or
+                            self._submaps_since_key >= self._keyframe_every)
+                if send_key:
+                    self._pub_snapshot.put(
+                        proto.pack_pcd(version, full_xyz, full_rgb, is_snapshot=True))
+                    self._submaps_since_key = 0
+                    kind, sent_pts = "keyframe", int(full_xyz.shape[0])
+                else:
+                    try:
+                        d = self._prism.engine.get_point_cloud_delta(self._last_sent_version)
+                        dxyz, drgb = d["points"], d["colors"]
+                    except Exception:
+                        dxyz = np.zeros((0, 3), np.float32)
+                        drgb = dxyz
+                    if dxyz.shape[0] > 0:
+                        self._pub_delta.put(proto.pack_pcd(
+                            version, dxyz, drgb, is_snapshot=False,
+                            since_version=self._last_sent_version))
+                    kind, sent_pts = "delta", int(dxyz.shape[0])
+                self._last_sent_version = version
                 traj = r["trajectory"]
                 if traj is not None and len(traj) > 0:
                     self._pub_traj.put(proto.pack_trajectory(traj))
                     self._publish_pose_correction(version, r["cam_pose"], traj,
                                                   r.get("cam_ts"))
                 n_sub += 1
-                last_pts = int(xyz.shape[0])
+                last_pts = int(full_xyz.shape[0])
                 self._last_window_t = time.time()
                 self._publish_status("processing", {
                     "map_version": int(version), "n_points": last_pts,
                     "submap": n_sub, "trigger": trigger, "seq_gaps": self._gap_count})
-                log.info(f"[Server] ✓ stream submap v{version}: {last_pts} pts "
-                         f"(batch #{n_sub})")
+                log.info(f"[Server] ✓ submap v{version}: {kind} {sent_pts} pts "
+                         f"(map {last_pts} pts, batch #{n_sub})")
             if n_sub == 0:
                 log.info(f"[Server] no new window yet ({total} frames buffered)")
             else:

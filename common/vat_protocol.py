@@ -37,6 +37,7 @@ instead of crashing.
 from __future__ import annotations
 
 import struct
+import zlib
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -145,46 +146,79 @@ def unpack_frame(buf: bytes) -> Tuple[int, int, float, bytes]:
 # 2. Point cloud   pcd_delta / pcd_snapshot   (server → client)
 # ═════════════════════════════════════════════════════════════════════════════
 #
-#   Offset    Bytes  Type            Field
-#   ──────    ─────  ──────────────  ──────────────────────────────────────
-#   0         4      int32           magic = MAGIC_PCD
-#   4         4      int32           version        (engine map version)
-#   8         4      int32           n_points
-#   12        4      int32           is_snapshot    (1 full / 0 delta)
-#   16        4      int32           since_version  (delta base; 0 if snapshot)
-#   20        n*12   float32[n,3]    xyz
-#   20+n*12   n*12   float32[n,3]    rgb  in [0,1]
+#   Offset  Bytes  Type      Field
+#   ──────  ─────  ────────  ──────────────────────────────────────────────
+#   0       4      int32     magic = MAGIC_PCD
+#   4       4      int32     version        (engine map version)
+#   8       4      int32     n_points
+#   12      4      int32     is_snapshot    (1 full / 0 delta)
+#   16      4      int32     since_version  (delta base; 0 if snapshot)
+#   20      4      int32     encoding       (PCD_ENC_*; how the body is packed)
+#   24      …      bytes     body
 #
-_PCD_HDR = "!iiiii"
+# Bodies:
+#   PCD_ENC_RAW_F32  : xyz float32[n,3] (BE) ++ rgb float32[n,3] (BE)  — legacy
+#   PCD_ENC_ZLIB_U8  : zlib( xyz float32[n,3] (BE) ++ rgb uint8[n,3] ) — default
+#       RGB is quantised to 8-bit (lossless vs an 8-bit camera) for a 4× colour
+#       saving; the whole body is zlib-deflated. ~2–4× smaller on the wire.
+#
+PCD_ENC_RAW_F32 = 0
+PCD_ENC_ZLIB_U8 = 1
+
+_PCD_HDR = "!iiiiii"
 _PCD_HDR_SIZE = struct.calcsize(_PCD_HDR)
+_PCD_ZLIB_LEVEL = 4   # fast; xyz floats don't deflate much, level 4 ≈ level 9 here
 
 
 def pack_pcd(version: int, xyz: np.ndarray, rgb: np.ndarray,
-             is_snapshot: bool, since_version: int = 0) -> bytes:
+             is_snapshot: bool, since_version: int = 0,
+             compress: bool = True) -> bytes:
     n = int(xyz.shape[0])
-    header = struct.pack(_PCD_HDR, MAGIC_PCD, int(version), n,
-                         1 if is_snapshot else 0, int(since_version))
     xyz_b = np.ascontiguousarray(xyz, dtype=">f4").tobytes()
-    rgb_b = np.ascontiguousarray(rgb, dtype=">f4").tobytes()
-    return header + xyz_b + rgb_b
+    if compress:
+        rgb_u8 = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+        rgb_u8 = np.ascontiguousarray((rgb_u8 * 255.0 + 0.5).astype(np.uint8))
+        body = zlib.compress(xyz_b + rgb_u8.tobytes(), _PCD_ZLIB_LEVEL)
+        enc = PCD_ENC_ZLIB_U8
+    else:
+        body = xyz_b + np.ascontiguousarray(rgb, dtype=">f4").tobytes()
+        enc = PCD_ENC_RAW_F32
+    header = struct.pack(_PCD_HDR, MAGIC_PCD, int(version), n,
+                         1 if is_snapshot else 0, int(since_version), enc)
+    return header + body
 
 
 def unpack_pcd(buf: bytes):
-    """Returns (version, xyz(n,3) f32, rgb(n,3) f32, is_snapshot, since_version)."""
+    """Returns (version, xyz(n,3) f32, rgb(n,3) f32 in [0,1], is_snapshot, since_version)."""
     if len(buf) < _PCD_HDR_SIZE:
         raise ProtocolError("pcd buffer too short")
-    magic, version, n, is_snap, since_v = struct.unpack_from(_PCD_HDR, buf, 0)
+    magic, version, n, is_snap, since_v, enc = struct.unpack_from(_PCD_HDR, buf, 0)
     if magic != MAGIC_PCD:
         raise ProtocolError(f"bad pcd magic 0x{magic & 0xFFFFFFFF:08X}")
-    need = _PCD_HDR_SIZE + n * 24
-    if len(buf) < need:
-        raise ProtocolError(f"pcd truncated: need {need}, have {len(buf)}")
-    off = _PCD_HDR_SIZE
-    xyz = np.frombuffer(buf, dtype=">f4", count=n * 3, offset=off
-                        ).reshape(n, 3).astype(np.float32)
-    rgb = np.frombuffer(buf, dtype=">f4", count=n * 3, offset=off + n * 12
-                        ).reshape(n, 3).astype(np.float32)
-    return version, xyz, rgb, bool(is_snap), since_v
+    body = buf[_PCD_HDR_SIZE:]
+    if enc == PCD_ENC_ZLIB_U8:
+        try:
+            body = zlib.decompress(body)
+        except zlib.error as e:
+            raise ProtocolError(f"pcd zlib decompress failed: {e}")
+        need = n * 12 + n * 3
+        if len(body) < need:
+            raise ProtocolError(f"pcd truncated: need {need}, have {len(body)}")
+        xyz = np.frombuffer(body, dtype=">f4", count=n * 3, offset=0
+                            ).reshape(n, 3).astype(np.float32)
+        rgb = (np.frombuffer(body, dtype=np.uint8, count=n * 3, offset=n * 12
+                             ).reshape(n, 3).astype(np.float32) / 255.0)
+        return version, xyz, rgb, bool(is_snap), since_v
+    elif enc == PCD_ENC_RAW_F32:
+        need = n * 24
+        if len(body) < need:
+            raise ProtocolError(f"pcd truncated: need {need}, have {len(body)}")
+        xyz = np.frombuffer(body, dtype=">f4", count=n * 3, offset=0
+                            ).reshape(n, 3).astype(np.float32)
+        rgb = np.frombuffer(body, dtype=">f4", count=n * 3, offset=n * 12
+                            ).reshape(n, 3).astype(np.float32)
+        return version, xyz, rgb, bool(is_snap), since_v
+    raise ProtocolError(f"unknown pcd encoding {enc}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -489,12 +523,24 @@ def _selftest() -> None:
         ts, seq, h, body = unpack_frame(pack_frame(123456789, 77, ch, jpeg))
         assert ts == 123456789 and seq == 77 and abs(h - ch) < 1e-5 and body == jpeg
 
-    # pcd round-trip
+    # pcd round-trip — compressed (default): xyz lossless, rgb 8-bit quantised
     xyz = rng.random((50, 3), dtype=np.float64).astype(np.float32)
     rgb = rng.random((50, 3), dtype=np.float64).astype(np.float32)
     v, xyz2, rgb2, snap, sv = unpack_pcd(pack_pcd(7, xyz, rgb, True))
     assert v == 7 and snap and sv == 0
-    assert np.allclose(xyz, xyz2, atol=1e-6) and np.allclose(rgb, rgb2, atol=1e-6)
+    assert np.allclose(xyz, xyz2, atol=1e-6)           # positions lossless
+    assert np.allclose(rgb, rgb2, atol=1.0 / 255 + 1e-6)  # colour to 8 bits
+    # delta + legacy raw mode round-trip
+    vv, x3, r3, snap3, sv3 = unpack_pcd(pack_pcd(9, xyz, rgb, False, since_version=7))
+    assert vv == 9 and not snap3 and sv3 == 7
+    v4, x4, r4, snap4, sv4 = unpack_pcd(pack_pcd(7, xyz, rgb, True, compress=False))
+    assert np.allclose(rgb, r4, atol=1e-6)             # raw mode keeps full f32
+    # compression actually shrinks a realistic (spatially-coherent) cloud
+    big = (rng.integers(0, 64, (4000, 3)).astype(np.float32) * 0.05)
+    bcol = rng.random((4000, 3)).astype(np.float32)
+    comp = len(pack_pcd(1, big, bcol, True))
+    raw = len(pack_pcd(1, big, bcol, True, compress=False))
+    assert comp < raw, (comp, raw)
 
     # trajectory round-trip
     traj = rng.random((10, 3)).astype(np.float32)

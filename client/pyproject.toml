@@ -5,11 +5,16 @@ description = "VAT client — receives PRISM point cloud deltas and renders them
 # Standalone, isolated uv project: own client/.venv + client/uv.lock.
 #   cd client && uv sync && uv run python prism_rerun_viewer.py
 # The bring-up tools in ../tools run in this same env.
-requires-python = ">=3.10"
+# Capped <3.13: Open3D (the POC viewer) only ships wheels for cp310–cp312.
+# uv will auto-provision a compatible interpreter for client/.venv.
+requires-python = ">=3.10,<3.13"
 dependencies = [
     # Transport
     "eclipse-zenoh>=1.0",
-    # Visualization
+    # Visualization — Open3D is the POC viewer (native OpenGL, low-latency, no
+    # gRPC/spawn stream). rerun-sdk is kept only for the legacy viewer
+    # (make viewer-rerun) and can be dropped once you're happy with Open3D.
+    "open3d>=0.18",
     "rerun-sdk>=0.21",
     # Numerics
     "numpy>=1.24",

@@ -19,7 +19,7 @@ CLIENT_RUN ?= cd client && uv run python
 
 .PHONY: help steps \
         sync-mapping sync-client sync-router sync-robot sync-docs \
-        router mapping theta-uvc theta-stream robot-docker viewer \
+        router mapping theta-uvc theta-stream robot-docker viewer viewer-rerun \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         teleop fetch_frame \
         docs docs-serve clean
@@ -40,7 +40,8 @@ help:
 	@echo "  make theta-uvc       [ROBOT]  expose Theta X UVC → /dev/video10 (host)"
 	@echo "  make theta-stream    [ROBOT]  headless: Theta → Zenoh (view on host)"
 	@echo "  make robot-docker    [ROBOT]  bridge + theta_camera + pose fuser container"
-	@echo "  make viewer          [CLIENT] full POC viewer (cloud + robot block)"
+	@echo "  make viewer          [CLIENT] full POC viewer — Open3D (cloud + robot + legs)"
+	@echo "  make viewer-rerun    [CLIENT] legacy Rerun viewer (debug/compare)"
 	@echo ""
 	@echo "Staged pre-POC tests (run in this order — see 'make steps'):"
 	@echo "  make test_link           0  transport alive (router + bridge + rates)"
@@ -129,8 +130,13 @@ robot-docker:
 	@echo ">> [ROBOT] build + run container → router $(ROUTER_IP)"
 	bash robot/docker/run.sh $(ROUTER_IP)
 
-# [CLIENT] Full POC viewer.
+# [CLIENT] Full POC viewer — native Open3D (low-latency, no gRPC/spawn stream).
 viewer: sync-client
+	@echo ">> Reminder: router + mapping server must be running."
+	$(CLIENT_RUN) prism_viewer.py --snapshot
+
+# [CLIENT] Legacy Rerun viewer (kept for comparison/debug).
+viewer-rerun: sync-client
 	@echo ">> Reminder: router + mapping server must be running."
 	$(CLIENT_RUN) prism_rerun_viewer.py --snapshot
 

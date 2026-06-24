@@ -34,14 +34,20 @@ import logging
 import argparse
 import threading
 
+import cv2
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 import zenoh
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "common"))
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "common"))
+sys.path.insert(0, os.path.join(_ROOT, "robot", "docker"))
 import vat_protocol as proto  # noqa: E402
 from vat_protocol import quat_identity, quat_normalize, quat_mul, quat_slerp, integrate_pose  # noqa: E402
+# Leg forward-kinematics trackers (same ones the Stage-2 view_robot_state uses):
+# the Go2-W doesn't populate foot_position_body, so legs come from /lowstate FK.
+from kinematics import RobotStateTracker, LowStateTracker, LEG_ORDER  # noqa: E402
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -75,10 +81,41 @@ def _rot_z(deg: float, v: np.ndarray) -> np.ndarray:
 # Go2-W footprint (approx, metres): length × width × height
 ROBOT_HALF = np.array([0.35, 0.16, 0.18], dtype=np.float32)
 
+# Drop point-cloud points farther than this from the origin (m): a single stray
+# far point makes Rerun's 3D view fit a huge bound and the real map collapses to
+# a dot. PRISM maps an indoor volume, so anything past this is an outlier.
+CLOUD_MAX_M = float(os.environ.get("CLOUD_MAX_M", "50.0"))
+
+FOOT_COLORS = {"FR": [255, 80, 80], "FL": [80, 255, 80],
+               "RR": [80, 160, 255], "RL": [255, 220, 60]}
+STICK = np.array([
+    float(os.environ.get("STICK_OFFSET_X", "-0.20")),
+    float(os.environ.get("STICK_OFFSET_Y", "0.0")),
+    float(os.environ.get("STICK_OFFSET_Z", "0.55")),
+], dtype=np.float32)
+
 RR_WORLD = "world"
 RR_PCD   = f"{RR_WORLD}/point_cloud"
 RR_TRAJ  = f"{RR_WORLD}/camera_trajectory"
 RR_ROBOT = f"{RR_WORLD}/robot"
+
+
+def _blueprint() -> rrb.Blueprint:
+    """Explicit layout so the 3D map is the primary, auto-framed view (the
+    default auto-blueprint framed on the origin box before the cloud arrived, so
+    the offset cloud landed off-camera and looked 'missing')."""
+    return rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Spatial3DView(origin=f"/{RR_WORLD}", name="PRISM map + robot"),
+            rrb.Vertical(
+                rrb.Spatial2DView(origin="/camera", name="360° camera"),
+                rrb.TimeSeriesView(origin="/telemetry", name="stream telemetry"),
+                row_shares=[2, 1],
+            ),
+            column_shares=[3, 1],
+        ),
+        collapse_panels=True,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -196,7 +233,7 @@ class PosePredictor:
 
 class PRISMViewer:
     def __init__(self, request_snapshot=False):
-        rr.init("VAT-PRISM-Viewer", spawn=True)
+        rr.init("VAT-PRISM-Viewer", spawn=True, default_blueprint=_blueprint())
         rr.log(RR_WORLD, rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
         # static robot body box (sits under the robot transform)
         rr.log(f"{RR_ROBOT}/body",
@@ -205,6 +242,14 @@ class PRISMViewer:
         rr.log(f"{RR_ROBOT}/heading",
                rr.Arrows3D(origins=[[0, 0, 0]], vectors=[[0.5, 0, 0]],
                            colors=[[255, 80, 80]]), static=True)
+        # selfie-stick + camera marker — children of the robot transform so they
+        # swing with the body (mirrors view_robot_state).
+        rr.log(f"{RR_ROBOT}/stick", rr.LineStrips3D(
+            [np.vstack([[0, 0, 0], STICK])], colors=[[230, 230, 60]], radii=0.012),
+            static=True)
+        rr.log(f"{RR_ROBOT}/camera", rr.Points3D(
+            [STICK], colors=[[255, 255, 0]], radii=0.04, labels=["theta"]),
+            static=True)
 
         self._cloud = LocalCloud()
         self._predictor = PosePredictor()
@@ -228,8 +273,14 @@ class PRISMViewer:
         self._z.declare_subscriber(_KEYS["trajectory"],   self._on_traj)
         self._z.declare_subscriber(_KEYS["status"],       self._on_status)
         self._z.declare_subscriber(_KEYS["pose"],         self._on_pose)
+        self._z.declare_subscriber(_KEYS["camera_frame"], self._on_frame)
+        # Leg FK + body-height trackers (subscribe to /lowstate + sportmodestate
+        # over Zenoh; best-effort, never raise) — same as view_robot_state.
+        self._body_tracker = RobotStateTracker(self._z, ROBOT_NAME)
+        self._leg_tracker = LowStateTracker(self._z, ROBOT_NAME)
+        self._legs_warned = False
         log.info(f"[Viewer] subscribed: pcd, trajectory, status, pose "
-                 f"('{_KEYS['pose']}')")
+                 f"('{_KEYS['pose']}'), camera, legs←'{ROBOT_NAME}/rt/lowstate'")
 
         self._pub_reset = self._z.declare_publisher(RESET_KEY)
         threading.Thread(target=self._stdin_loop, daemon=True).start()
@@ -290,6 +341,18 @@ class PRISMViewer:
         try:
             status = json.loads(bytes(sample.payload).decode())
             rr.log("status", rr.TextLog(json.dumps(status)))
+        except Exception:
+            pass
+
+    def _on_frame(self, sample):
+        """Live 360° camera image + camera-height scalar (mirrors view_robot_state)."""
+        try:
+            _, _, cam_h, jpeg = proto.unpack_frame(bytes(sample.payload))
+            bgr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+            if bgr is not None:
+                rr.log("camera/equirect", rr.Image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)))
+            if cam_h >= 0:
+                rr.log("telemetry/camera_height_m", rr.Scalars(float(cam_h)))
         except Exception:
             pass
 
@@ -368,18 +431,21 @@ class PRISMViewer:
             cloud = self._cloud.take_if_dirty()
             if cloud is not None:
                 xyz, rgb = cloud
-                # Drop non-finite points: a single NaN/Inf makes Rerun's 3D view
-                # fit an infinite bound and the whole cloud collapses to a dot.
-                finite = np.isfinite(xyz).all(axis=1)
-                xyz = xyz[finite]
-                rgb = rgb[finite]
+                n0 = xyz.shape[0]
+                # Drop non-finite + far-outlier points: a single NaN/Inf/stray
+                # point makes Rerun's 3D view fit a huge bound and the real map
+                # collapses to a dot (a prime "cloud not showing" cause).
+                keep = np.isfinite(xyz).all(axis=1) & \
+                    (np.abs(xyz).max(axis=1) <= CLOUD_MAX_M)
+                xyz = xyz[keep]
+                rgb = rgb[keep]
                 colors = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-                rr.log(RR_PCD, rr.Points3D(positions=xyz, colors=colors, radii=0.01))
+                rr.log(RR_PCD, rr.Points3D(positions=xyz, colors=colors, radii=0.02))
                 if not self._logged_cloud_once:
                     self._logged_cloud_once = True
                     log.info(f"[Viewer] rendered first cloud → '{RR_PCD}': "
-                             f"{xyz.shape[0]} finite pts "
-                             f"({int((~finite).sum())} dropped)")
+                             f"{xyz.shape[0]}/{n0} pts kept "
+                             f"({n0 - xyz.shape[0]} non-finite/outlier dropped)")
 
             # robot avatar (every frame, predicted) — apply the manual yaw knob
             # so the operator can align the robot frame with the cloud frame.
@@ -395,6 +461,22 @@ class PRISMViewer:
                 color = [80, 220, 120] if fix == proto.FIX_CORRECTED else [255, 190, 60]
                 rr.log(f"{RR_ROBOT}/body",
                        rr.Boxes3D(half_sizes=[ROBOT_HALF], colors=[color]))
+
+            # legs from /lowstate forward kinematics — children of RR_ROBOT so
+            # they ride the predicted body transform (mirrors view_robot_state).
+            legs, legs_valid = self._leg_tracker.get()
+            if legs_valid and legs:
+                for leg in LEG_ORDER:
+                    p = legs[leg]
+                    chain = np.vstack([p["hip"], p["thigh_root"], p["knee"], p["foot"]])
+                    rr.log(f"{RR_ROBOT}/leg_{leg}", rr.LineStrips3D(
+                        [chain.astype(np.float32)], colors=[FOOT_COLORS[leg]], radii=0.006))
+                    rr.log(f"{RR_ROBOT}/foot_{leg}", rr.Points3D(
+                        [p["foot"].astype(np.float32)], colors=[FOOT_COLORS[leg]],
+                        radii=0.025, labels=[leg]))
+            elif not self._legs_warned:
+                log.info("[Viewer] (no leg data yet — is /lowstate flowing? bridge up?)")
+                self._legs_warned = True
 
             # telemetry (throttled ~5 Hz): freshness of the two streams + knob.
             if now - self._last_tel_t > 0.2:
