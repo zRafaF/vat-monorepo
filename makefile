@@ -21,7 +21,7 @@ CLIENT_RUN ?= cd client && uv run python
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-stream robot-docker viewer viewer-rerun record-frames \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
-        teleop fetch_frame \
+        teleop fetch_frame fetch_pcd \
         docs docs-serve clean
 
 # ── Help / runbook ───────────────────────────────────────────────────────────
@@ -175,6 +175,12 @@ teleop: sync-client
 fetch_frame: sync-client
 	@echo ">> fetching full-res archive frame seq=$(SEQ) from $(ROBOT_NAME)"
 	$(CLIENT_RUN) ../tools/fetch_archive.py --seq $(SEQ)
+
+# [CLIENT] Diagnostic: fetch one PRISM cloud, print stats, save .npz/.ply to open
+# in pano_viz.py — proves whether a bad cloud is a streaming/codec or render issue.
+fetch_pcd: sync-client
+	@echo ">> fetching one PRISM snapshot for inspection (open the .npz in pano_viz)"
+	$(CLIENT_RUN) ../tools/fetch_pcd.py $(if $(OUT),--out $(OUT),)
 
 # Stage 2 — body frame + limb/foot positions, live.
 test_robot_state: sync-client

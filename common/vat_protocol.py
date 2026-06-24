@@ -185,15 +185,27 @@ def _rgb_to_u8(rgb: np.ndarray) -> bytes:
     return np.ascontiguousarray((u * 255.0 + 0.5).astype(np.uint8)).tobytes()
 
 
+_PCD_SANE_LIMIT = 1000.0   # metres; drop points farther than this from the origin
+
+
 def pack_pcd(version: int, xyz: np.ndarray, rgb: np.ndarray,
              is_snapshot: bool, since_version: int = 0,
              compress: bool = True, quantize: bool = True) -> bytes:
     """Serialise a point cloud. Default = 16-bit-quantised + zlib (smallest).
     ``compress=False`` → legacy raw float32; ``quantize=False`` → zlib + f32 xyz."""
+    xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    rgb = np.asarray(rgb, dtype=np.float32).reshape(-1, 3)
+    # Drop non-finite / absurd points BEFORE encoding. A single NaN/Inf makes the
+    # quantisation bbox NaN and corrupts the ENTIRE cloud (and wrecks any viewer's
+    # auto-bounds); a lone far outlier stretches the bbox so the real map collapses
+    # into a few quantisation levels. Filter once, at the source.
+    if xyz.shape[0]:
+        ok = np.isfinite(xyz).all(axis=1) & (np.abs(xyz).max(axis=1) < _PCD_SANE_LIMIT)
+        if not ok.all():
+            xyz, rgb = xyz[ok], rgb[ok]
     n = int(xyz.shape[0])
     if compress and quantize:
         enc = PCD_ENC_ZLIB_QUANT
-        xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
         if n > 0:
             mn = xyz.min(axis=0)
             span = np.maximum(xyz.max(axis=0) - mn, 1e-6)   # avoid /0 on flat axes
