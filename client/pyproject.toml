@@ -11,10 +11,12 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     # Transport
     "eclipse-zenoh>=1.0",
-    # Visualization — Open3D is the POC viewer (native OpenGL, low-latency, no
-    # gRPC/spawn stream). rerun-sdk is kept only for the legacy viewer
-    # (make viewer-rerun) and can be dropped once you're happy with Open3D.
-    "open3d>=0.18",
+    # Visualization — VisPy is the POC viewer: native OpenGL point scatter, no
+    # shaders to write, handles 10^5–10^6 points at 60fps. glfw is the lightweight
+    # windowing backend (if it ever misbehaves, `uv pip install pyqt5` — VisPy auto-
+    # detects it). rerun-sdk kept only for the legacy viewer (make viewer-rerun).
+    "vispy>=0.14",
+    "glfw>=2.6",
     "rerun-sdk>=0.21",
     # Numerics
     "numpy>=1.24",

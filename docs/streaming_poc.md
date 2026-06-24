@@ -288,13 +288,24 @@ Key env vars for the server:
 | `TARGET_WIDTH` | `1036` | Canonical image width fed to PRISM |
 | `TARGET_HEIGHT` | `518` | Canonical image height fed to PRISM |
 
-### Start the Rerun viewer (any machine)
+### Start the viewer (any machine)
 
 ```bash
 # from the repo root (config from vat.env) — runs in client/.venv
-make viewer
-# or directly:  cd client && uv run python prism_rerun_viewer.py --snapshot
+make viewer            # VisPy POC viewer (native OpenGL)
+# or directly:  cd client && uv run python prism_viewer.py --snapshot
+make viewer-rerun      # legacy Rerun viewer (debug/compare)
 ```
+
+The POC viewer is **VisPy** (native-OpenGL GPU point scatter; the earlier Rerun
+build froze on the stream and Open3D was finicky for live updates). The robot
+block, legs (`/lowstate` FK), selfie-stick and trajectory update continuously from
+the low-latency pose stream; the **point cloud is fetched on demand** — press `1`
+to pull the freshest full snapshot (it *replaces* the local cloud, so nothing
+accumulates or drifts), `R` to reset (wipe the server map + local), `F` to refit
+the view, `,`/`.`/`/` to nudge the cloud↔robot yaw, `N`/`M` for point size. Pose
+and legs run on a separate Zenoh session from the bulky cloud query so a fetch
+never starves them. There is **no video stream** in the viewer (BW only).
 
 ### Tune the frame rate live (from any machine)
 
@@ -315,7 +326,7 @@ zenoh put --key go2/rt/prism/config/throttle_fps --payload 5.0
 
 ### Point cloud  (`server/prism/pcd_delta`, `server/prism/pcd_snapshot`)
 
-All values big-endian.
+24-byte header (big-endian), then an encoding-dependent body:
 
 | Offset | Bytes | Type | Field |
 |---|---|---|---|
@@ -324,8 +335,22 @@ All values big-endian.
 | 8 | 4 | `int32` | `n_points` |
 | 12 | 4 | `int32` | `is_snapshot` — 1 = full cloud, 0 = delta |
 | 16 | 4 | `int32` | `since_version` — delta base version (0 if snapshot) |
-| 20 | n×12 | `float32[n,3]` | XYZ positions |
-| 20+n×12 | n×12 | `float32[n,3]` | RGB colours in [0, 1] |
+| 20 | 4 | `int32` | `encoding` — 0 RAW_F32 · 1 ZLIB_U8 · **2 ZLIB_QUANT (default)** |
+
+**Body — `ZLIB_QUANT` (default):** `[bbox_min 3×f32][bbox_span 3×f32]` then
+`zlib( xyz uint16[n,3] ++ rgb uint8[n,3] )`. Positions are quantised to 16 bits
+per axis over the cloud's own bounding box (≈ span/65535 ≈ sub-mm at room scale)
+and colour to 8 bits, then deflated — **~7 wire-bytes/point, ~3–4× smaller than
+raw**, lossless to the eye. Non-finite / >1 km outliers are dropped *before*
+quantising (a single NaN would otherwise make the bbox NaN and corrupt the whole
+cloud). `RAW_F32` (xyz+rgb float32) and `ZLIB_U8` (zlib + f32 xyz + uint8 rgb)
+remain decodable. `pack_pcd`/`unpack_pcd` in `common/vat_protocol.py` are the one
+source of truth; inspect a live cloud with `make fetch_pcd` (saves `.npz`/`.ply`).
+
+> The server still *supports* per-submap keyframe + delta pushes, but the VisPy
+> viewer ignores them and fetches a full snapshot on demand — simpler and immune
+> to delta-accumulation drift. Delta block *removal* (TSDF decay) isn't tracked, so
+> on-demand full snapshots are the correct, drift-free choice for the POC.
 
 ### Trajectory  (`server/prism/trajectory`)
 
@@ -430,23 +455,44 @@ future, forward kinematics of an arm from a URDF (`URDFArmModel`, placeholder;
 set `ROBOT_MODEL=urdf` + `ROBOT_URDF=…`). For the Go2-W the *wheels* are
 continuous joints — they don't change `T_base_camera`, only the body height.
 
-**2. Camera height above the floor** (for PRISM metric scale). The Go2-W can lie
-down / stand up, so this is **not** constant:
+**2. Camera height above the floor** — the input to PRISM's **metric scale**. The
+robot stamps a camera height into every `{robot}/prism/camera/frame`; the server
+reads it from the frame (falling back to `CAMERA_HEIGHT` only if `< 0`).
 
-```
-camera_height = body_height + (R_body · stick_offset).z
-```
+> **Critical: anchor the scale ONCE, then let VGGT carry it.** PRISM-VGGT is
+> scale-ambiguous; the camera height gives it a metric anchor. We learned the hard
+> way that the height must be *consistent across frames*. The engine used to re-pull
+> each submap's scale toward that submap's floor/height estimate
+> (`s_est = 0.9·s_est + 0.1·floor_scale`); with a per-frame height that wobbled, every
+> submap landed at a slightly different scale and **the submaps no longer
+> registered — the global map looked "misaligned."** The gradio offline run used a
+> *single constant* height and aligned perfectly. The fix, in two parts:
+>
+> * **Engine** (`prism_vggt/engine.py`): metric scale is anchored **only on the first
+>   window** (from the floor / camera height); every later window inherits scale
+>   through the overlap-camera **Sim3 chain**. The per-window floor pull is off by
+>   default (re-enable with `SCALE_TRACK_FLOOR=1` only if the stamped height is
+>   rock-steady).
+> * **Robot** (`theta_camera.py`): stamps a *consistent* height. `CAMERA_HEIGHT_MODE`
+>   selects how:
+>     * `const` (default) — one fixed `CAMERA_HEIGHT_M` (measured ground→camera,
+>       1.15 m) for every frame. Even a slightly wrong constant only rescales the
+>       whole map uniformly (correct *shape*); a varying one shears it.
+>     * `legs` — a **stance-aware** height derived from the leg forward kinematics:
+>       the four feet define the ground plane, the base sits `‑mean(R_body·foot).z`
+>       above it, and `camera_height = base_height + (R_body·stick_offset).z`. Stable
+>       and correct as the dog crouches/stands; accounts for body roll/pitch (roll
+>       swings the camera sideways *and* lowers it). See `kinematics.camera_height_above_ground`.
 
-`body_height` comes from `SportModeState.body_height` (live, via the bridge),
-`R_body` from the IMU quaternion (so body tilt is accounted for). The robot
-computes this at frame-capture time and stamps it into every
-`{robot}/prism/camera/frame` message; the server reads it straight from the
-frame (falling back to its `CAMERA_HEIGHT` env var only if the value is `< 0`).
+The leg-derived height also fixes a Stage-2 visual bug: placing the body at
+`SportModeState.body_height` left it pinned while the legs rose when the dog went
+prone; deriving the base height from the feet lowers the *body* instead (used in
+`view_robot_state`, the same helper the robot can stamp).
 
-`RobotStateTracker` decodes `SportModeState` directly from the bridged CDR using
-`rosbags` (no ROS install) via embedded `unitree_go` message definitions. If the
-custom message can't be decoded (firmware layout differs), it falls back to a
-configured constant and never crashes — verify the layout against your firmware.
+`RobotStateTracker` / `LowStateTracker` decode `SportModeState` / `LowState`
+directly from the bridged CDR using `rosbags` (no ROS install) via embedded
+`unitree_go` message definitions. If the layout differs they fall back to a
+constant and never crash — verify against your firmware.
 
 ---
 
@@ -548,28 +594,26 @@ by the viewer is ~3–4 s end-to-end. This is acceptable for a mapping POC.
 
 ## Known limitations (POC)
 
-### Online streaming mode
+### Online metric scale (resolved)
 
-`StreamingWindowEngine.process_sequence()` calls `self.reset()` at the start of
-every invocation — it was designed for offline batch mode. The server works
-around this by replaying the full accumulated frame list on every new sub-window.
-This is O(N) in total frames processed, which becomes slow for long sessions.
+`process_sequence(reset=False)` runs the engine **online** — it keeps the
+persistent map and processes only new windows. The map's metric scale is now
+anchored **once** on the first window and propagated through the overlap Sim3
+chain; the per-window floor pull is off by default (`SCALE_TRACK_FLOOR=1` to
+re-enable). Combined with a *consistent* stamped camera height
+(`CAMERA_HEIGHT_MODE=const|legs`, see [camera height](#robot-kinematics-camera--base-and-camera-height)),
+this fixed the "misaligned" global map. The known-good gradio offline run uses
+`window 16 / overlap 4`; the server defaults match it (`vat.env`).
 
-**Fix (TODO):** extend `StreamingWindowEngine` with an `add_frame()` / `step()`
-API that maintains internal state across calls without resetting. The
-`NvbloxPanoTSDF` mapper already supports incremental integration; only the
-sliding-window bookkeeping in `process_sequence()` needs restructuring.
+### Cloud delivery: on-demand full snapshots
 
-### Delta streaming is approximate
-
-The current server publishes per-submap deltas by calling
-`engine.get_point_cloud_delta(version - 1)` — this gives only blocks that
-changed in the last submap. Because the engine resets on each `process_sequence`
-call, `version` restarts from 0 each time, so the client may receive duplicate
-points. The `LocalCloud` accumulator on the client side merges by version key,
-which limits visual artefacts.
-
-This is resolved once the true online engine mode is implemented.
+The viewer does **not** subscribe to the pushed cloud stream; it fetches a full
+snapshot from the `pcd_snapshot` queryable on demand (key `1`) and replaces its
+local cloud. This sidesteps delta accumulation entirely: the engine's
+`get_point_cloud_delta()` reports changed/added blocks but **not removals** (TSDF
+decay), so accumulating deltas client-side drifts over time. The server still
+supports keyframe+delta push (`PCD_KEYFRAME_EVERY`) for a future always-on client,
+but full-snapshot-on-demand is the drift-free POC default.
 
 ### No navigation or ESDF
 
