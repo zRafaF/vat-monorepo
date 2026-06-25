@@ -199,6 +199,9 @@ docs: sync-docs
 docs-serve: sync-docs
 	uv run mkdocs serve
 
+docs-deploy: sync-docs
+	uv run mkdocs gh-deploy --force
+
 # ── Housekeeping ─────────────────────────────────────────────────────────────
 clean:
 	@find . -name __pycache__ -type d -not -path './.venv/*' -exec rm -rf {} + 2>/dev/null || true
