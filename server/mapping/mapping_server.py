@@ -152,7 +152,10 @@ class OnlinePRISMSession:
             max_depth=MAX_DEPTH, face_size=FACE_SIZE)
         self.engine.compute_esdf = False
         self.engine.point_cloud_only = True
-        log.info("[PRISM] Engine ready.")
+        # Set PROCESSING_MODE=sequential to A/B the parallel A/B perception pipeline
+        # (rule it out as the source of online drift). Default keeps parallel.
+        self.engine.processing_mode = os.environ.get("PROCESSING_MODE", "parallel").strip().lower()
+        log.info(f"[PRISM] Engine ready (processing_mode={self.engine.processing_mode}).")
 
         self._frames: dict[int, FrameInput] = {}
         self._lock = threading.Lock()
@@ -200,9 +203,28 @@ class OnlinePRISMSession:
         adds WINDOW_SIZE-OVERLAP new poses to the persistent trajectory.
         """
         with self._lock:
-            all_seqs = sorted(self._frames)
-            frames_list = [self._frames[s] for s in all_seqs]
-            max_seq = all_seqs[-1] if all_seqs else -1
+            if not self._frames:
+                return
+            seqs = sorted(self._frames)
+            lo = seqs[0]
+            # CONTIGUOUS, gap-free prefix so a frame's list index never shifts
+            # between calls. The engine tracks processed windows by index
+            # (_done_starts) and stitches submaps by their shared OVERLAP frames;
+            # a late/recovered (out-of-order) frame inserted into sorted() would
+            # shift every later index and break that overlap correspondence →
+            # the progressive submap misalignment / "cloning" seen on streaming
+            # (gradio's offline list is fixed + in-order, so it never drifts).
+            # Stopping at the first gap keeps index == seq-lo stable; a recovered
+            # frame simply EXTENDS the prefix.
+            frames_list = []
+            s = lo
+            while s in self._frames:
+                frames_list.append(self._frames[s])
+                s += 1
+            max_seq = s - 1
+            if s <= seqs[-1]:
+                log.warning(f"[PRISM] frame gap at seq={s} (have up to {seqs[-1]}); "
+                            f"processing contiguous prefix [{lo}..{max_seq}] only")
         if len(frames_list) < WINDOW_SIZE:
             return
         try:
