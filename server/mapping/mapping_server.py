@@ -602,7 +602,6 @@ class MappingServer:
                     "n_points_streamed": sent_pts, "submap": n_sub,
                     "submap_s": round(time.time() - t_iter, 2),
                     "cloud_mbps": round(self._cloud_mbps, 3),
-                    "payload_kb": round(payload_bytes / 1024, 1),
                     "frames_buffered": total, "trigger": trigger,
                     "seq_gaps": self._gap_count})
                 log.info(f"[Server] ✓ submap v{version}: {kind} {sent_pts} pts "

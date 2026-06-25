@@ -27,17 +27,20 @@ import sys
 import time
 import struct
 import argparse
+import threading
 
 import numpy as np
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "common"))
 import vat_protocol as proto  # noqa: E402
+import vat_blockmap as bm  # noqa: E402
 import zenoh  # noqa: E402
 
 ROUTER        = os.environ.get("ZENOH_ROUTER", "tcp/127.0.0.1:7447")
 ROBOT_NAME    = os.environ.get("ROBOT_NAME", "go2")
 SERVER_PREFIX = os.environ.get("SERVER_PREFIX", "server/prism")
+CUBE_SIZE     = float(os.environ.get("CUBE_SIZE", "1.0"))
 K = proto.keys(ROBOT_NAME, SERVER_PREFIX)
 _ENC = {0: "RAW_F32", 1: "ZLIB_U8", 2: "ZLIB_QUANT"}
 
@@ -59,21 +62,34 @@ def _write_ply(path, xyz, rgb):
         f.write(rec.tobytes())
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Fetch + inspect a PRISM snapshot")
-    ap.add_argument("--out", default=os.path.expanduser("~/Downloads/pcd"))
-    ap.add_argument("--timeout", type=float, default=10.0)
-    args = ap.parse_args()
-    os.makedirs(args.out, exist_ok=True)
+def _stats(tag, xyz, rgb):
+    n = xyz.shape[0]
+    finite = np.isfinite(xyz).all(axis=1)
+    far = int((np.abs(xyz).max(axis=1) > 50.0).sum()) if n else 0
+    print(f"[{tag}] {n} pts   non-finite {int((~finite).sum())}   |coord|>50m {far}")
+    fx = xyz[finite]
+    if fx.shape[0]:
+        print(f"       bbox {np.round(fx.min(0), 2)} .. {np.round(fx.max(0), 2)}  "
+              f"span {np.round(fx.max(0) - fx.min(0), 2)} m")
 
-    conf = zenoh.Config()
-    conf.insert_json5("connect/endpoints", f'["{ROUTER}"]')
-    conf.insert_json5("mode", '"client"')
-    z = zenoh.open(conf)
-    print(f"Connected to {ROUTER}; querying '{K['pcd_snapshot']}' …")
 
+def _save(out, tag, xyz, rgb):
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    base = os.path.join(out, f"pcd_{tag}_{ts}")
+    rgb01 = rgb.astype(np.float32) / 255.0 if rgb.dtype != np.float32 or rgb.max() > 1.0 + 1e-6 else rgb
+    np.savez(base + ".npz", points=xyz.astype(np.float32),
+             colors=(np.clip(rgb01, 0, 1) * 255).astype(np.uint8))   # pano_viz format
+    try:
+        _write_ply(base + ".ply", xyz, np.clip(rgb01, 0, 1))
+    except Exception as e:
+        print(f"  (ply skipped: {e})")
+    print(f"  saved {base}.npz / .ply   ← open in pano_viz.py")
+
+
+def fetch_full(z, timeout):
+    """The SERVER'S canonical full cloud (engine.get_point_cloud_snapshot)."""
     data = None
-    for reply in z.get(K["pcd_snapshot"], timeout=args.timeout):
+    for reply in z.get(K["pcd_snapshot"], timeout=timeout):
         try:
             if reply.ok:
                 buf = bytes(reply.result.payload)
@@ -81,42 +97,70 @@ def main():
                     data = buf
         except Exception:
             pass
-    z.close()
-    if not data:
-        print("✗ no snapshot reply — is the mapping server running & has it mapped?")
-        return
+    if not data or len(data) <= 20:
+        print("✗ FULL: no snapshot reply (server mapping yet?)")
+        return None
+    enc = struct.unpack_from("!iiiiii", data, 0)[5]
+    print(f"[full] wire {len(data)/1e6:.3f} MB  encoding {_ENC.get(enc, enc)}")
+    v, xyz, rgb, *_ = proto.unpack_pcd(data)              # rgb in [0,1]
+    return xyz, (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
 
-    magic, version, n_hdr, is_snap, since_v, enc = struct.unpack_from("!iiiiii", data, 0)
-    print(f"wire: {len(data)/1e6:.3f} MB  encoding={_ENC.get(enc, enc)}  "
-          f"version={version}  n(header)={n_hdr}  snapshot={bool(is_snap)}")
 
-    v, xyz, rgb, snap, sv = proto.unpack_pcd(data)
-    n = xyz.shape[0]
-    if n == 0:
-        print("decoded 0 points (empty/cleared map).")
-        return
-    finite = np.isfinite(xyz).all(axis=1)
-    far = np.abs(xyz).max(axis=1) > 50.0
-    print(f"decoded: {n} pts   {len(data)/max(n,1):.2f} wire-bytes/pt")
-    print(f"  non-finite: {int((~finite).sum())}   |coord|>50m: {int(far.sum())}")
-    fx = xyz[finite]
-    if fx.shape[0]:
-        print(f"  bbox min = {np.round(fx.min(0), 3)}   max = {np.round(fx.max(0), 3)}"
-              f"   span = {np.round(fx.max(0) - fx.min(0), 3)} m")
-    print(f"  rgb range = [{rgb.min():.2f}, {rgb.max():.2f}]   sample xyz = {np.round(xyz[0], 3)}")
+def fetch_blocks(z, timeout):
+    """What the CLIENT reconstructs from the block-sync manifest + Draco bundles."""
+    store = bm.ClientBlockStore(CUBE_SIZE)
+    man = {}
+    evt = threading.Event()
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    base = os.path.join(args.out, f"pcd_{ts}")
-    np.savez(base + ".npz", points=xyz.astype(np.float32),
-             colors=(np.clip(rgb, 0, 1) * 255).astype(np.uint8))   # pano_viz format
-    with open(base + ".bin", "wb") as f:
-        f.write(data)
+    def on_man(sample):
+        nonlocal man
+        try:
+            man = bm.unpack_manifest(bytes(sample.payload)); evt.set()
+        except Exception:
+            pass
+
+    z.declare_subscriber(K["pcd_manifest"], on_man)
+    if not evt.wait(timeout):
+        print("✗ BLOCKS: no manifest (is block-sync server running?)")
+        return None
+    need, _ = bm.diff_manifest({}, man)
+    print(f"[blocks] manifest {len(man)} cubes; requesting all…")
+    for reply in z.get(K["pcd_blocks"], payload=bm.pack_request(need), timeout=timeout):
+        if reply.ok:
+            store.apply_bundle_bytes(bytes(reply.result.payload))
+    return store.merged()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Fetch + inspect a live PRISM cloud")
+    ap.add_argument("--out", default=os.path.expanduser("~/Downloads/pcd"))
+    ap.add_argument("--timeout", type=float, default=15.0)
+    ap.add_argument("--blocks", action="store_true",
+                    help="reconstruct the CLIENT view via block-sync instead of the full snapshot")
+    ap.add_argument("--both", action="store_true",
+                    help="fetch BOTH (server full + client blocks) to compare in pano_viz")
+    args = ap.parse_args()
+    os.makedirs(args.out, exist_ok=True)
+
+    conf = zenoh.Config()
+    conf.insert_json5("connect/endpoints", f'["{ROUTER}"]')
+    conf.insert_json5("mode", '"client"')
+    z = zenoh.open(conf)
+    print(f"Connected to {ROUTER}")
     try:
-        _write_ply(base + ".ply", xyz, rgb)
-        ply_note = base + ".ply"
-    except Exception as e:
-        ply_note = f"(ply skipped: {e})"
-    print(f"saved:\n  {base}.npz   ← open this in pano_viz.py\n  {ply_note}\n  {base}.bin (raw)")
+        if args.both or not args.blocks:
+            r = fetch_full(z, args.timeout)
+            if r:
+                _stats("full", *r); _save(args.out, "full", *r)
+        if args.both or args.blocks:
+            r = fetch_blocks(z, args.timeout)
+            if r:
+                _stats("blocks", *r); _save(args.out, "blocks", *r)
+    finally:
+        z.close()
+    if args.both:
+        print("→ open BOTH npz in pano_viz: if 'full' is misaligned the SERVER map is; "
+              "if only 'blocks' is, the client/sync is.")
 
 
 if __name__ == "__main__":

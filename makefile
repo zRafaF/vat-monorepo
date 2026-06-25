@@ -179,8 +179,8 @@ fetch_frame: sync-client
 # [CLIENT] Diagnostic: fetch one PRISM cloud, print stats, save .npz/.ply to open
 # in pano_viz.py — proves whether a bad cloud is a streaming/codec or render issue.
 fetch_pcd: sync-client
-	@echo ">> fetching one PRISM snapshot for inspection (open the .npz in pano_viz)"
-	$(CLIENT_RUN) ../tools/fetch_pcd.py $(if $(OUT),--out $(OUT),)
+	@echo ">> fetch a live PRISM cloud for pano_viz. ARGS=--both compares server vs client."
+	$(CLIENT_RUN) ../tools/fetch_pcd.py $(if $(OUT),--out $(OUT),) $(ARGS)
 
 # Stage 2 — body frame + limb/foot positions, live.
 test_robot_state: sync-client
