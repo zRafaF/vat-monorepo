@@ -51,6 +51,8 @@ from vat_protocol import (  # noqa: E402
     quat_identity, quat_normalize, quat_mul, quat_slerp, integrate_pose)
 import zenoh  # noqa: E402
 from kinematics import RobotStateTracker, LowStateTracker, LEG_ORDER  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))         # client/ (block_sync)
+from block_sync import BlockSync  # noqa: E402
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -70,6 +72,7 @@ SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
 POSE_LOOKAHEAD_S = float(os.environ.get("POSE_LOOKAHEAD_S", "0.0"))
 CLOUD_MAX_M   = float(os.environ.get("CLOUD_MAX_M", "50.0"))
 PT_SIZE       = float(os.environ.get("PCD_POINT_SIZE", "3.0"))
+CUBE_SIZE     = float(os.environ.get("CUBE_SIZE", "1.0"))   # block-sync cube edge (m)
 
 _KEYS = proto.keys(ROBOT_NAME, SERVER_PREFIX)
 RESET_KEY = f"{SERVER_PREFIX}/cmd/reset"
@@ -153,42 +156,6 @@ def ground_grid(size=4.0, step=0.5):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class LocalCloud:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._xyz = None
-        self._rgb = None
-        self._dirty = False
-        self._cleared = False
-
-    def apply_snapshot(self, version, xyz, rgb):
-        if xyz.shape[0] == 0:
-            self.clear()
-            log.info(f"[Cloud] empty snapshot v{version} → cleared")
-            return
-        with self._lock:
-            self._xyz, self._rgb, self._dirty = xyz, rgb, True
-        log.info(f"[Cloud] snapshot v{version}: {xyz.shape[0]} pts")
-
-    def clear(self):
-        with self._lock:
-            self._xyz = self._rgb = None
-            self._dirty = False
-            self._cleared = True
-
-    def pop_cleared(self):
-        with self._lock:
-            c, self._cleared = self._cleared, False
-            return c
-
-    def take_if_dirty(self):
-        with self._lock:
-            if not self._dirty or self._xyz is None:
-                return None
-            self._dirty = False
-            return self._xyz, self._rgb
-
-
 class PosePredictor:
     def __init__(self):
         self._lock = threading.Lock()
@@ -249,32 +216,20 @@ class PosePredictor:
 
 class PRISMViewer:
     def __init__(self, request_snapshot=False):
-        self._cloud = LocalCloud()
         self._predictor = PosePredictor()
         self._yaw_offset_deg = float(os.environ.get("CLOUD_YAW_OFFSET_DEG", "0"))
         self._traj = None
         self._traj_lock = threading.Lock()
         self._legs_warned = False
-        self._fetching = False
         self._cloud_framed = False
+        self._cloud_n = 0
         self._pt_size = PT_SIZE
         self._last_tick = time.monotonic()
-        # streamed cloud: callback stashes the latest RAW bytes; a worker decodes
-        # off the GL + zenoh-callback threads and REPLACES the local cloud.
-        self._raw_pcd = None
-        self._raw_lock = threading.Lock()
-        self._raw_evt = threading.Event()
-        self._last_cloud_mono = 0.0
-        self._cloud_n = 0
-        self._cloud_dt_ema = 0.0
-        # throughput counters (cumulative bytes; rates computed in the HUD)
-        self._cloud_bytes = 0
+        # throughput: pose recv bytes (cloud bytes come from BlockSync stats)
         self._pose_bytes = 0
         self._status = {}                # latest server-published metrics (JSON)
         self._m_prev_t = time.monotonic()
-        self._m_prev_cloud = 0
         self._m_prev_pose = 0
-        self._m_cloud_bps = 0.0
         self._m_pose_bps = 0.0
 
         log.info(f"[Viewer] Connecting to Zenoh at {ZENOH_ROUTER}...")
@@ -282,9 +237,9 @@ class PRISMViewer:
         self._z_fast = self._open(self._conf())          # isolate low-latency pose/legs
         log.info("[Viewer] Connected (2 sessions: bulk + low-latency).")
 
-        # bulk session: STREAMED point cloud (server pushes a full compressed
-        # snapshot per submap; each REPLACES our cloud → always aligned) + trajectory.
-        self._z.declare_subscriber(_KEYS["pcd_snapshot"], self._on_pcd_raw)
+        # bulk session: DIFF-BASED block sync (manifest + Draco bundles, only the
+        # cubes that changed) + trajectory + server status.
+        self._blocksync = BlockSync(self._z, cube_m=CUBE_SIZE, server_prefix=SERVER_PREFIX)
         self._z.declare_subscriber(_KEYS["trajectory"], self._on_traj)
         self._z.declare_subscriber(_KEYS["status"], self._on_status)
         self._pub_reset = self._z.declare_publisher(RESET_KEY)
@@ -292,12 +247,8 @@ class PRISMViewer:
         self._z_fast.declare_subscriber(_KEYS["pose"], self._on_pose)
         self._body_tracker = RobotStateTracker(self._z_fast, ROBOT_NAME)
         self._leg_tracker = LowStateTracker(self._z_fast, ROBOT_NAME)
-        log.info(f"[Viewer] subscribed: [bulk] pcd stream + trajectory | [fast] pose, "
+        log.info(f"[Viewer] subscribed: [bulk] block-sync + trajectory | [fast] pose, "
                  f"legs←'{ROBOT_NAME}/rt/lowstate'")
-
-        threading.Thread(target=self._decode_worker, daemon=True).start()
-        if request_snapshot:
-            threading.Thread(target=self._request_snapshot, daemon=True).start()
 
     @staticmethod
     def _conf():
@@ -339,72 +290,13 @@ class PRISMViewer:
         except Exception:
             pass
 
-    # ── streamed cloud: stash latest raw bytes (callback stays instant) ──────
-    def _on_pcd_raw(self, sample):
-        buf = bytes(sample.payload)
-        self._cloud_bytes += len(buf)
-        with self._raw_lock:
-            self._raw_pcd = buf                       # latest wins; stale dropped
-        self._raw_evt.set()
-
-    def _decode_worker(self):
-        """Decode streamed snapshots off the zenoh-callback AND GL threads, then
-        REPLACE the local cloud (full snapshots only — a delta wouldn't be a whole
-        map). Latest-only: if several arrive while we decode, we skip to the newest."""
-        while True:
-            self._raw_evt.wait()
-            self._raw_evt.clear()
-            with self._raw_lock:
-                raw, self._raw_pcd = self._raw_pcd, None
-            if raw is None or len(raw) <= 24:
-                continue
-            try:
-                v, xyz, rgb, is_snap, _sv = proto.unpack_pcd(raw)
-            except proto.ProtocolError as e:
-                log.warning(f"[Viewer] pcd decode: {e}")
-                continue
-            if not is_snap:
-                continue                              # ignore deltas (we replace wholesale)
-            now = time.monotonic()
-            if self._last_cloud_mono:
-                dt = now - self._last_cloud_mono
-                self._cloud_dt_ema = dt if self._cloud_dt_ema == 0 else 0.8 * self._cloud_dt_ema + 0.2 * dt
-            self._last_cloud_mono = now
-            self._cloud.apply_snapshot(v, xyz, rgb)
-
-    # ── manual force-fetch via the queryable (fallback; '1') ─────────────────
-    def _request_snapshot(self):
-        if self._fetching:
-            return
-        self._fetching = True
-        try:
-            log.info(f"[Viewer] fetching snapshot from '{_KEYS['pcd_snapshot']}'…")
-            data = None
-            for reply in self._z.get(_KEYS["pcd_snapshot"], timeout=10.0):
-                try:
-                    if reply.ok:
-                        buf = bytes(reply.result.payload)
-                        if data is None or len(buf) > len(data):
-                            data = buf
-                except Exception:
-                    pass
-            if data and len(data) > 20:
-                v, xyz, rgb, *_ = proto.unpack_pcd(data)
-                self._cloud.apply_snapshot(v, xyz, rgb)
-            else:
-                log.warning("[Viewer] no snapshot reply (server mapping yet?)")
-        except Exception as e:
-            log.warning(f"[Viewer] snapshot fetch failed: {e}")
-        finally:
-            self._fetching = False
-
     def _reset_map(self):
-        log.info("[Viewer] RESET → clear cloud + wipe server map")
+        log.info("[Viewer] RESET → wipe server map + local cubes")
         try:
             self._pub_reset.put(b"reset")
         except Exception as e:
             log.warning(f"[Viewer] reset publish failed: {e}")
-        self._cloud.clear()
+        self._blocksync.force_resync()
         self._cloud_framed = False
 
     # ── render setup + loop (main thread, VisPy event loop) ─────────────────
@@ -439,7 +331,7 @@ class PRISMViewer:
         def _on_key(ev):
             k = (ev.text or "").lower()
             if k == "1":
-                threading.Thread(target=self._request_snapshot, daemon=True).start()
+                self._blocksync.force_resync()      # drop local cubes → full refetch
             elif k == "r":
                 self._reset_map()
             elif k == "f":
@@ -484,24 +376,24 @@ class PRISMViewer:
         dt = now - self._last_tick
         self._last_tick = now
 
-        if self._cloud.pop_cleared():
-            self._cloud_vis.set_data(np.zeros((0, 3), np.float32))
-
-        c = self._cloud.take_if_dirty()
-        if c is not None:
-            xyz, rgb = c
-            keep = np.isfinite(xyz).all(axis=1) & (np.abs(xyz).max(axis=1) <= CLOUD_MAX_M)
-            xyz, rgb = xyz[keep], rgb[keep]
+        # cloud: BlockSync hands us the merged map only when a cube changed
+        m = self._blocksync.take_merged()
+        if m is not None:
+            xyz, rgb = m
             if xyz.shape[0]:
-                rgba = np.empty((xyz.shape[0], 4), np.float32)
-                rgba[:, :3] = np.clip(rgb, 0, 1)
-                rgba[:, 3] = 1.0
+                keep = np.isfinite(xyz).all(axis=1) & (np.abs(xyz).max(axis=1) <= CLOUD_MAX_M)
+                xyz, rgb = xyz[keep], rgb[keep]
+                rgba = np.ones((xyz.shape[0], 4), np.float32)
+                rgba[:, :3] = rgb.astype(np.float32) / 255.0
                 self._cloud_vis.set_data(xyz.astype(np.float32), face_color=rgba,
                                          size=self._pt_size, edge_width=0)
                 self._cloud_n = int(xyz.shape[0])
                 if not self._cloud_framed:
                     self._view.camera.set_range()
                     self._cloud_framed = True
+            else:
+                self._cloud_vis.set_data(np.zeros((0, 3), np.float32))
+                self._cloud_n = 0
 
         # trajectory
         with self._traj_lock:
@@ -534,14 +426,12 @@ class PRISMViewer:
         self._update_hud()
 
     def _update_hud(self):
-        # recompute receive throughput every ~0.5 s (cumulative byte deltas)
+        # recompute pose receive throughput every ~0.5 s (cumulative byte deltas)
         now = time.monotonic()
         el = now - self._m_prev_t
         if el >= 0.5:
-            self._m_cloud_bps = (self._cloud_bytes - self._m_prev_cloud) / el
             self._m_pose_bps = (self._pose_bytes - self._m_prev_pose) / el
-            self._m_prev_t, self._m_prev_cloud, self._m_prev_pose = \
-                now, self._cloud_bytes, self._pose_bytes
+            self._m_prev_t, self._m_prev_pose = now, self._pose_bytes
 
         tel = self._predictor.telemetry()
         if tel is None:
@@ -555,20 +445,19 @@ class PRISMViewer:
             pose_line = (f"POSE  age {age*1000:4.0f}ms  rate {rate_s}  "
                          f"e2e {e2e_s}  {self._m_pose_bps/1024:5.1f} KB/s  fix {fixs}{warn}")
 
-        c_age = (now - self._last_cloud_mono) if self._last_cloud_mono else -1.0
-        c_rate = (1.0 / self._cloud_dt_ema) if self._cloud_dt_ema > 1e-6 else float("nan")
-        c_age_s = f"{c_age:4.1f}s" if c_age >= 0 else "  – "
-        c_rate_s = f"{c_rate:4.2f}Hz" if c_rate == c_rate else "  – "
-        cloud_line = (f"CLOUD  {self._cloud_n} pts  age {c_age_s}  rate {c_rate_s}  "
-                      f"{self._m_cloud_bps/1e6:5.2f} MB/s recv")
+        # cloud line from BlockSync (diff-based): cubes held, last sync cost
+        bs = self._blocksync
+        cloud_line = (f"CLOUD  {self._cloud_n} pts  {bs.cubes} cubes  "
+                      f"last sync {bs.last_need} cubes / {bs.last_bundle_bytes/1024:5.1f} KB "
+                      f"in {bs.last_sync_ms:4.0f}ms  total {bs.bytes_total/1e6:.2f} MB")
 
         # server-published metrics (cross-network view → find the bottleneck)
         s = self._status
         if s:
             srv = (f"SERVER  submap {s.get('submap_s', 0):.2f}s  "
-                   f"out {s.get('cloud_mbps', 0):.2f} MB/s  "
-                   f"buf {s.get('frames_buffered', '?')}f  "
-                   f"sent {s.get('n_points_streamed', '?')}/{s.get('n_points', '?')} pts")
+                   f"cubes {s.get('cubes_changed', '?')}/{s.get('cubes', '?')} changed  "
+                   f"manifest {s.get('manifest_kb', '?')} KB  "
+                   f"buf {s.get('frames_buffered', '?')}f  map {s.get('n_points', '?')} pts")
         else:
             srv = "SERVER  (no status yet)"
 

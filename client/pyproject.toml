@@ -17,6 +17,8 @@ dependencies = [
     # detects it). rerun-sdk kept only for the legacy viewer (make viewer-rerun).
     "vispy>=0.14",
     "glfw>=2.6",
+    # Draco point-cloud compression for the block-sync bundle (client decodes)
+    "DracoPy>=1.4",
     "rerun-sdk>=0.21",
     # Numerics
     "numpy>=1.24",

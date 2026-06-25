@@ -49,6 +49,7 @@ import zenoh
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "common"))
 import vat_protocol as proto  # noqa: E402
+from block_publisher import BlockPublisher  # noqa: E402  (same dir; wraps vat_blockmap)
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -83,6 +84,8 @@ OVERLAP       = int(os.environ.get("OVERLAP",      "4"))
 # Cap points in the STREAMED snapshot to keep the uplink sane (full-res is still
 # available via the on-demand `pcd_snapshot` query). 0 = no cap.
 CLOUD_STREAM_MAX_POINTS = int(os.environ.get("CLOUD_STREAM_MAX_POINTS", "60000"))
+# Block-sync (diff-based cloud): cube edge (m) for the content-versioned grid.
+CUBE_SIZE = float(os.environ.get("CUBE_SIZE", "1.0"))
 
 # Stopgap (rolling local map): StreamingWindowEngine.process_sequence() resets
 # per call, so replaying the WHOLE buffer each cycle is O(N) and grows without
@@ -352,6 +355,12 @@ class MappingServer:
         self._pub_pose_cor = self._z.declare_publisher(
             _KEYS["pose_correction"], congestion_control=zenoh.CongestionControl.DROP)
 
+        # Block-sync publisher: per-submap manifest + queryable that serves Draco
+        # block bundles. This is the primary cloud delivery (diff-based, low BW);
+        # the pcd_snapshot queryable above stays for full-res fetch (make fetch_pcd).
+        self._blockpub = BlockPublisher(self._z, cube_m=CUBE_SIZE,
+                                        server_prefix=SERVER_PREFIX)
+
         try:
             self._live = self._z.liveliness().declare_token(_KEYS["live_server"])
         except Exception:
@@ -478,6 +487,7 @@ class MappingServer:
         # next send must be a fresh keyframe (deltas restart from scratch)
         self._last_sent_version = -1
         self._submaps_since_key = 0
+        self._blockpub.reset()          # empty manifest → clients clear their cubes
         # Tell every connected client to drop its cloud: an empty snapshot (v0).
         try:
             empty = np.zeros((0, 3), dtype=np.float32)
@@ -564,43 +574,18 @@ class MappingServer:
                 full_xyz, full_rgb = snap["points"], snap["colors"]
                 if full_xyz.shape[0] == 0:
                     continue
-                # Bandwidth: send a full keyframe snapshot on the first send and
-                # every Nth submap; in between send only the blocks CHANGED since
-                # the last send (the snapshots are ~99% redundant frame-to-frame).
-                # Payloads are zlib+uint8-RGB compressed by pack_pcd.
-                self._submaps_since_key += 1
-                send_key = (self._last_sent_version < 0 or
-                            self._submaps_since_key >= self._keyframe_every)
-                payload_bytes = 0
-                if send_key:
-                    # Thin the STREAMED cloud to keep the uplink sane; full-res stays
-                    # on the on-demand `pcd_snapshot` query. Payload is zlib+uint8-RGB
-                    # +16-bit-quantised compressed by pack_pcd.
-                    sx, sg = _subsample(full_xyz, full_rgb, CLOUD_STREAM_MAX_POINTS)
-                    payload = proto.pack_pcd(version, sx, sg, is_snapshot=True)
-                    self._pub_snapshot.put(payload)
-                    payload_bytes = len(payload)
-                    self._submaps_since_key = 0
-                    kind, sent_pts = "stream", int(sx.shape[0])
-                else:
-                    try:
-                        d = self._prism.engine.get_point_cloud_delta(self._last_sent_version)
-                        dxyz, drgb = d["points"], d["colors"]
-                    except Exception:
-                        dxyz = np.zeros((0, 3), np.float32)
-                        drgb = dxyz
-                    if dxyz.shape[0] > 0:
-                        payload = proto.pack_pcd(version, dxyz, drgb, is_snapshot=False,
-                                                 since_version=self._last_sent_version)
-                        self._pub_delta.put(payload)
-                        payload_bytes = len(payload)
-                    kind, sent_pts = "delta", int(dxyz.shape[0])
-                self._last_sent_version = version
-                # cloud-stream throughput (payload bytes / wall interval since last submap)
+                # Diff-based BLOCK SYNC: rebuild the content-versioned cube grid and
+                # publish the tiny manifest. Clients diff it and pull only the cubes
+                # whose CRC changed (Draco bundles via the pcd/blocks queryable) — so
+                # steady state ships KB, not MB, and the cloud can't drift/misalign.
+                # The pcd_snapshot queryable still serves full-res on demand.
+                n_changed, n_removed, n_cubes, man_bytes = \
+                    self._blockpub.ingest_and_publish(full_xyz, full_rgb)
+                kind, sent_pts = "blocks", n_changed
                 _now = time.time()
                 if self._last_submap_t:
                     dt = max(_now - self._last_submap_t, 1e-3)
-                    self._cloud_mbps = (payload_bytes / dt) / 1e6
+                    self._cloud_mbps = (man_bytes / dt) / 1e6   # manifest only; blocks are pull
                 self._last_submap_t = _now
                 traj = r["trajectory"]
                 if traj is not None and len(traj) > 0:
@@ -612,6 +597,8 @@ class MappingServer:
                 self._last_window_t = time.time()
                 self._publish_status("processing", {
                     "map_version": int(version), "n_points": last_pts,
+                    "cubes": n_cubes, "cubes_changed": n_changed,
+                    "manifest_kb": round(man_bytes / 1024, 1),
                     "n_points_streamed": sent_pts, "submap": n_sub,
                     "submap_s": round(time.time() - t_iter, 2),
                     "cloud_mbps": round(self._cloud_mbps, 3),

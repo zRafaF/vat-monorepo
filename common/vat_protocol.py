@@ -89,6 +89,10 @@ def keys(robot_name: str = "go2", server_prefix: str = "server/prism") -> dict:
         # server → client
         "pcd_delta":       f"{server_prefix}/pcd_delta",
         "pcd_snapshot":    f"{server_prefix}/pcd_snapshot",
+        # block-sync (diff-based): manifest (pub/sub) + a queryable the client GETs
+        # with its requested cube-keys as the query payload → Draco bundle reply.
+        "pcd_manifest":    f"{server_prefix}/pcd/manifest",
+        "pcd_blocks":      f"{server_prefix}/pcd/blocks",
         "trajectory":      f"{server_prefix}/trajectory",
         "status":          f"{server_prefix}/status",
         # server → robot (DOWN)

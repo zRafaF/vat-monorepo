@@ -300,10 +300,10 @@ make viewer-rerun      # legacy Rerun viewer (debug/compare)
 The POC viewer is **VisPy** (native-OpenGL GPU point scatter; the earlier Rerun
 build froze on the stream and Open3D was finicky for live updates). The robot
 block, legs (`/lowstate` FK), selfie-stick and trajectory update continuously from
-the low-latency pose stream. The **point cloud STREAMS**: the server pushes a full
-compressed snapshot per submap and each one *replaces* the local cloud (always
-aligned, no delta accumulation); decode runs in a worker thread off the GL and
-zenoh-callback threads. A **latency HUD** (top-left) shows pose age / rate /
+the low-latency pose stream. The **point cloud syncs by content-versioned blocks**
+(see [Cloud sync](#cloud-sync-content-versioned-blocks--draco)): the client diffs the
+manifest and pulls only changed cubes as Draco bundles, off the GL thread. A
+**latency HUD** (top-left) shows pose age / rate /
 capture→display e2e / fix quality and cloud point-count / age / rate. Keys: `1`
 force re-fetch, `R` reset (wipe server map + local), `F` refit, `,`/`.`/`/` cloud↔
 robot yaw, `N`/`M` point size. Pose/legs run on a separate Zenoh session from the
@@ -595,6 +595,51 @@ by the viewer is ~3–4 s end-to-end. This is acceptable for a mapping POC.
 
 ---
 
+## Cloud sync: content-versioned blocks + Draco
+
+The point cloud is synced as a **diff over a sparse grid of fixed-size cubes**,
+each carrying a **CRC of its contents** — so only the cubes that actually changed
+travel, Draco-compressed. This replaced full-snapshot streaming (which saturated
+the link and lagged even the pose) and delta accumulation (which drifted, because
+the engine reports changed/added blocks but not *removals*).
+
+**Modules** (split out, not one script):
+
+| File | Role |
+|---|---|
+| `common/vat_blockmap.py` | core: point→cube keying, CRC versioning (`BlockGrid`), manifest/request/bundle wire codecs, Draco encode/decode, `ClientBlockStore`. Pure NumPy + DracoPy; self-testable. |
+| `server/mapping/block_publisher.py` | `BlockPublisher`: after each submap, rebuild the grid + publish the manifest; a queryable serves Draco bundles. |
+| `client/block_sync.py` | `BlockSync`: diff manifest, request missing cubes, apply bundles, expose the merged cloud. |
+
+**Protocol** (Zenoh keys in `vat_protocol.keys()`):
+
+1. **manifest** `server/prism/pcd/manifest` (pub/sub) — `{cube_key: crc}`, one entry
+   per occupied cube (~12 B/cube; a room is a few KB). Published every submap.
+2. **request** — the client diffs the manifest against its local store and GETs the
+   `server/prism/pcd/blocks` queryable with the needed cube-keys as the **query
+   payload**.
+3. **bundle** (the query reply) — an index `(key, crc)` + **one Draco blob** of all
+   the requested cubes' points. The client decodes it and **re-derives each point's
+   cube from its position** (Draco reorders points, but its ~1 mm error never crosses
+   a cube edge for voxel-centre clouds), then replaces those cubes wholesale.
+
+**Why it's correct and cheap.** A cube is replaced atomically when its CRC changes,
+so nothing accumulates or drifts. A global re-anchor (PRISM re-levels/rescales)
+flips every CRC → the client simply refetches all (the `1` key forces this too).
+The grid is sparse and unbounded — cubes appear wherever points exist, so it grows
+with the map. Steady state ships only the few changed cubes: measured **~1.6 KB to
+resync one edited cube** vs **0.68 MB** for a 120 k-point cold start.
+
+**Compression.** Draco at `quantization_bits=12` is ~1.4× smaller than our
+quant+zlib (~1 mm error) and decodes in ~1 ms; the per-cube CRC is a CRC-32 of the
+cube's canonically-sorted, mm-quantised contents. Tunables: `CUBE_SIZE` (1 m),
+`DRACO_QUANT_BITS` (12), and (server) `quant_bits`/`level`.
+
+> A coarse Merkle rollup (e.g. 4 m parents over 1 m leaves) would let the client
+> skip unchanged regions without scanning every leaf — worth adding only once the
+> manifest grows beyond a few thousand cubes. At room scale the flat manifest is
+> a few KB, so it isn't needed yet.
+
 ## Known limitations (POC)
 
 ### Online metric scale (resolved)
@@ -608,16 +653,13 @@ re-enable). Combined with a *consistent* stamped camera height
 this fixed the "misaligned" global map. The known-good gradio offline run uses
 `window 16 / overlap 4`; the server defaults match it (`vat.env`).
 
-### Cloud delivery: streamed full snapshots (replace, don't accumulate)
+### Cloud delivery: content-versioned block sync + Draco
 
-The server pushes a full compressed snapshot every submap (`PCD_KEYFRAME_EVERY=1`)
-on `server/prism/pcd_snapshot`; the viewer **replaces** its cloud with each one.
-This streams continuously yet stays drift-free, because we never accumulate deltas:
-the engine's `get_point_cloud_delta()` reports changed/added blocks but **not
-removals** (TSDF decay), so client-side delta merging drifts over time (this is what
-made the cloud "misalign" on a second on-demand fetch). The keyframe+delta path is
-kept (`PCD_KEYFRAME_EVERY>1`) for a future bandwidth-constrained always-on client.
-The `1` key still force-fetches via the `pcd_snapshot` queryable as a fallback.
+The cloud is delivered as a **diff over a spatial block grid** — the design that
+replaced both full-snapshot streaming (saturated the link) and delta accumulation
+(drifted/misaligned). See [Cloud sync](#cloud-sync-content-versioned-blocks--draco).
+The `1` key forces a full re-sync; `pcd_snapshot` (full-res, on demand) is kept for
+`make fetch_pcd`.
 
 ### No navigation or ESDF
 

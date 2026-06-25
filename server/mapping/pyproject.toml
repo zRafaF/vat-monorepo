@@ -18,6 +18,8 @@ dependencies = [
     "opencv-python-headless>=4.9",
     # 3D / point cloud helpers
     "open3d>=0.18",
+    # Draco point-cloud compression for the block-sync bundle (server encodes)
+    "DracoPy>=1.4",
     # NOTE: torch + nvblox_torch are pulled in transitively by prism-vggt.
     # To force a CUDA build, pin torch here and add the pytorch index below.
 ]
