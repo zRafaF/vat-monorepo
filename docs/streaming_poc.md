@@ -817,14 +817,35 @@ rate. The knobs (all in `vat.env`):
 > manifest/diff). The on-demand snapshot query already covers late joiners. This is
 > the recommended next step if the geometry-only CRC isn't enough.
 
-### Viewer controls (VisPy)
+### Viewer controls (VisPy) + telemetry window
 
-`1` force re-fetch · `R` reset map · `F` refit · `,`/`.` cloud↔robot yaw · `/` yaw 0
-· `N`/`M` point size · **`C` ceiling clip on/off · `[`/`]` lower/raise the ceiling**.
-The ceiling keys publish the height to `server/prism/config/ceiling_z` (clip at the
-source for bandwidth) *and* clip the local cloud instantly. A true draggable slider
-needs the Qt backend (`vispy.use('pyqt5')` + a `QSlider` panel) — offered as a
-follow-up; the keys deliver the same control on the current glfw backend.
+`make viewer` opens the 3D view **and a separate Telemetry window** (per-path
+latency, throughput, drops, pose, render FPS). Keys:
+
+- **Camera:** `←`/`→` orbit · `↑`/`↓` tilt · `W`/`A`/`S`/`D`/`Q`/`E` pan · `F` /
+  scroll zoom-fit (mouse drag-orbit, shift+drag pan, scroll zoom still work). The
+  view frames to the cloud once via a manual centre/distance — never
+  `camera.set_range()`, which crashes on an empty Markers visual and froze rotation.
+- **Cloud:** `N`/`M` point size ∓ (default 6, up to `PCD_POINT_SIZE_MAX`=40 — crank
+  it to close the gaps between 3 cm voxels) · `1` force re-fetch · `R` reset map.
+- **Ceiling clip:** `C` on/off · `[`/`]` lower/raise. Publishes the height to
+  `server/prism/config/ceiling_z` (clip at the source for bandwidth) *and* clips the
+  local cloud instantly. A true draggable slider needs the Qt backend; the keys give
+  the same control on glfw.
+
+**Pose rendering is interpolated, not extrapolated** (`PosePredictor`): the avatar
+is drawn at `now − POSE_RENDER_DELAY_S` (default 0.10 s) by interpolating between
+buffered poses — smooth, no overshoot, so it doesn't *rubber-band*. It only
+extrapolates (with velocity + staleness decay) when the stream stalls. Net visual
+lag ≈ `POSE_RENDER_DELAY_S − POSE_LOOKAHEAD_S`; raise the robot's `PUBLISH_HZ` for
+finer interpolation. The startup "warm-up" before the avatar matches reality is the
+pose-graph/correction convergence (`CORRECTION_POS_GAIN`, default 0.7).
+
+**Latency is measured per-link, clock-skew-immune.** Server/client/robot clocks are
+*not* actually NTP-synced (raw deltas go negative), so the client runs the same
+windowed-minimum offset filter on each stream — every latency is reported relative
+to that link's own baseline (≥0, good for spotting stalls/jitter). Absolute one-way
+latency still needs a round-trip ping (a robot-side clock-echo queryable).
 
 ### Pose correction convergence (POC)
 

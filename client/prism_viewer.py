@@ -39,6 +39,7 @@ import time
 import logging
 import argparse
 import threading
+from collections import deque
 
 import numpy as np
 from vispy import app, scene
@@ -49,7 +50,7 @@ sys.path.insert(0, os.path.join(_ROOT, "robot", "docker"))
 import vat_protocol as proto  # noqa: E402
 from vat_protocol import (  # noqa: E402
     quat_identity, quat_normalize, quat_mul, quat_slerp, integrate_pose)
-from vat_telemetry import ThroughputMeter  # noqa: E402
+from vat_telemetry import ThroughputMeter, ClockOffsetEstimator  # noqa: E402
 import zenoh  # noqa: E402
 from kinematics import RobotStateTracker, LowStateTracker, LEG_ORDER  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))         # client/ (block_sync)
@@ -71,8 +72,15 @@ SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
 # the avatar is otherwise always ~transport-latency behind reality. Dial it up to
 # match the observed lag (or the HUD's pose age). 0 = predict only from receipt.
 POSE_LOOKAHEAD_S = float(os.environ.get("POSE_LOOKAHEAD_S", "0.0"))
+# Anti-rubber-band: render the avatar this far in the PAST and INTERPOLATE between
+# buffered poses (smooth, no overshoot) instead of extrapolating into the future
+# (which overshoots on jitter → snaps back = rubber-banding). Set a touch above the
+# pose inter-arrival jitter. 0 = pure extrapolation (old behaviour). Net visual lag
+# ≈ POSE_RENDER_DELAY_S − POSE_LOOKAHEAD_S.
+POSE_RENDER_DELAY_S = float(os.environ.get("POSE_RENDER_DELAY_S", "0.10"))
 CLOUD_MAX_M   = float(os.environ.get("CLOUD_MAX_M", "50.0"))
-PT_SIZE       = float(os.environ.get("PCD_POINT_SIZE", "3.0"))
+PT_SIZE       = float(os.environ.get("PCD_POINT_SIZE", "6.0"))
+PT_SIZE_MAX   = float(os.environ.get("PCD_POINT_SIZE_MAX", "40.0"))
 CUBE_SIZE     = float(os.environ.get("CUBE_SIZE", "1.0"))   # block-sync cube edge (m)
 
 _KEYS = proto.keys(ROBOT_NAME, SERVER_PREFIX)
@@ -161,56 +169,84 @@ def ground_grid(size=4.0, step=0.5):
 
 
 class PosePredictor:
+    """Interpolating pose predictor (multiplayer-netcode style).
+
+    Buffers recent poses by receipt time and renders the avatar at ``now -
+    POSE_RENDER_DELAY_S``, INTERPOLATING between the two buffered poses bracketing
+    that instant. This is smooth and never overshoots, so it doesn't rubber-band.
+    Only when the buffer runs dry (the stream stalled) does it fall back to
+    velocity EXTRAPOLATION (with staleness decay) so a disconnected robot coasts to
+    a stop instead of freezing."""
+
     def __init__(self):
         self._lock = threading.Lock()
+        self._buf = deque(maxlen=128)     # (recv_monotonic, pose), time-ordered
         self._have = False
-        self._sample = None
-        self._recv_monotonic = 0.0
-        self._dt_ema = 0.0                # inter-arrival time EMA → rate
-        self._e2e_ms = float("nan")       # capture→receipt latency (needs clock sync)
+        self._dt_ema = 0.0
+        self._e2e_ms = float("nan")
         self._disp_pos = np.zeros(3)
         self._disp_quat = quat_identity()
 
     def on_pose(self, pose):
         with self._lock:
             now = time.monotonic()
-            if self._have and self._recv_monotonic:
-                dt = now - self._recv_monotonic
+            if self._buf:
+                dt = now - self._buf[-1][0]
                 self._dt_ema = dt if self._dt_ema == 0 else 0.9 * self._dt_ema + 0.1 * dt
-            # capture→receipt latency (wall clock; meaningful only if robot/client
-            # clocks are synced — shown on the HUD so you can judge the lag).
             self._e2e_ms = (time.time_ns() - pose.timestamp_ns) * 1e-6
-            self._sample = pose
-            self._recv_monotonic = now
+            self._buf.append((now, pose))
             if not self._have:
                 self._disp_pos = pose.position.astype(np.float64)
                 self._disp_quat = quat_normalize(pose.quaternion)
                 self._have = True
 
+    def _target_at(self, t):
+        """Pose at render time ``t`` (monotonic): interpolate within the buffer, or
+        extrapolate from the newest sample if ``t`` is past it. Returns
+        ``(pos, quat, fix)``. Caller holds the lock."""
+        buf = self._buf
+        newest_recv, newest = buf[-1]
+        if t >= newest_recv or len(buf) == 1:
+            # buffer dry / disconnected → velocity extrapolation with decay
+            age = time.monotonic() - newest_recv
+            horizon = (t - newest_recv) + POSE_LOOKAHEAD_S
+            scale = 1.0 if age <= STALE_S else max(0.0, 1.0 - (age - STALE_S) / max(DECAY_S, 1e-3))
+            pos, quat = integrate_pose(newest.position, newest.quaternion,
+                                       newest.linear_velocity * scale,
+                                       newest.angular_velocity * scale, horizon)
+            return pos, quat, newest.fix_quality
+        # interpolate between the two samples bracketing t (scan from the recent end)
+        for i in range(len(buf) - 1, 0, -1):
+            r0, p0 = buf[i - 1]
+            r1, p1 = buf[i]
+            if r0 <= t <= r1:
+                a = (t - r0) / max(r1 - r0, 1e-6)
+                pos = (1 - a) * p0.position + a * p1.position
+                quat = quat_slerp(quat_normalize(p0.quaternion), quat_normalize(p1.quaternion), a)
+                return pos, quat, p1.fix_quality
+        r0, p0 = buf[0]                    # t older than the whole buffer → oldest
+        return p0.position, p0.quaternion, p0.fix_quality
+
     def step(self, dt_render):
         with self._lock:
-            if not self._have or self._sample is None:
+            if not self._have:
                 return None
-            s = self._sample
-            age = time.monotonic() - self._recv_monotonic
-            # extrapolate forward by age + look-ahead to hide transport latency
-            horizon = age + POSE_LOOKAHEAD_S
-            scale = 1.0 if age <= STALE_S else max(0.0, 1.0 - (age - STALE_S) / max(DECAY_S, 1e-3))
-            tgt_pos, tgt_quat = integrate_pose(
-                s.position, s.quaternion, s.linear_velocity * scale,
-                s.angular_velocity * scale, horizon)
+            t = time.monotonic() - POSE_RENDER_DELAY_S
+            tgt_pos, tgt_quat, fix = self._target_at(t)
+            # light critically-damped smoothing to absorb segment-boundary kinks
             alpha = 1.0 - np.exp(-dt_render / max(SMOOTH_TAU, 1e-3))
-            self._disp_pos = (1 - alpha) * self._disp_pos + alpha * tgt_pos
-            self._disp_quat = quat_slerp(self._disp_quat, tgt_quat, alpha)
-            return self._disp_pos.copy(), self._disp_quat.copy(), s.fix_quality, age
+            self._disp_pos = (1 - alpha) * self._disp_pos + alpha * np.asarray(tgt_pos, float)
+            self._disp_quat = quat_slerp(self._disp_quat, quat_normalize(tgt_quat), alpha)
+            age = time.monotonic() - self._buf[-1][0]
+            return self._disp_pos.copy(), self._disp_quat.copy(), fix, age
 
     def telemetry(self):
         with self._lock:
             if not self._have:
                 return None
-            age = time.monotonic() - self._recv_monotonic
+            age = time.monotonic() - self._buf[-1][0]
             rate = (1.0 / self._dt_ema) if self._dt_ema > 1e-6 else float("nan")
-            return age, rate, self._e2e_ms, self._sample.fix_quality
+            return age, rate, self._e2e_ms, self._buf[-1][1].fix_quality
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,6 +281,13 @@ class PRISMViewer:
         self._tp_status = ThroughputMeter()
         self._pose_recv_ns = 0
         self._pose_ts_ns = 0
+        # Per-path clock-offset filters: server/client/robot clocks are NOT actually
+        # synced (the raw deltas go negative), so we run the same windowed-minimum
+        # offset filter on EACH arriving stream → latency relative to that link's own
+        # baseline (always ≥0, meaningful for stalls/jitter) without trusting NTP.
+        self._clk_s2c = ClockOffsetEstimator()     # server → client (status)
+        self._clk_pose = ClockOffsetEstimator()    # robot  → client (pose)
+        self._clk_cap = ClockOffsetEstimator()     # frame capture → display
         self._render_fps = 0.0
         self._render_stalls = 0
         self._last_metrics_t = 0.0
@@ -306,6 +349,7 @@ class PRISMViewer:
             return
         self._pose_recv_ns = time.time_ns()
         self._pose_ts_ns = int(pose.timestamp_ns)
+        self._clk_pose.update(self._pose_ts_ns, self._pose_recv_ns)
         self._predictor.on_pose(pose)
 
     def _on_status(self, sample):
@@ -314,6 +358,10 @@ class PRISMViewer:
         try:
             self._status = json.loads(buf.decode())
             self._status_recv_ns = time.time_ns()
+            if self._status.get("server_send_ns"):
+                self._clk_s2c.update(int(self._status["server_send_ns"]), self._status_recv_ns)
+            if self._status.get("newest_frame_robot_ns"):
+                self._clk_cap.update(int(self._status["newest_frame_robot_ns"]), self._status_recv_ns)
         except Exception:
             pass
 
@@ -418,8 +466,9 @@ class PRISMViewer:
             elif k == "/":
                 self._set_yaw(0.0)
             elif k in ("n", "m"):
-                self._pt_size = float(np.clip(self._pt_size + (1 if k == "m" else -1), 1, 12))
-                log.info(f"[Viewer] point size = {self._pt_size:.0f}")
+                self._pt_size = float(np.clip(self._pt_size + (2 if k == "m" else -2), 1, PT_SIZE_MAX))
+                log.info(f"[Viewer] point size = {self._pt_size:.0f} (max {PT_SIZE_MAX:.0f})")
+                self._render_cloud()        # re-render so the size change shows now
             elif k == "c":                      # toggle ceiling clip on/off
                 self._set_ceiling(None if self._ceiling_z is not None else CEILING_START)
             elif k == "[":                      # lower the ceiling
@@ -588,20 +637,18 @@ class PRISMViewer:
         for m in (self._tp_cloud, self._tp_pose, self._tp_traj, self._tp_status):
             m.decay()
         s = self._status or {}
-        off_ns = float(s.get("robot_offset_ms", 0.0)) * 1e6
-        now_ns = time.time_ns()
 
         def ms(v):
             return f"{v:6.0f} ms" if v == v else "    -- ms"
 
-        # latencies (relative / above-baseline)
-        r2s = float(s.get("robot_to_server_ms", float("nan")))
-        s2c = ((self._status_recv_ns - s["server_send_ns"]) * 1e-6
-               if s.get("server_send_ns") else float("nan"))
-        r2c = ((self._pose_recv_ns - (self._pose_ts_ns + off_ns)) * 1e-6
-               if self._pose_ts_ns else float("nan"))
-        cap2disp = ((now_ns - (s["newest_frame_robot_ns"] + off_ns)) * 1e-6
-                    if s.get("newest_frame_robot_ns") else float("nan"))
+        def lat(est):
+            return est.last_latency_s * 1e3 if est.offset_s is not None else float("nan")
+
+        # latencies — each relative to its own link's baseline (clock-skew immune)
+        r2s = float(s.get("robot_to_server_ms", float("nan")))   # server-side filter
+        s2c = lat(self._clk_s2c)                                  # client-side filters
+        r2c = lat(self._clk_pose)
+        cap2disp = lat(self._clk_cap)
 
         tel = self._predictor.telemetry()
         pose_age, pose_rate, _e2e, fix = tel if tel else (float("nan"),) * 4
@@ -617,7 +664,7 @@ class PRISMViewer:
             f"  server → client    {ms(s2c)}",
             f"  robot → client(pose){ms(r2c)}",
             f"  capture → display  {ms(cap2disp)}",
-            f"  robot clock offset {off_ns*1e-6:+.0f} ms",
+            f"  robot→srv offset   {float(s.get('robot_offset_ms', 0.0)):+.0f} ms",
             "",
             "THROUGHPUT",
             f"  robot → server     {float(s.get('robot_kbps',0)):6.0f} KB/s  {float(s.get('robot_fps',0)):4.1f} fps",
