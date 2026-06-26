@@ -85,6 +85,7 @@ class PoseFuser:
             fallback_body_height=float(os.environ.get("FALLBACK_BODY_HEIGHT", "0.30")))
         self._est = WheelInertialEstimator(att_gain=ATT_GAIN,
                                            pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
+        log.info(f"[Fuser] correction backend: {self._est.backend_note}")
         self._lock = threading.Lock()
         self._last_pub_ns = time.time_ns()
         self._corrections = 0

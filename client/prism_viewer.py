@@ -357,12 +357,18 @@ class PRISMViewer:
         self._hud.transform = scene.transforms.STTransform(translate=(12, 40))
 
         # ── separate TELEMETRY window (latency / throughput / drops / pose) ──
+        # One Text visual PER LINE, stacked vertically. A single multi-line Text
+        # renders all lines at the same point on this VisPy/glfw build (they overlap
+        # and you only see the last one), so we lay the lines out explicitly.
         self._mcanvas = scene.SceneCanvas(title="VAT — Telemetry", bgcolor="#0c0e12",
-                                          size=(430, 560), show=True)
-        self._mtext = scene.visuals.Text(
-            "waiting for data…", color=(0.75, 0.95, 0.85, 1.0), bold=False,
-            font_size=8, anchor_x="left", anchor_y="top", parent=self._mcanvas.scene)
-        self._mtext.transform = scene.transforms.STTransform(translate=(12, 16))
+                                          size=(470, 600), show=True)
+        self._mlines = []
+        for i in range(30):
+            t = scene.visuals.Text("", color=(0.80, 0.96, 0.86, 1.0), bold=False,
+                                   font_size=9, anchor_x="left", anchor_y="top",
+                                   parent=self._mcanvas.scene)
+            t.transform = scene.transforms.STTransform(translate=(14, 16 + i * 19))
+            self._mlines.append(t)
 
         def _camera_key(ev):
             """Keyboard orbit/tilt/pan/zoom (works regardless of mouse modifiers).
@@ -404,7 +410,7 @@ class PRISMViewer:
             elif k == "r":
                 self._reset_map()
             elif k == "f":
-                self._view.camera.set_range()
+                self._frame_to(self._cloud_xyz_raw)
             elif k == ",":
                 self._set_yaw(self._yaw_offset_deg - 5)
             elif k == ".":
@@ -483,8 +489,25 @@ class PRISMViewer:
                                  size=self._pt_size, edge_width=0)
         self._cloud_n = int(x.shape[0])
         if not self._cloud_framed and x.shape[0]:
-            self._view.camera.set_range()
+            self._frame_to(x)
             self._cloud_framed = True
+
+    def _frame_to(self, xyz):
+        """Frame the camera to a point set WITHOUT camera.set_range(). set_range walks
+        every visual's bounds, and an empty Markers visual (feet before legs arrive)
+        has ``_data['a_position'] is None`` → it crashes every tick and freezes mouse
+        rotation. Compute centre/distance from this cloud alone instead."""
+        try:
+            xyz = np.asarray(xyz, np.float64)
+            xyz = xyz[np.isfinite(xyz).all(axis=1)]
+            if xyz.shape[0] == 0:
+                return
+            lo, hi = xyz.min(axis=0), xyz.max(axis=0)
+            cam = self._view.camera
+            cam.center = tuple((lo + hi) * 0.5)
+            cam.distance = float(max(np.linalg.norm(hi - lo) * 0.9, 1.0))
+        except Exception as e:
+            log.warning(f"[Viewer] frame failed (non-fatal): {e}")
 
     def _on_tick(self, event):
         now = time.monotonic()
@@ -503,7 +526,12 @@ class PRISMViewer:
         m = self._blocksync.take_merged()
         if m is not None:
             self._cloud_xyz_raw, self._cloud_rgb_raw = m
-            self._render_cloud()
+            try:
+                self._render_cloud()
+            except Exception as e:
+                if not getattr(self, "_cloud_warned", False):
+                    log.warning(f"[Viewer] cloud render error (suppressed): {e}")
+                    self._cloud_warned = True
             self._tp_cloud.add(int(getattr(self._blocksync, "last_bundle_bytes", 0)))
 
         # trajectory
@@ -535,10 +563,22 @@ class PRISMViewer:
                 log.info("[Viewer] (no leg data yet — /lowstate flowing?)")
                 self._legs_warned = True
 
-        self._update_hud()
+        # Overlays must never kill the render tick (a crash here froze the camera
+        # and stopped the robot drawing). Isolate them.
+        try:
+            self._update_hud()
+        except Exception as e:
+            if not getattr(self, "_hud_warned", False):
+                log.warning(f"[Viewer] HUD update error (suppressed): {e}")
+                self._hud_warned = True
         if now - self._last_metrics_t >= 0.25:      # ~4 Hz dashboard refresh
             self._last_metrics_t = now
-            self._update_metrics()
+            try:
+                self._update_metrics()
+            except Exception as e:
+                if not getattr(self, "_metrics_warned", False):
+                    log.warning(f"[Viewer] metrics update error (suppressed): {e}")
+                    self._metrics_warned = True
 
     def _update_metrics(self):
         """Render the separate telemetry window: per-path latency + throughput +
@@ -597,16 +637,15 @@ class PRISMViewer:
             f"  map points         {int(s.get('n_points',0))}",
             f"  render             {self._render_fps:4.0f} fps  stalls {self._render_stalls}",
         ]
-        self._mtext.text = "\n".join(lines)
+        for i, t in enumerate(self._mlines):
+            t.text = lines[i] if i < len(lines) else ""
+        # also print a compact block to the console every ~3 s (reliable fallback)
+        now = time.monotonic()
+        if now - getattr(self, "_last_console_t", 0.0) >= 3.0:
+            self._last_console_t = now
+            log.info("[Telemetry]\n  " + "\n  ".join(lines))
 
     def _update_hud(self):
-        # recompute pose receive throughput every ~0.5 s (cumulative byte deltas)
-        now = time.monotonic()
-        el = now - self._m_prev_t
-        if el >= 0.5:
-            self._m_pose_bps = (self._pose_bytes - self._m_prev_pose) / el
-            self._m_prev_t, self._m_prev_pose = now, self._pose_bytes
-
         tel = self._predictor.telemetry()
         if tel is None:
             pose_line = "POSE  waiting…"
@@ -617,7 +656,7 @@ class PRISMViewer:
             e2e_s = f"{e2e_ms:5.0f}ms" if e2e_ms == e2e_ms else "  – "
             warn = "  ⚠STALE" if age > STALE_S else ""
             pose_line = (f"POSE  age {age*1000:4.0f}ms  rate {rate_s}  "
-                         f"e2e {e2e_s}  {self._m_pose_bps/1024:5.1f} KB/s  fix {fixs}{warn}")
+                         f"e2e {e2e_s}  {self._tp_pose.kbps:5.1f} KB/s  fix {fixs}{warn}")
 
         # cloud line from BlockSync (diff-based): cubes held, last sync cost
         bs = self._blocksync

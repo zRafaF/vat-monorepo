@@ -39,8 +39,17 @@ from vat_protocol import (
     integrate_pose,
 )
 from kinematics import Transform
-from pose_graph import (
-    SlidingWindowPoseGraph, se3, se3_inv, quat_to_R, R_to_quat)
+# The pose-graph backend is OPTIONAL: if its module is missing from the deployment
+# (e.g. the container wasn't rebuilt with pose_graph.py) or fails to import, the
+# estimator must STILL run — falling back to the blend — so the fuser never stops
+# publishing go2/prism/pose. A broken add-on must not take down the pose path.
+try:
+    from pose_graph import (
+        SlidingWindowPoseGraph, se3, se3_inv, quat_to_R, R_to_quat)
+    _HAVE_POSE_GRAPH = True
+except Exception as _e:    # pragma: no cover
+    _HAVE_POSE_GRAPH = False
+    _POSE_GRAPH_IMPORT_ERR = _e
 
 
 class WheelInertialEstimator:
@@ -102,10 +111,15 @@ class WheelInertialEstimator:
         # solve, less jitter, drift-corrected); "blend" = the legacy single-anchor
         # complementary blend. POSE_BACKEND=blend to fall back.
         self._backend = os.environ.get("POSE_BACKEND", "graph").strip().lower()
-        self._graph = SlidingWindowPoseGraph(
-            window=int(os.environ.get("POSE_GRAPH_WINDOW", "12"))) \
-            if self._backend == "graph" else None
+        if self._backend == "graph" and not _HAVE_POSE_GRAPH:
+            self._backend = "blend"          # module missing → safe fallback
+        self._graph = (SlidingWindowPoseGraph(
+            window=int(os.environ.get("POSE_GRAPH_WINDOW", "12")))
+            if self._backend == "graph" else None)
         self._prev_odom_kf_T = None
+        # human-readable note the fuser logs at startup
+        self.backend_note = (self._backend if _HAVE_POSE_GRAPH or self._backend != "blend"
+                             else f"blend (pose_graph unavailable: {_POSE_GRAPH_IMPORT_ERR})")
 
     # -- high-rate prediction -------------------------------------------------
     def predict(self, imu_quat: np.ndarray, gyro: np.ndarray,
@@ -182,12 +196,20 @@ class WheelInertialEstimator:
         R_v = quat_normalize(base_world.rotation)
         p_v = np.asarray(base_world.translation, dtype=np.float64).reshape(3)
 
-        # Pose-graph backend: jointly fit this fix against the odometry chain.
+        # Pose-graph backend: jointly fit this fix against the odometry chain. Any
+        # failure here must NOT stop pose output — fall through to the blend.
         if self._backend == "graph" and self._graph is not None:
-            self._correct_graph(odom_pos_t, odom_quat_t, R_v, p_v,
-                                 int(capture_ts_ns) if capture_ts_ns is not None else now_ns)
-            self.have_vggt = True
-            return
+            try:
+                self._correct_graph(odom_pos_t, odom_quat_t, R_v, p_v,
+                                    int(capture_ts_ns) if capture_ts_ns is not None else now_ns)
+                self.have_vggt = True
+                return
+            except Exception as e:
+                if not getattr(self, "_graph_err_logged", False):
+                    print(f"[Estimator] pose-graph correction failed ({e}); "
+                          f"falling back to blend for this and future fixes")
+                    self._graph_err_logged = True
+                self._backend = "blend"      # stop trying the graph; keep publishing
 
         # offset s.t.  R_corr * odom_quat_t == R_v  and
         #              R_corr * odom_pos_t + p_corr == p_v
