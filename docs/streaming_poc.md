@@ -714,14 +714,37 @@ shrink but may still grow slowly with distance until loop closure lands.
 ### Pose correction stability (POC)
 
 The VGGT **camera-pose correction** is sent down to the robot fuser and
-back-propagates the avatar. Because our windowed trajectory drifts (above), a
-late/degenerate submap pose could throw the avatar — the *"robot walks through
-walls / goes all over the place on green-fix"* symptom. Two server-side guards
-(`mapping_server._publish_pose_correction`) contain it: corrections are **gated
-until the metric scale commits** (no back-prop during the unstable warm-up), and a
-correction implying travel faster than `CORRECTION_MAX_SPEED` (m/s) since the last
-accepted one (plus `CORRECTION_JUMP_MARGIN`) is **rejected as an outlier**. These
-stop the violent jumps; the slow underlying drift still awaits loop closure.
+back-propagates the avatar — a path the offline/gradio run never exercises, which
+is why *"offline is perfect even with the robot still"* while the **live avatar
+jitters when stationary**. The map itself is fine: a live log shows the scale
+locking to `s≈0.594` within 3 windows and the anchor `t_z/cam0_z` holding at
+~1.15 m ±1 cm for 25+ submaps. The jitter is the **correction**: it publishes the
+newest VGGT camera pose each submap, and even on a still scene that newest
+(non-overlap, unpinned) frame wobbles a few cm / few degrees — and the
+selfie-stick offset turns a few degrees of camera rotation into several cm of
+*base* swing, so the avatar twitches on every green update.
+
+Four server-side guards in `mapping_server._publish_pose_correction` contain it:
+
+1. **Commit gate** — no corrections until the metric scale has committed (the
+   warm-up frame is still shifting).
+2. **Outlier gate** — reject a correction implying travel faster than
+   `CORRECTION_MAX_SPEED` m/s since the last (plus `CORRECTION_JUMP_MARGIN`); stops
+   a drifted/degenerate submap from throwing the avatar.
+3. **Deadband** — a correction within `CORRECTION_DEADBAND_M` /
+   `CORRECTION_DEADBAND_DEG` of the last published one is treated as still-scene
+   noise and **not republished**, so a stationary robot's avatar holds (in a
+   simulation of ±1 cm / ±1° still-jitter this suppresses ~39/40 corrections).
+4. **Raw publish, no server smoothing** — accepted corrections are sent *raw*
+   (not EMA-blended). The pose is stamped with its keyframe **capture time** and
+   the robot estimator re-anchors odometry at that instant; smoothing the position
+   here would desync it from its timestamp and drag the avatar backward during
+   motion. Easing is left to the estimator's `_pos_gain`/`_rot_gain`.
+
+Tune `CORRECTION_DEADBAND_*` up if it still twitches when still, down if the
+avatar lags small real moves. **Validated in simulation only** (`corr_gate_test.py`);
+not yet confirmed on hardware. The slow *map* drift underneath (wall ghosting over
+distance) is unaffected by these guards and still awaits loop closure (Phase 2).
 
 ### Cloud delivery: content-versioned block sync + Draco
 

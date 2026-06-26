@@ -116,6 +116,21 @@ CAMERA_HEIGHT = float(os.environ.get("CAMERA_HEIGHT", "0.50"))  # fallback only
 #     (m/s) since the previous one (plus a fixed margin).
 CORRECTION_MAX_SPEED = float(os.environ.get("CORRECTION_MAX_SPEED", "2.5"))
 CORRECTION_JUMP_MARGIN = float(os.environ.get("CORRECTION_JUMP_MARGIN", "0.75"))
+# Jitter suppression. VGGT's per-window absolute camera pose wobbles a few cm /
+# few degrees even on a STILL scene (the newest, non-overlap frame isn't pinned),
+# so each correction nudges the avatar → it twitches on every "green" update while
+# standing still. Two POC mitigations (the real fix is the on-robot EKF, Phase 2):
+#   * DEADBAND: if a new correction is within this of the last PUBLISHED one,
+#     it's noise → don't republish (the avatar holds perfectly still). Easing of
+#     accepted corrections is left to the robot estimator's _pos_gain/_rot_gain.
+CORRECTION_DEADBAND_M   = float(os.environ.get("CORRECTION_DEADBAND_M", "0.06"))
+CORRECTION_DEADBAND_DEG = float(os.environ.get("CORRECTION_DEADBAND_DEG", "3.0"))
+
+
+def _quat_angle_deg(q1, q2):
+    """Smallest rotation angle (deg) between two xyzw quaternions."""
+    d = float(np.clip(abs(np.dot(np.asarray(q1), np.asarray(q2))), 0.0, 1.0))
+    return float(np.degrees(2.0 * np.arccos(d)))
 
 TARGET_WIDTH  = int(os.environ.get("TARGET_WIDTH",  "1036"))
 TARGET_HEIGHT = int(os.environ.get("TARGET_HEIGHT", "518"))
@@ -366,8 +381,9 @@ class MappingServer:
         self._last_submap_t = 0.0
         self._cloud_mbps = 0.0
         self._last_payload_bytes = 0
-        # last accepted pose correction (for the jump/outlier gate)
+        # last PUBLISHED pose correction (jump gate + deadband + smoothing)
         self._last_corr_pos = None
+        self._last_corr_quat = None
         self._last_corr_ts = None
         self._mask = get_spherical_valid_mask(
             TARGET_HEIGHT, TARGET_WIDTH, zenith_deg=ZENITH_LIMIT, nadir_deg=NADIR_LIMIT)
@@ -520,6 +536,7 @@ class MappingServer:
         self._gap_count = 0
         self._last_window_t = time.time()
         self._last_corr_pos = None
+        self._last_corr_quat = None
         self._last_corr_ts = None
         # next send must be a fresh keyframe (deltas restart from scratch)
         self._last_sent_version = -1
@@ -672,20 +689,40 @@ class MappingServer:
             return
         pos, quat = pose
 
-        # Gate 2: outlier/teleport rejection. Reject a correction implying travel
-        # faster than CORRECTION_MAX_SPEED since the last accepted one (a drifted /
-        # degenerate submap pose). Slow map drift still needs loop closure (POC
-        # limitation) — this only stops the violent jumps.
+        pos = np.asarray(pos, dtype=np.float64)
+        quat = np.asarray(quat, dtype=np.float64)
+
         if self._last_corr_pos is not None:
+            # Gate 2: outlier/teleport rejection. Reject a correction implying travel
+            # faster than CORRECTION_MAX_SPEED since the last published one (a drifted
+            # / degenerate submap). Slow map drift still needs loop closure (POC
+            # limitation) — this only stops the violent jumps.
             dt = abs((cam_ts_s or 0.0) - (self._last_corr_ts or 0.0))
-            budget = CORRECTION_MAX_SPEED * dt + CORRECTION_JUMP_MARGIN if dt > 0 else None
-            jump = float(np.linalg.norm(np.asarray(pos) - self._last_corr_pos))
-            if budget is not None and jump > budget:
-                log.warning(f"[Server] pose correction rejected: jump {jump:.2f} m > "
-                            f"{budget:.2f} m budget ({dt:.2f}s) — likely a drifted submap")
+            jump = float(np.linalg.norm(pos - self._last_corr_pos))
+            if dt > 0:
+                budget = CORRECTION_MAX_SPEED * dt + CORRECTION_JUMP_MARGIN
+                if jump > budget:
+                    log.warning(f"[Server] pose correction rejected: jump {jump:.2f} m "
+                                f"> {budget:.2f} m budget ({dt:.2f}s) — drifted submap")
+                    return
+
+            # Gate 3: deadband. Within VGGT's still-scene noise of the last published
+            # anchor → don't republish, so a stationary robot's avatar holds perfectly
+            # still instead of twitching on every green correction. We publish the RAW
+            # pose (no server-side smoothing): the pose is stamped with its keyframe
+            # CAPTURE time and the robot estimator re-anchors odometry at that instant,
+            # so smoothing the position here would desync it from its timestamp and
+            # drag the avatar backward during motion. The estimator's own _pos_gain/
+            # _rot_gain already ease each accepted correction.
+            ang = _quat_angle_deg(quat, self._last_corr_quat)
+            if jump < CORRECTION_DEADBAND_M and ang < CORRECTION_DEADBAND_DEG:
                 return
-        self._last_corr_pos = np.asarray(pos, dtype=np.float64).copy()
+
+        self._last_corr_pos = pos.copy()
+        self._last_corr_quat = quat.copy()
         self._last_corr_ts = cam_ts_s
+        pos = pos.astype(np.float32)
+        quat = quat.astype(np.float32)
         # CRITICAL: stamp with the keyframe's CAPTURE time, not now(). This pose
         # describes where the camera was ~2-4 s ago; the robot needs that capture
         # time to re-anchor its dead-reckoning history at the right point instead
