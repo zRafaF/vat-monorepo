@@ -76,6 +76,9 @@ CUBE_SIZE     = float(os.environ.get("CUBE_SIZE", "1.0"))   # block-sync cube ed
 
 _KEYS = proto.keys(ROBOT_NAME, SERVER_PREFIX)
 RESET_KEY = f"{SERVER_PREFIX}/cmd/reset"
+CEILING_KEY = f"{SERVER_PREFIX}/config/ceiling_z"
+CEILING_STEP = float(os.environ.get("CEILING_STEP", "0.2"))      # m per keypress
+CEILING_START = float(os.environ.get("CEILING_START", "2.2"))    # m when first enabled
 
 ROBOT_HALF = np.array([0.35, 0.16, 0.18], dtype=np.float64)
 STICK = np.array([
@@ -224,6 +227,11 @@ class PRISMViewer:
         self._cloud_framed = False
         self._cloud_n = 0
         self._pt_size = PT_SIZE
+        # latest merged cloud (pre-display-filter) kept so the ceiling clip can be
+        # re-applied instantly on a keypress without waiting for the next submap
+        self._cloud_xyz_raw = None
+        self._cloud_rgb_raw = None
+        self._ceiling_z = None               # None = OFF (show whole cloud)
         self._last_tick = time.monotonic()
         # throughput: pose recv bytes (cloud bytes come from BlockSync stats)
         self._pose_bytes = 0
@@ -243,6 +251,7 @@ class PRISMViewer:
         self._z.declare_subscriber(_KEYS["trajectory"], self._on_traj)
         self._z.declare_subscriber(_KEYS["status"], self._on_status)
         self._pub_reset = self._z.declare_publisher(RESET_KEY)
+        self._pub_ceiling = self._z.declare_publisher(CEILING_KEY)
         # low-latency session: authoritative pose + leg FK + body height
         self._z_fast.declare_subscriber(_KEYS["pose"], self._on_pose)
         self._body_tracker = RobotStateTracker(self._z_fast, ROBOT_NAME)
@@ -345,6 +354,14 @@ class PRISMViewer:
             elif k in ("n", "m"):
                 self._pt_size = float(np.clip(self._pt_size + (1 if k == "m" else -1), 1, 12))
                 log.info(f"[Viewer] point size = {self._pt_size:.0f}")
+            elif k == "c":                      # toggle ceiling clip on/off
+                self._set_ceiling(None if self._ceiling_z is not None else CEILING_START)
+            elif k == "[":                      # lower the ceiling
+                base = self._ceiling_z if self._ceiling_z is not None else CEILING_START
+                self._set_ceiling(base - CEILING_STEP)
+            elif k == "]":                      # raise the ceiling
+                base = self._ceiling_z if self._ceiling_z is not None else CEILING_START
+                self._set_ceiling(base + CEILING_STEP)
 
         self._timer = app.Timer(interval=1.0 / max(RENDER_HZ, 1.0),
                                 connect=self._on_tick, start=True)
@@ -364,36 +381,59 @@ class PRISMViewer:
     @staticmethod
     def _print_controls():
         log.info("[Viewer] cloud STREAMS automatically. keys:  1 force re-fetch | "
-                 "R reset map | F refit | , / .  yaw ∓5 | / yaw 0 | N / M  point size ∓  "
-                 "(mouse: drag rotate, scroll zoom)")
+                 "R reset map | F refit | , / .  yaw ∓5 | / yaw 0 | N / M  point size ∓ | "
+                 "C ceiling on/off | [ / ]  ceiling ∓  (mouse: drag rotate, scroll zoom)")
 
     def _set_yaw(self, deg):
         self._yaw_offset_deg = float(deg)
         log.info(f"[Viewer] cloud↔robot yaw offset = {self._yaw_offset_deg:.0f}°")
+
+    def _set_ceiling(self, z):
+        """Set the ceiling-clip height (m, world-Z) or None to disable. Publishes to
+        the server (drops points above it at the source → less bandwidth) AND clips
+        the already-received cloud locally for instant visual feedback."""
+        self._ceiling_z = None if z is None else float(z)
+        payload = "off" if self._ceiling_z is None else f"{self._ceiling_z:.2f}"
+        try:
+            self._pub_ceiling.put(payload.encode())
+        except Exception as e:
+            log.warning(f"[Viewer] ceiling publish failed: {e}")
+        log.info(f"[Viewer] ceiling clip → {'OFF (whole cloud)' if self._ceiling_z is None else f'Z<={self._ceiling_z:.2f}m'}")
+        self._render_cloud()                 # instant local feedback
+
+    def _render_cloud(self):
+        """(Re)draw the cloud from the last merged snapshot, applying the finite/range
+        filter and the optional ceiling clip. Safe to call from the tick or a key."""
+        xyz, rgb = self._cloud_xyz_raw, self._cloud_rgb_raw
+        if xyz is None or rgb is None or xyz.shape[0] == 0 or xyz.shape[0] != rgb.shape[0]:
+            self._cloud_vis.set_data(np.zeros((0, 3), np.float32))
+            self._cloud_n = 0
+            return
+        keep = np.isfinite(xyz).all(axis=1) & (np.abs(xyz).max(axis=1) <= CLOUD_MAX_M)
+        if self._ceiling_z is not None:
+            keep &= xyz[:, 2] <= self._ceiling_z
+        x, c = xyz[keep], rgb[keep]
+        rgba = np.ones((x.shape[0], 4), np.float32)
+        rgba[:, :3] = c.astype(np.float32) / 255.0
+        self._cloud_vis.set_data(x.astype(np.float32), face_color=rgba,
+                                 size=self._pt_size, edge_width=0)
+        self._cloud_n = int(x.shape[0])
+        if not self._cloud_framed and x.shape[0]:
+            self._view.camera.set_range()
+            self._cloud_framed = True
 
     def _on_tick(self, event):
         now = time.monotonic()
         dt = now - self._last_tick
         self._last_tick = now
 
-        # cloud: BlockSync hands us the merged map only when a cube changed
+        # cloud: BlockSync hands us the merged map only when a cube changed. Keep the
+        # raw snapshot so the ceiling clip can be re-applied instantly on a keypress,
+        # and render through one path (which guards against any xyz/rgb mismatch).
         m = self._blocksync.take_merged()
         if m is not None:
-            xyz, rgb = m
-            if xyz.shape[0]:
-                keep = np.isfinite(xyz).all(axis=1) & (np.abs(xyz).max(axis=1) <= CLOUD_MAX_M)
-                xyz, rgb = xyz[keep], rgb[keep]
-                rgba = np.ones((xyz.shape[0], 4), np.float32)
-                rgba[:, :3] = rgb.astype(np.float32) / 255.0
-                self._cloud_vis.set_data(xyz.astype(np.float32), face_color=rgba,
-                                         size=self._pt_size, edge_width=0)
-                self._cloud_n = int(xyz.shape[0])
-                if not self._cloud_framed:
-                    self._view.camera.set_range()
-                    self._cloud_framed = True
-            else:
-                self._cloud_vis.set_data(np.zeros((0, 3), np.float32))
-                self._cloud_n = 0
+            self._cloud_xyz_raw, self._cloud_rgb_raw = m
+            self._render_cloud()
 
         # trajectory
         with self._traj_lock:

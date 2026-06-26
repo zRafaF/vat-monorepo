@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import struct
+import threading
 import zlib
 from typing import Dict, List, Tuple
 
@@ -121,9 +122,21 @@ class BlockGrid:
 
         new_blocks: Dict[int, Tuple[int, np.ndarray, np.ndarray]] = {}
         changed: List[int] = []
+        # A cube's version (CRC) is GEOMETRY-ONLY by default. The colorizer
+        # re-projects best-view colour for every vertex each submap, so even a
+        # perfectly static surface gets slightly different colours every time — if
+        # colour were in the CRC, every cube would flip every submap and the diff
+        # would degenerate to a full resend (the "synced N/N cubes" pathology). With
+        # geometry-only versioning a cube re-sends only when its shape changes
+        # (bandwidth ∝ frontier, not total map). The full 8-bit colour still travels
+        # in the bundle; a static cube simply keeps the colour it was last sent with.
+        # Set BLOCKMAP_CRC_COLOR=1 to fold a coarse (4-bit) colour back into the CRC.
+        include_color = os.environ.get("BLOCKMAP_CRC_COLOR", "0") == "1"
+        rgb_crc = (rgb_s >> 4) if include_color else None
         for kk, s, e in zip(uniq.tolist(), starts.tolist(), ends.tolist()):
             crc = zlib.crc32(fq_s[s:e].tobytes()) & 0xFFFFFFFF
-            crc = zlib.crc32(rgb_s[s:e].tobytes(), crc) & 0xFFFFFFFF
+            if include_color:
+                crc = zlib.crc32(rgb_crc[s:e].tobytes(), crc) & 0xFFFFFFFF
             new_blocks[kk] = (crc, np.ascontiguousarray(xyz_s[s:e]),
                               np.ascontiguousarray(rgb_s[s:e]))
             old = self.blocks.get(kk)
@@ -265,34 +278,46 @@ class ClientBlockStore:
         self.cube_m = float(cube_m)
         self.blocks: Dict[int, Tuple[int, np.ndarray, np.ndarray]] = {}
         self._dirty = True
+        # The Zenoh sync thread mutates ``blocks`` while the render thread calls
+        # ``merged()``; without this lock the two concatenations below could read
+        # different block sets and return mismatched xyz/rgb lengths (a crash).
+        self._lock = threading.Lock()
 
     def local_manifest(self) -> Dict[int, int]:
-        return {k: v[0] for k, v in self.blocks.items()}
+        with self._lock:
+            return {k: v[0] for k, v in self.blocks.items()}
 
     def apply_bundle_bytes(self, buf: bytes) -> int:
         got = unpack_bundle(buf, self.cube_m)
-        self.blocks.update(got)
-        self._dirty = True
+        with self._lock:
+            self.blocks.update(got)
+            self._dirty = True
         return len(got)
 
     def drop(self, keys: List[int]):
-        for k in keys:
-            self.blocks.pop(int(k), None)
-        if keys:
-            self._dirty = True
+        with self._lock:
+            for k in keys:
+                self.blocks.pop(int(k), None)
+            if keys:
+                self._dirty = True
 
     def clear(self):
-        self.blocks = {}
-        self._dirty = True
+        with self._lock:
+            self.blocks = {}
+            self._dirty = True
 
     def merged(self):
         """→ (xyz (N,3) float32, rgb (N,3) uint8) of the whole map, or None if
-        unchanged since the last call."""
-        if not self._dirty:
-            return None
-        self._dirty = False
-        if not self.blocks:
+        unchanged since the last call. Built from ONE atomic snapshot of the blocks
+        so xyz and rgb always have matching length even while the sync thread
+        updates the store."""
+        with self._lock:
+            if not self._dirty:
+                return None
+            self._dirty = False
+            vals = list(self.blocks.values())          # single consistent snapshot
+        if not vals:
             return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint8)
-        xyz = np.concatenate([b[1] for b in self.blocks.values()])
-        rgb = np.concatenate([b[2] for b in self.blocks.values()])
+        xyz = np.concatenate([b[1] for b in vals])
+        rgb = np.concatenate([b[2] for b in vals])
         return xyz, rgb

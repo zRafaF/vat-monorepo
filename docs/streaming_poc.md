@@ -795,16 +795,46 @@ rate. The knobs (all in `vat.env`):
 - **`WINDOW_SIZE=12 OVERLAP=4`** — lower per-submap latency, more frequent clouds
   (slightly less per-window context for PanoVGGT).
 
-> **On the block-diff degenerating to a full transfer.** The content-versioned
-> diff (below) only saves bandwidth when <~30 % of cubes change between submaps. In
-> online mapping the global mesh re-extracts every submap and marching-cubes
-> vertices shift sub-voxel, so most CRCs flip → it ships nearly the whole cloud each
-> time anyway, plus manifest/CRC/diff/request-reply overhead. It still self-heals on
-> reset and costs only one query/reply per submap, so with the payload now small
-> (above) it's kept as-is. If profiling shows the diff itself (not the payload) is
-> the stutter, replace it with a single Draco full-cloud **push** (pub/sub, client
-> replaces wholesale) — simpler and immune to the churn; the protocol hook
-> (`get_current_cloud`) is already in place.
+> **Why the diff degenerated to a full transfer ("synced N/N cubes", transfer ∝
+> total map size) — fixed.** The cube version was a CRC over geometry **and colour**.
+> The colorizer re-projects best-view colour for every vertex each submap, so even a
+> perfectly static surface got a slightly different colour every time → every cube's
+> CRC flipped → the whole map re-sent each submap, and that grew without bound as
+> you explored. Fix: the cube CRC is now **geometry-only** (`vat_blockmap`), so a
+> cube re-sends only when its *shape* changes → **bandwidth scales with the frontier,
+> not the map**. The full 8-bit colour still travels in the bundle; a static cube
+> keeps the colour it was last sent with (`BLOCKMAP_CRC_COLOR=1` folds a coarse
+> colour back in). `CLOUD_VOXEL_SNAP=1` additionally dedups the cloud to one point
+> per voxel, but binning flickers cube membership at cell edges so it's **off by
+> default** (nvblox's marching cubes is deterministic for an unchanged TSDF, so raw
+> vertices give a more stable diff). Other bandwidth knobs: **`TRAJ_MAX_POSES`** caps
+> the streamed trajectory (it's re-sent each submap), and the **ceiling clip** drops
+> points above `CEILING_Z`.
+>
+> If geometry CRCs still churn (e.g. nvblox re-meshes globally), the guaranteed-O(1)
+> design is **local-region streaming**: each submap the server pushes only the cubes
+> within R m of the camera and the client *accumulates* (keeps far cubes, no
+> manifest/diff). The on-demand snapshot query already covers late joiners. This is
+> the recommended next step if the geometry-only CRC isn't enough.
+
+### Viewer controls (VisPy)
+
+`1` force re-fetch · `R` reset map · `F` refit · `,`/`.` cloud↔robot yaw · `/` yaw 0
+· `N`/`M` point size · **`C` ceiling clip on/off · `[`/`]` lower/raise the ceiling**.
+The ceiling keys publish the height to `server/prism/config/ceiling_z` (clip at the
+source for bandwidth) *and* clip the local cloud instantly. A true draggable slider
+needs the Qt backend (`vispy.use('pyqt5')` + a `QSlider` panel) — offered as a
+follow-up; the keys deliver the same control on the current glfw backend.
+
+### Pose correction convergence (POC)
+
+`CORRECTION_POS_GAIN`/`CORRECTION_ROT_GAIN` (default **0.7**) set how much of each
+VGGT correction is folded into the robot anchor — 0.7 converges the avatar in ~2
+corrections (the green pose used to crawl in over ~5 at 0.5). This is still the
+placeholder dead-reckoner; the proper fix for convergence *and* drift is a
+**pose-graph backend** (a fixed-lag smoother over VGGT keyframe constraints +
+odometry, with loop closures), which replaces the complementary blend behind the
+same `go2/prism/pose` contract — the next major work item.
 
 ### Cloud delivery: content-versioned block sync + Draco
 

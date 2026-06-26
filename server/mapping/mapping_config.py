@@ -62,6 +62,9 @@ CEILING_Z = _parse_ceiling(os.environ.get("CEILING_Z", ""))
 # Cap points in the STREAMED snapshot (0 = no cap); full-res still via the query.
 CLOUD_STREAM_MAX_POINTS = int(os.environ.get("CLOUD_STREAM_MAX_POINTS", "60000"))
 CUBE_SIZE = float(os.environ.get("CUBE_SIZE", "1.0"))
+# Cap the camera trajectory streamed to the viewer to the last N poses (the full
+# trajectory grows without bound and is re-sent each submap). 0 = send all.
+TRAJ_MAX_POSES = int(os.environ.get("TRAJ_MAX_POSES", "300"))
 # 1 = full snapshot every submap (viewer replaces wholesale → always aligned).
 PCD_KEYFRAME_EVERY = int(os.environ.get("PCD_KEYFRAME_EVERY", "1"))
 

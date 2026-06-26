@@ -302,7 +302,9 @@ class MappingServer:
                 self._last_submap_t = _now
 
                 if r.trajectory is not None and len(r.trajectory) > 0:
-                    self._pub_traj.put(proto.pack_trajectory(r.trajectory))
+                    traj_send = (r.trajectory[-cfg.TRAJ_MAX_POSES:]
+                                 if cfg.TRAJ_MAX_POSES > 0 else r.trajectory)
+                    self._pub_traj.put(proto.pack_trajectory(traj_send))
                     self._publish_pose_correction(version, r.cam_pose, r.trajectory, r.cam_ts)
 
                 n_sub += 1
