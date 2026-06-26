@@ -38,6 +38,7 @@ from frame_io import build_mask, decode_frame
 from prism_session import OnlinePRISMSession
 from pose_estimation import (
     PoseCorrectionGate, camera_pose_from_matrix, camera_pose_from_trajectory)
+from telemetry import ClockOffsetEstimator, ThroughputMeter
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -60,6 +61,10 @@ class MappingServer:
         self._cloud_mbps = 0.0
         self._mask = build_mask()
         self._ceiling_z = cfg.CEILING_Z      # None = send whole cloud (no slicing)
+        # telemetry: robot→server clock offset + frame throughput (see telemetry.py)
+        self._clock = ClockOffsetEstimator()
+        self._rx_meter = ThroughputMeter()
+        self._last_frame_robot_ns = 0
         self._corr_gate = PoseCorrectionGate(
             cfg.CORRECTION_MAX_SPEED, cfg.CORRECTION_JUMP_MARGIN,
             cfg.CORRECTION_DEADBAND_M, cfg.CORRECTION_DEADBAND_DEG)
@@ -147,6 +152,11 @@ class MappingServer:
         seq, frame = decoded
         if self._prism is None:
             return
+        # telemetry: robot→server clock offset + throughput (payload = wire bytes)
+        robot_ns = int(frame.timestamp * 1e9)
+        self._clock.update(robot_ns)
+        self._rx_meter.add(len(bytes(sample.payload)))
+        self._last_frame_robot_ns = robot_ns
         self._prism.add_frame(seq, frame)
         self._frame_rx += 1
         total, _lo, _hi, new = self._prism.stats()
@@ -212,6 +222,7 @@ class MappingServer:
         self._gap_count = 0
         self._last_window_t = time.time()
         self._corr_gate.reset()
+        self._rx_meter = ThroughputMeter()
         self._blockpub.reset()
         try:
             empty = np.zeros((0, 3), dtype=np.float32)
@@ -317,6 +328,7 @@ class MappingServer:
                     span = r.trajectory.max(axis=0) - r.trajectory.min(axis=0)
                     extent = f"{span[0]:.1f}x{span[1]:.1f}x{span[2]:.1f}m"
                 clipped = n_full - last_pts
+                self._rx_meter.decay()
                 self._publish_status("processing", {
                     "map_version": int(version), "n_points": last_pts,
                     "n_points_full": n_full, "ceiling_clipped": clipped,
@@ -326,7 +338,14 @@ class MappingServer:
                     "submap_s": round(time.time() - t_iter, 2),
                     "cloud_mbps": round(self._cloud_mbps, 3),
                     "frames_buffered": total, "trigger": trigger,
-                    "seq_gaps": self._gap_count})
+                    "seq_gaps": self._gap_count,
+                    # ── telemetry for the client metrics window ──
+                    "server_send_ns": time.time_ns(),
+                    "robot_offset_ms": round((self._clock.offset_s or 0.0) * 1e3, 1),
+                    "robot_to_server_ms": round(self._clock.last_latency_s * 1e3, 1),
+                    "robot_kbps": round(self._rx_meter.kbps, 1),
+                    "robot_fps": round(self._rx_meter.mps, 2),
+                    "newest_frame_robot_ns": int(self._last_frame_robot_ns)})
                 clip_note = (f" (clipped {clipped} above {self._ceiling_z:.2f}m)"
                              if self._ceiling_z is not None else "")
                 log.info(f"[Server] ✓ submap v{version}: surface {last_pts} pts{clip_note} | "

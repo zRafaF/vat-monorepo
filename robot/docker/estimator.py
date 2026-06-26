@@ -29,6 +29,7 @@ Pure NumPy: no ROS, no Zenoh — so it unit-tests in isolation.
 
 from __future__ import annotations
 
+import os
 from collections import deque
 
 import numpy as np
@@ -38,6 +39,8 @@ from vat_protocol import (
     integrate_pose,
 )
 from kinematics import Transform
+from pose_graph import (
+    SlidingWindowPoseGraph, se3, se3_inv, quat_to_R, R_to_quat)
 
 
 class WheelInertialEstimator:
@@ -94,6 +97,15 @@ class WheelInertialEstimator:
         self._pos_gain = pos_gain
         self._rot_gain = rot_gain
         self._inited = False
+        # Correction backend: "graph" = sliding-window SE(3) pose graph (jointly
+        # fits the recent VGGT fixes against the odometry chain → converges in one
+        # solve, less jitter, drift-corrected); "blend" = the legacy single-anchor
+        # complementary blend. POSE_BACKEND=blend to fall back.
+        self._backend = os.environ.get("POSE_BACKEND", "graph").strip().lower()
+        self._graph = SlidingWindowPoseGraph(
+            window=int(os.environ.get("POSE_GRAPH_WINDOW", "12"))) \
+            if self._backend == "graph" else None
+        self._prev_odom_kf_T = None
 
     # -- high-rate prediction -------------------------------------------------
     def predict(self, imu_quat: np.ndarray, gyro: np.ndarray,
@@ -170,6 +182,13 @@ class WheelInertialEstimator:
         R_v = quat_normalize(base_world.rotation)
         p_v = np.asarray(base_world.translation, dtype=np.float64).reshape(3)
 
+        # Pose-graph backend: jointly fit this fix against the odometry chain.
+        if self._backend == "graph" and self._graph is not None:
+            self._correct_graph(odom_pos_t, odom_quat_t, R_v, p_v,
+                                 int(capture_ts_ns) if capture_ts_ns is not None else now_ns)
+            self.have_vggt = True
+            return
+
         # offset s.t.  R_corr * odom_quat_t == R_v  and
         #              R_corr * odom_pos_t + p_corr == p_v
         R_corr_new = quat_normalize(quat_mul(R_v, quat_conj(quat_normalize(odom_quat_t))))
@@ -184,6 +203,27 @@ class WheelInertialEstimator:
                 + self._pos_gain * p_corr_new
             self._corr_R = quat_normalize(
                 quat_slerp(self._corr_R, R_corr_new, self._rot_gain))
+
+    def _correct_graph(self, odom_pos_t, odom_quat_t, R_v, p_v, ts_ns):
+        """Pose-graph correction: add this keyframe (seeded from the current
+        world←odom anchor and linked to the previous keyframe by the odometry
+        relative pose), attach the VGGT absolute factor, optimise the window, and
+        recompute the world←odom anchor from the optimised latest keyframe.
+        ``state()`` then applies that anchor to live odometry exactly as before."""
+        T_odom_kf = se3(quat_to_R(odom_quat_t), np.asarray(odom_pos_t, np.float64))
+        T_corr = se3(quat_to_R(self._corr_R), self._corr_p)
+        world_init = T_corr @ T_odom_kf
+        odom_rel = (se3_inv(self._prev_odom_kf_T) @ T_odom_kf
+                    if self._prev_odom_kf_T is not None else None)
+        idx = self._graph.add_keyframe(float(ts_ns) * 1e-9, world_init, odom_rel=odom_rel)
+        self._graph.add_absolute(idx, se3(quat_to_R(R_v), np.asarray(p_v, np.float64)))
+        self._graph.optimize()
+        T_kf = self._graph.latest_T()
+        if T_kf is not None:
+            T_corr_new = T_kf @ se3_inv(T_odom_kf)
+            self._corr_R = R_to_quat(T_corr_new[:3, :3])
+            self._corr_p = T_corr_new[:3, 3].copy()
+        self._prev_odom_kf_T = T_odom_kf
 
     # -- accessor -------------------------------------------------------------
     def state(self):

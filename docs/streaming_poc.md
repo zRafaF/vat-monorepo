@@ -828,13 +828,36 @@ follow-up; the keys deliver the same control on the current glfw backend.
 
 ### Pose correction convergence (POC)
 
-`CORRECTION_POS_GAIN`/`CORRECTION_ROT_GAIN` (default **0.7**) set how much of each
-VGGT correction is folded into the robot anchor — 0.7 converges the avatar in ~2
-corrections (the green pose used to crawl in over ~5 at 0.5). This is still the
-placeholder dead-reckoner; the proper fix for convergence *and* drift is a
-**pose-graph backend** (a fixed-lag smoother over VGGT keyframe constraints +
-odometry, with loop closures), which replaces the complementary blend behind the
-same `go2/prism/pose` contract — the next major work item.
+The robot estimator has two correction backends (`POSE_BACKEND`, default `graph`):
+
+* **`graph`** — a lightweight **sliding-window SE(3) pose graph**
+  (`robot/docker/pose_graph.py`, numpy-only Gauss-Newton, no GTSAM/Ceres dep). Each
+  VGGT fix adds a keyframe seeded from the current anchor, linked to the previous
+  keyframe by the odometry relative pose, with the VGGT pose as an absolute factor;
+  the window (default 12) is optimised in one solve and the world←odom anchor is
+  read back from the latest keyframe. Because it fits the recent fixes *jointly
+  against the odometry chain*, the avatar converges in one correction instead of
+  blending in over several, and a noisy fix is smoothed rather than snapped.
+  Validated on synthetic trajectories: raw-odometry drift 1.7 m → graph 0.13 m
+  (`python pose_graph.py` self-test, and the estimator replica test).
+* **`blend`** — the legacy single-anchor complementary blend
+  (`CORRECTION_POS_GAIN`/`ROT_GAIN`, default 0.7). Fallback if the graph misbehaves.
+
+It is still a fixed-lag smoother without loop closure (Phase 2 adds loop-closure
+factors behind the same `go2/prism/pose` contract).
+
+### Pipeline profiling & the robot clock
+
+The robot clock isn't synced (it drifts), so absolute one-way latency is
+unobservable; the server (`telemetry.py`) runs a **windowed-minimum offset filter**
+(`recv − send = offset + transit`, `transit ≥ 0`) over frame arrivals to recover the
+robot→server clock offset and the latency *above the link baseline*, and publishes
+`robot_offset_ms`, `robot_to_server_ms`, `robot_kbps/fps`, `server_send_ns` and
+`newest_frame_robot_ns` in the status. The client (NTP-synced to the server) uses
+these to compute every path: server→client directly, robot→server from the status,
+robot→client (pose) via the offset, capture→display from `newest_frame_robot_ns`.
+For *absolute* robot latency, add a round-trip ping (a robot-side queryable echoing
+its clock). These feed the client metrics window.
 
 ### Cloud delivery: content-versioned block sync + Draco
 
