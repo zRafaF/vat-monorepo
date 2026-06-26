@@ -111,7 +111,12 @@ vat-monorepo/
 ├── server/                     ← multiple microservices, each its own uv project
 │   ├── mapping/                ← vat-mapping (ISOLATED env; heavy CUDA deps)
 │   │   ├── pyproject.toml
-│   │   ├── mapping_server.py   ← PRISM mapping + VGGT pose-correction publisher
+│   │   ├── mapping_server.py   ← thin orchestrator (Zenoh I/O + batch loop)
+│   │   ├── mapping_config.py   ← all tunables + Zenoh keys (one place)
+│   │   ├── frame_io.py         ← VAT frame decode + spherical mask
+│   │   ├── prism_session.py    ← PRISM engine + seq-keyed frame buffer (online)
+│   │   ├── pose_estimation.py  ← VGGT camera-pose extract + correction gate
+│   │   ├── block_publisher.py  ← diff-based cube-grid cloud sync
 │   │   └── PRISM-VGGT/         ← git submodule (git submodule add … — see below)
 │   └── router/                 ← vat-router (ISOLATED env, excluded from workspace)
 │       ├── pyproject.toml      ← only eclipse-zenoh — no clash with the mapper
@@ -745,6 +750,31 @@ Tune `CORRECTION_DEADBAND_*` up if it still twitches when still, down if the
 avatar lags small real moves. **Validated in simulation only** (`corr_gate_test.py`);
 not yet confirmed on hardware. The slow *map* drift underneath (wall ghosting over
 distance) is unaffected by these guards and still awaits loop closure (Phase 2).
+
+### Map display source: current TSDF surface, not the accumulating cache
+
+**Symptom:** live walls were *many voxels thick and fuzzy* (and the on-demand full
+fetch / press-1 showed duplicated walls), while the **same frames in gradio gave
+crisp 1-voxel-thin walls**. "Is there a final step gradio does before display?" —
+effectively yes, and the server wasn't doing it.
+
+**Root cause.** `mapping_server` published `engine.get_point_cloud_snapshot()` —
+the `BlockColorCache`, whose `_cache_update` only ever *adds/updates* blocks and
+**never removes** them. So it ACCUMULATES every block ever coloured across all
+submaps; the moment the surface shifts (any drift, or even sub-voxel jitter that
+lands a vertex in a new block) the old blocks stay and new ones pile on → thick,
+fuzzy, duplicated walls. Gradio never uses that cache: it displays the **current
+nvblox TSDF mesh** (`get_color_mesh_raw` / `_extract_and_color_current`) —
+marching cubes over the fused volume, one vertex per zero-crossing = thin walls.
+
+**Fix.** The engine exposes `get_current_cloud()` (the current TSDF surface), and
+`prism_session`/`mapping_server` route BOTH the streamed cloud and the on-demand
+`pcd_snapshot` query through it. The block-sync `BlockGrid.ingest` already returns
+`removed` cubes, so feeding it the current surface each submap prunes vanished
+cubes instead of layering — the streamed manifest now reflects the live surface.
+The `BlockColorCache` remains only for the versioned delta API. This makes the
+live map a 1:1 match for gradio's geometry. (Residual *thickness from genuine pose
+drift over distance* is separate and still awaits loop closure — Phase 2.)
 
 ### Cloud delivery: content-versioned block sync + Draco
 
