@@ -89,6 +89,14 @@ STICK = np.array([
 ], dtype=np.float64)
 RETX_BUFFER     = int(os.environ.get("RETX_BUFFER", "256"))
 CAPTURE_RETRY_S = float(os.environ.get("CAPTURE_RETRY_S", "3.0"))
+# Frozen-stream watchdog. When the Theta drops offline (or the host `theta-uvc`
+# gstthetauvc feed dies), the v4l2 loopback keeps handing back the SAME cached
+# frame instead of failing — so the container would publish that one stale frame
+# forever and need a manual restart. Real frames always differ by sensor noise,
+# so if the captured frame is byte-identical for this many seconds we treat the
+# stream as dead: stop publishing and reopen the capture, which transparently
+# picks up a restarted `theta-uvc` with NO container restart. 0 disables.
+STALE_TIMEOUT_S = float(os.environ.get("STALE_TIMEOUT_S", "2.5"))
 
 # Capture source
 THETA_GST_PIPELINE = os.environ.get("THETA_GST_PIPELINE", "").strip()
@@ -186,11 +194,37 @@ class ThetaCapture(threading.Thread):
                     time.sleep(CAPTURE_RETRY_S)
                     continue
                 log.info("[Capture] Theta stream open. Streaming…")
+                last_sig = None
+                last_change = time.time()
+                warned_frozen = False
                 while not self._stop.is_set():
                     ok, frame = cap.read()
                     if not ok or frame is None:
                         log.warning("[Capture] read failed — reopening stream")
                         break
+                    now = time.time()
+                    # Cheap content signature over a sparse grid; live frames differ
+                    # by sensor noise every read, a frozen stream is byte-identical.
+                    sig = hash(frame[::32, ::32].tobytes())
+                    if sig != last_sig:
+                        last_sig = sig
+                        last_change = now
+                        warned_frozen = False
+                    else:
+                        # Duplicate frame: do NOT publish it (don't feed the map a
+                        # stale frame). If it stays frozen past the timeout, drop the
+                        # handle and reopen so a restarted theta-uvc is picked up.
+                        if not warned_frozen:
+                            log.warning("[Capture] identical frames — camera may be "
+                                        "frozen/offline; pausing publish")
+                            warned_frozen = True
+                        if STALE_TIMEOUT_S > 0 and (now - last_change) > STALE_TIMEOUT_S:
+                            log.warning(f"[Capture] stream FROZEN for "
+                                        f"{now - last_change:.1f}s — reopening capture "
+                                        "(reboot the camera + re-run 'make theta-uvc'; "
+                                        "recovery is automatic, no container restart)")
+                            break
+                        continue
                     self._frames += 1
                     self._decimator.push(time.time_ns(), frame)
             except Exception as e:

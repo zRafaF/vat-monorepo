@@ -107,6 +107,16 @@ MAX_RETRIES_CYCLE  = int(os.environ.get("MAX_RETRIES_CYCLE", str(WINDOW_SIZE)))
 
 CAMERA_HEIGHT = float(os.environ.get("CAMERA_HEIGHT", "0.50"))  # fallback only
 
+# Pose-correction safety. The VGGT camera-pose correction is sent DOWN to the
+# robot fuser and back-propagates the avatar pose. A single bad/early submap pose
+# (or a still-converging warm-up scale) would otherwise teleport the avatar — the
+# "robot walks through walls / goes all over the place on green-fix" symptom.
+#   * gate corrections until the metric scale has COMMITTED (warm-up done), and
+#   * reject a correction that implies travel faster than CORRECTION_MAX_SPEED
+#     (m/s) since the previous one (plus a fixed margin).
+CORRECTION_MAX_SPEED = float(os.environ.get("CORRECTION_MAX_SPEED", "2.5"))
+CORRECTION_JUMP_MARGIN = float(os.environ.get("CORRECTION_JUMP_MARGIN", "0.75"))
+
 TARGET_WIDTH  = int(os.environ.get("TARGET_WIDTH",  "1036"))
 TARGET_HEIGHT = int(os.environ.get("TARGET_HEIGHT", "518"))
 ZENITH_LIMIT  = float(os.environ.get("ZENITH_LIMIT", "75"))
@@ -356,6 +366,9 @@ class MappingServer:
         self._last_submap_t = 0.0
         self._cloud_mbps = 0.0
         self._last_payload_bytes = 0
+        # last accepted pose correction (for the jump/outlier gate)
+        self._last_corr_pos = None
+        self._last_corr_ts = None
         self._mask = get_spherical_valid_mask(
             TARGET_HEIGHT, TARGET_WIDTH, zenith_deg=ZENITH_LIMIT, nadir_deg=NADIR_LIMIT)
 
@@ -506,6 +519,8 @@ class MappingServer:
         self._max_seq_seen = -1
         self._gap_count = 0
         self._last_window_t = time.time()
+        self._last_corr_pos = None
+        self._last_corr_ts = None
         # next send must be a fresh keyframe (deltas restart from scratch)
         self._last_sent_version = -1
         self._submaps_since_key = 0
@@ -639,6 +654,15 @@ class MappingServer:
             self._processing = False
 
     def _publish_pose_correction(self, version, cam_pose, traj_np, cam_ts_s=None):
+        # Gate 1: don't back-propagate corrections while the metric scale is still
+        # converging (warm-up). Early corrections live in a shifting frame and would
+        # jerk the avatar. Once the engine commits the scale they're trustworthy.
+        try:
+            if not getattr(self._prism.engine, "_scale_committed", True):
+                return
+        except Exception:
+            pass
+
         # Prefer the real VGGT extrinsics; fall back to heading-from-tangent only
         # if the engine hasn't exposed a full pose yet.
         pose = _camera_pose_from_matrix(cam_pose)
@@ -647,6 +671,21 @@ class MappingServer:
         if pose is None:
             return
         pos, quat = pose
+
+        # Gate 2: outlier/teleport rejection. Reject a correction implying travel
+        # faster than CORRECTION_MAX_SPEED since the last accepted one (a drifted /
+        # degenerate submap pose). Slow map drift still needs loop closure (POC
+        # limitation) — this only stops the violent jumps.
+        if self._last_corr_pos is not None:
+            dt = abs((cam_ts_s or 0.0) - (self._last_corr_ts or 0.0))
+            budget = CORRECTION_MAX_SPEED * dt + CORRECTION_JUMP_MARGIN if dt > 0 else None
+            jump = float(np.linalg.norm(np.asarray(pos) - self._last_corr_pos))
+            if budget is not None and jump > budget:
+                log.warning(f"[Server] pose correction rejected: jump {jump:.2f} m > "
+                            f"{budget:.2f} m budget ({dt:.2f}s) — likely a drifted submap")
+                return
+        self._last_corr_pos = np.asarray(pos, dtype=np.float64).copy()
+        self._last_corr_ts = cam_ts_s
         # CRITICAL: stamp with the keyframe's CAPTURE time, not now(). This pose
         # describes where the camera was ~2-4 s ago; the robot needs that capture
         # time to re-anchor its dead-reckoning history at the right point instead

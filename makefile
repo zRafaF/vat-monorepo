@@ -19,7 +19,7 @@ CLIENT_RUN ?= cd client && uv run python
 
 .PHONY: help steps \
         sync-mapping sync-client sync-router sync-robot sync-docs \
-        router mapping theta-uvc theta-stream robot-docker viewer viewer-rerun record-frames \
+        router mapping theta-uvc theta-uvc-kill theta-stream robot-docker viewer viewer-rerun record-frames \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         teleop fetch_frame fetch_pcd \
         docs docs-serve clean
@@ -38,6 +38,7 @@ help:
 	@echo "  make router          [SERVER] run the Zenoh router (hub)"
 	@echo "  make mapping         [SERVER] run the PRISM mapping server"
 	@echo "  make theta-uvc       [ROBOT]  expose Theta X UVC → /dev/video10 (host)"
+	@echo "  make theta-uvc-kill  [ROBOT]  stop the Theta UVC feed (after a camera reboot)"
 	@echo "  make theta-stream    [ROBOT]  headless: Theta → Zenoh (view on host)"
 	@echo "  make robot-docker    [ROBOT]  bridge + theta_camera + pose fuser container"
 	@echo "  make viewer          [CLIENT] full POC viewer — Open3D (cloud + robot + legs)"
@@ -117,6 +118,18 @@ mapping: sync-mapping
 theta-uvc:
 	@echo ">> [ROBOT] Theta X UVC → /dev/video10 (leave running in its own shell)"
 	bash robot/theta/theta_uvc.sh
+
+# [ROBOT] Stop the Theta UVC feed (gstthetauvc / gst_loopback). Use this when the
+# camera dropped and you've rebooted it: kill the old feed, then re-run
+# `make theta-uvc`. The v4l2 loopback device is left loaded (theta_uvc.sh reuses
+# it); the container's frozen-stream watchdog reconnects automatically once the
+# fresh feed is up — no robot-docker restart needed.
+theta-uvc-kill:
+	@echo ">> [ROBOT] stopping Theta UVC feed (gstthetauvc / gst_loopback) ..."
+	-@pkill -f 'gst-launch-1.0.*thetauvcsrc' 2>/dev/null || true
+	-@pkill -f 'gst_loopback' 2>/dev/null || true
+	-@pkill -f 'robot/theta/theta_uvc.sh' 2>/dev/null || true
+	@echo ">> stopped. Loopback /dev/video10 kept loaded; re-run 'make theta-uvc' to restart the feed."
 
 # [ROBOT] Headless: publish the Theta loopback to Zenoh so you can view it on
 # the host (make test_frames_server). No display on the robot; no container.

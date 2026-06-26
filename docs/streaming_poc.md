@@ -484,14 +484,15 @@ reads it from the frame (falling back to `CAMERA_HEIGHT` only if `< 0`).
 >        confident windows** (and window 0's own anchor is itself a median over
 >        several of its frames). `SCALE_WARMUP_WINDOWS=1` restores the old
 >        lock-on-first-window behaviour.
->     2. **Floor-anchored depth scale.** VGGT's *native* per-window scale drifts as
->        the camera explores; integrating depth at the single locked scale then lands
->        each window's floor at a slightly different height → the duplicated/layered
->        ground. So each window's **depth is integrated at that window's own floor
->        scale** (floor always at the metric camera height) while the **pose chain**
->        stays on the locked scale. Disable with `DEPTH_SCALE_FROM_FLOOR=0`.
->   The legacy per-window floor *pull* on the pose scale is still off by default
->   (`SCALE_TRACK_FLOOR=1` to re-enable; only safe if the stamped height is rock-steady).
+>   Depth is then integrated at that **single committed scale for every window —
+>   identical to the offline gradio pipeline.** (The camera height only anchors
+>   metric scale on the first scene; PanoVGGT carries it after, so there is nothing
+>   per-frame to re-apply.) An opt-in `DEPTH_SCALE_FROM_FLOOR=1` instead re-scales
+>   each window's depth to its own floor estimate — that pins the floor perfectly
+>   flat, but the ~±4 % per-window floor-RANSAC noise then makes the *walls* jitter
+>   in size window-to-window (wall ghosting), so it is **off by default** and only
+>   worth enabling for a genuine *monotonic* floor climb across very different scenes.
+>   The legacy floor *pull* on the pose scale is also off (`SCALE_TRACK_FLOOR=1`).
 > * **Robot** (`theta_camera.py`): stamps a *consistent* height. `CAMERA_HEIGHT_MODE`
 >   selects how:
 >     * `const` (default) — one fixed `CAMERA_HEIGHT_M` (measured ground→camera,
@@ -688,19 +689,39 @@ worse by real (vs curated) footage:
    was ~0.60-sized**, so the same wall reconstructed at different places per window.
 
 **Fixes (see [camera height note](#robot-kinematics-camera--base-and-camera-height)
-for the engine bullets):** floor-anchored depth scale (`DEPTH_SCALE_FROM_FLOOR`),
-a robust median **scale warm-up** (`SCALE_WARMUP_WINDOWS`), and a multi-frame
-first-window anchor.
+for the engine bullets):** a robust median **scale warm-up** (`SCALE_WARMUP_WINDOWS`)
+plus a multi-frame first-window anchor get the *one* metric scale right; depth is
+then integrated at that committed scale, **matching gradio** (`DEPTH_SCALE_FROM_FLOOR=0`,
+the per-window depth re-scale is opt-in only).
 
-**Verification status.** Validated *in simulation* against the logged numbers:
-the depth-scale fix collapses the floor span from ~13 cm to ≤±1.5 cm; the warm-up
-anchor cuts landmark ghosting ~1.41 m → ~0.045 m and locks the scale to the true
-`~0.60` instead of the `0.70` outlier (`drift_sim.py`, `anchor_sim.py`,
-`statemachine_test.py`). **Not yet confirmed on hardware.** To confirm on a live
-run, watch the new server logs: `[Scale Warmup]/[Scale Lock]` should settle on a
-scale close to the steady-state floor scale (not an early outlier), `[Depth Scale]`
-Δ% should be small, and the viewer should show a single ground plane with no
-wall ghosting as the robot drives.
+**Verification status — partial.** The scale math is validated *in simulation*
+against the logged numbers: online and batch pose-chaining are byte-identical
+(`drift_sim.py`); the warm-up anchor cuts simulated landmark ghosting ~1.41 m →
+~0.045 m and locks the scale to the true `~0.60` instead of the `0.70` outlier
+(`anchor_sim.py`, `statemachine_test.py`). On hardware, a first round of these
+fixes **improved alignment but did not fully resolve it**: residual *wall* ghosting
+remained and the full-snapshot fetch still showed duplication. Part of that was the
+per-window depth re-scale adding wall jitter (now off by default); the rest is
+**sequential-registration drift** — each window is aligned only to the previous
+one's overlap, so small rotation errors accumulate over a long trajectory. That is
+a fundamental limitation of the current windowed front-end with **no loop closure /
+global bundle adjustment** (Phase 2). Expect it to be much reduced, not zero.
+**Not yet re-confirmed on hardware after this round.** To check a live run: the
+`[Scale Warmup]/[Scale Lock]` logs should settle near the steady-state floor scale
+(not an early outlier); the floor should be a single plane; wall ghosting should
+shrink but may still grow slowly with distance until loop closure lands.
+
+### Pose correction stability (POC)
+
+The VGGT **camera-pose correction** is sent down to the robot fuser and
+back-propagates the avatar. Because our windowed trajectory drifts (above), a
+late/degenerate submap pose could throw the avatar — the *"robot walks through
+walls / goes all over the place on green-fix"* symptom. Two server-side guards
+(`mapping_server._publish_pose_correction`) contain it: corrections are **gated
+until the metric scale commits** (no back-prop during the unstable warm-up), and a
+correction implying travel faster than `CORRECTION_MAX_SPEED` (m/s) since the last
+accepted one (plus `CORRECTION_JUMP_MARGIN`) is **rejected as an outlier**. These
+stop the violent jumps; the slow underlying drift still awaits loop closure.
 
 ### Cloud delivery: content-versioned block sync + Draco
 
@@ -787,6 +808,17 @@ The `1` key forces a full re-sync; `pcd_snapshot` (full-res, on demand) is kept 
 → If the robot preview works but the client sees 0 Hz, the container didn't get
    the device — start `make theta-uvc` **before** `make robot-docker` so `--device
    /dev/video10` is attached; check `docker logs vat-robot` for `theta_camera`.
+
+**Camera dropped / map froze on one stale frame**  
+→ The Theta sometimes drops its UVC stream; the v4l2 loopback then keeps handing
+   back the **same cached frame**, so the map appears to "freeze" on one view.
+   `theta_camera.py` now detects this (byte-identical frames for `STALE_TIMEOUT_S`):
+   it **stops publishing the stale frame and reopens the capture**, logging
+   `stream FROZEN … reopening`. Recovery flow: reboot/power-cycle the camera (back
+   to LIVE mode, `lsusb` → `05ca:2717`), then `make theta-uvc-kill` and
+   `make theta-uvc` to restart the host feed. The container reconnects on its own —
+   **no `make robot-docker` restart needed.** (If it still won't recover, the old
+   feed may be holding the device: `make theta-uvc-kill` then re-run.)
 
 **`ros2 topic list` is empty / `package not found` on the robot**  
 → Export the CycloneDDS fix first (the Go2 points at the wrong interface):
