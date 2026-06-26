@@ -471,11 +471,27 @@ reads it from the frame (falling back to `CAMERA_HEIGHT` only if `< 0`).
 > registered — the global map looked "misaligned."** The gradio offline run used a
 > *single constant* height and aligned perfectly. The fix, in two parts:
 >
-> * **Engine** (`prism_vggt/engine.py`): metric scale is anchored **only on the first
->   window** (from the floor / camera height); every later window inherits scale
->   through the overlap-camera **Sim3 chain**. The per-window floor pull is off by
->   default (re-enable with `SCALE_TRACK_FLOOR=1` only if the stamped height is
->   rock-steady).
+> * **Engine** (`prism_vggt/engine.py`): the **pose-chain** scale is anchored early
+>   and then held, so the camera trajectory stays metrically stable; every later
+>   window inherits it through the overlap-camera **Sim3 chain**. Two refinements
+>   (added after a streaming run still showed a layered/ghosting map — see
+>   [Online metric scale](#online-metric-scale)) make that anchor trustworthy and
+>   stop the geometry from drifting off it:
+>     1. **Robust scale anchor (warm-up).** A single window's floor RANSAC is noisy
+>        and the *first* window's estimate is the one most likely to be a damaging
+>        outlier. Instead of locking to window 0 alone, the scale is anchored to the
+>        **median floor scale of the first `SCALE_WARMUP_WINDOWS` (default 3)
+>        confident windows** (and window 0's own anchor is itself a median over
+>        several of its frames). `SCALE_WARMUP_WINDOWS=1` restores the old
+>        lock-on-first-window behaviour.
+>     2. **Floor-anchored depth scale.** VGGT's *native* per-window scale drifts as
+>        the camera explores; integrating depth at the single locked scale then lands
+>        each window's floor at a slightly different height → the duplicated/layered
+>        ground. So each window's **depth is integrated at that window's own floor
+>        scale** (floor always at the metric camera height) while the **pose chain**
+>        stays on the locked scale. Disable with `DEPTH_SCALE_FROM_FLOOR=0`.
+>   The legacy per-window floor *pull* on the pose scale is still off by default
+>   (`SCALE_TRACK_FLOOR=1` to re-enable; only safe if the stamped height is rock-steady).
 > * **Robot** (`theta_camera.py`): stamps a *consistent* height. `CAMERA_HEIGHT_MODE`
 >   selects how:
 >     * `const` (default) — one fixed `CAMERA_HEIGHT_M` (measured ground→camera,
@@ -642,16 +658,49 @@ cube's canonically-sorted, mm-quantised contents. Tunables: `CUBE_SIZE` (1 m),
 
 ## Known limitations (POC)
 
-### Online metric scale (resolved)
+### Online metric scale
 
 `process_sequence(reset=False)` runs the engine **online** — it keeps the
-persistent map and processes only new windows. The map's metric scale is now
-anchored **once** on the first window and propagated through the overlap Sim3
-chain; the per-window floor pull is off by default (`SCALE_TRACK_FLOOR=1` to
-re-enable). Combined with a *consistent* stamped camera height
-(`CAMERA_HEIGHT_MODE=const|legs`, see [camera height](#robot-kinematics-camera--base-and-camera-height)),
-this fixed the "misaligned" global map. The known-good gradio offline run uses
-`window 16 / overlap 4`; the server defaults match it (`vat.env`).
+persistent map and processes only new windows. The known-good gradio offline run
+uses `window 16 / overlap 4`; the server defaults match it (`vat.env`).
+
+**Symptom we chased:** the live map showed a *duplicated/layered ground* (a floor
+at 0, then ~10 cm, then ~20 cm…) and walls that ghosted as the robot moved, while
+the **same frames replayed through the gradio UI reconstructed cleanly**.
+
+**What it was NOT.** A pure-NumPy reproduction of the pose-chaining math
+(`server/mapping/PRISM-VGGT/drift_sim.py`) shows the online (incremental, many
+`process_sequence` calls) and offline (one batch call) paths produce **identical
+poses to machine precision** — so this was never an online-vs-offline state/index
+bug. The difference is *scene-driven*, not code-path-driven.
+
+**Root cause (confirmed from a live server log).** Two scale problems, both made
+worse by real (vs curated) footage:
+
+1. **Layered floor** — the depth was integrated at the single first-window scale,
+   but VGGT's *native* per-window scale drifts, so each window's floor landed at a
+   different height. In the log, the floor scale each window wanted (`~0.58–0.62`)
+   differed from the locked scale (`0.7003`) by a *varying* −11 % to −18 %; pushing
+   those through the depth integration scattered the floor over ~13 cm — the layers.
+2. **Ghosting / inflated map** — the locked scale `0.7003` was itself a bad
+   *first-window outlier*: every later window reported `~0.60`. Locking the whole
+   trajectory to `0.70` left the **cameras ~16 % too far apart while the geometry
+   was ~0.60-sized**, so the same wall reconstructed at different places per window.
+
+**Fixes (see [camera height note](#robot-kinematics-camera--base-and-camera-height)
+for the engine bullets):** floor-anchored depth scale (`DEPTH_SCALE_FROM_FLOOR`),
+a robust median **scale warm-up** (`SCALE_WARMUP_WINDOWS`), and a multi-frame
+first-window anchor.
+
+**Verification status.** Validated *in simulation* against the logged numbers:
+the depth-scale fix collapses the floor span from ~13 cm to ≤±1.5 cm; the warm-up
+anchor cuts landmark ghosting ~1.41 m → ~0.045 m and locks the scale to the true
+`~0.60` instead of the `0.70` outlier (`drift_sim.py`, `anchor_sim.py`,
+`statemachine_test.py`). **Not yet confirmed on hardware.** To confirm on a live
+run, watch the new server logs: `[Scale Warmup]/[Scale Lock]` should settle on a
+scale close to the steady-state floor scale (not an early outlier), `[Depth Scale]`
+Δ% should be small, and the viewer should show a single ground plane with no
+wall ghosting as the robot drives.
 
 ### Cloud delivery: content-versioned block sync + Draco
 
