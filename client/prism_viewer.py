@@ -49,6 +49,7 @@ sys.path.insert(0, os.path.join(_ROOT, "robot", "docker"))
 import vat_protocol as proto  # noqa: E402
 from vat_protocol import (  # noqa: E402
     quat_identity, quat_normalize, quat_mul, quat_slerp, integrate_pose)
+from vat_telemetry import ThroughputMeter  # noqa: E402
 import zenoh  # noqa: E402
 from kinematics import RobotStateTracker, LowStateTracker, LEG_ORDER  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))         # client/ (block_sync)
@@ -236,9 +237,17 @@ class PRISMViewer:
         # throughput: pose recv bytes (cloud bytes come from BlockSync stats)
         self._pose_bytes = 0
         self._status = {}                # latest server-published metrics (JSON)
-        self._m_prev_t = time.monotonic()
-        self._m_prev_pose = 0
-        self._m_pose_bps = 0.0
+        self._status_recv_ns = 0
+        # per-path throughput meters + receive-time/timestamp captures for latency
+        self._tp_cloud = ThroughputMeter()
+        self._tp_pose = ThroughputMeter()
+        self._tp_traj = ThroughputMeter()
+        self._tp_status = ThroughputMeter()
+        self._pose_recv_ns = 0
+        self._pose_ts_ns = 0
+        self._render_fps = 0.0
+        self._render_stalls = 0
+        self._last_metrics_t = 0.0
 
         log.info(f"[Viewer] Connecting to Zenoh at {ZENOH_ROUTER}...")
         self._z = self._open(self._conf())
@@ -277,8 +286,10 @@ class PRISMViewer:
 
     # ── zenoh callbacks (small payloads) ────────────────────────────────────
     def _on_traj(self, sample):
+        buf = bytes(sample.payload)
+        self._tp_traj.add(len(buf))
         try:
-            pts = proto.unpack_trajectory(bytes(sample.payload))
+            pts = proto.unpack_trajectory(buf)
         except proto.ProtocolError:
             return
         if pts.shape[0] >= 2:
@@ -288,14 +299,21 @@ class PRISMViewer:
     def _on_pose(self, sample):
         buf = bytes(sample.payload)
         self._pose_bytes += len(buf)
+        self._tp_pose.add(len(buf))
         try:
-            self._predictor.on_pose(proto.unpack_pose(buf))
+            pose = proto.unpack_pose(buf)
         except proto.ProtocolError:
-            pass
+            return
+        self._pose_recv_ns = time.time_ns()
+        self._pose_ts_ns = int(pose.timestamp_ns)
+        self._predictor.on_pose(pose)
 
     def _on_status(self, sample):
+        buf = bytes(sample.payload)
+        self._tp_status.add(len(buf))
         try:
-            self._status = json.loads(bytes(sample.payload).decode())
+            self._status = json.loads(buf.decode())
+            self._status_recv_ns = time.time_ns()
         except Exception:
             pass
 
@@ -314,6 +332,8 @@ class PRISMViewer:
                                    bgcolor="#0d0d10", size=(1280, 800), show=True)
         view = canvas.central_widget.add_view()
         view.camera = scene.cameras.TurntableCamera(up="+z", fov=45, distance=8.0)
+        view.camera.interactive = True       # ensure mouse orbit/zoom is enabled
+        self._canvas = canvas
 
         self._cloud_vis = scene.visuals.Markers(parent=view.scene)
         self._cloud_vis.set_gl_state(depth_test=True)
@@ -336,9 +356,49 @@ class PRISMViewer:
         # pushed well below the OS title bar so it isn't occluded
         self._hud.transform = scene.transforms.STTransform(translate=(12, 40))
 
+        # ── separate TELEMETRY window (latency / throughput / drops / pose) ──
+        self._mcanvas = scene.SceneCanvas(title="VAT — Telemetry", bgcolor="#0c0e12",
+                                          size=(430, 560), show=True)
+        self._mtext = scene.visuals.Text(
+            "waiting for data…", color=(0.75, 0.95, 0.85, 1.0), bold=False,
+            font_size=8, anchor_x="left", anchor_y="top", parent=self._mcanvas.scene)
+        self._mtext.transform = scene.transforms.STTransform(translate=(12, 16))
+
+        def _camera_key(ev):
+            """Keyboard orbit/tilt/pan/zoom (works regardless of mouse modifiers).
+            Returns True if the key was a camera control."""
+            cam = self._view.camera
+            name = getattr(ev.key, "name", "") or ""
+            if name == "Left":    cam.azimuth -= 5
+            elif name == "Right": cam.azimuth += 5
+            elif name == "Up":    cam.elevation = float(np.clip(cam.elevation + 5, -89, 89))
+            elif name == "Down":  cam.elevation = float(np.clip(cam.elevation - 5, -89, 89))
+            else:
+                return False
+            return True
+
+        def _pan_key(k):
+            cam = self._view.camera
+            step = 0.08 * float(getattr(cam, "scale_factor", cam.distance or 8.0))
+            c = np.array(cam.center, dtype=float)
+            if   k == "a": c[0] -= step
+            elif k == "d": c[0] += step
+            elif k == "w": c[1] += step
+            elif k == "s": c[1] -= step
+            elif k == "q": c[2] += step
+            elif k == "e": c[2] -= step
+            else:
+                return False
+            cam.center = tuple(c)
+            return True
+
         @canvas.events.key_press.connect
         def _on_key(ev):
+            if _camera_key(ev):                     # arrow keys → orbit/tilt
+                return
             k = (ev.text or "").lower()
+            if _pan_key(k):                          # w/a/s/d/q/e → pan
+                return
             if k == "1":
                 self._blocksync.force_resync()      # drop local cubes → full refetch
             elif k == "r":
@@ -373,6 +433,10 @@ class PRISMViewer:
             pass
         finally:
             try:
+                self._mcanvas.close()
+            except Exception:
+                pass
+            try:
                 self._z.close(); self._z_fast.close()
             except Exception:
                 pass
@@ -380,9 +444,9 @@ class PRISMViewer:
 
     @staticmethod
     def _print_controls():
-        log.info("[Viewer] cloud STREAMS automatically. keys:  1 force re-fetch | "
-                 "R reset map | F refit | , / .  yaw ∓5 | / yaw 0 | N / M  point size ∓ | "
-                 "C ceiling on/off | [ / ]  ceiling ∓  (mouse: drag rotate, scroll zoom)")
+        log.info("[Viewer] keys:  ←/→ orbit · ↑/↓ tilt · W/A/S/D/Q/E pan · scroll/F zoom-fit | "
+                 "1 re-fetch | R reset | , / . yaw | N/M point size | C ceiling | [ / ] ceiling∓  "
+                 "(mouse: drag orbit, shift+drag pan, scroll zoom)  +  Telemetry window")
 
     def _set_yaw(self, deg):
         self._yaw_offset_deg = float(deg)
@@ -426,6 +490,12 @@ class PRISMViewer:
         now = time.monotonic()
         dt = now - self._last_tick
         self._last_tick = now
+        # render FPS (EMA) + stall counter (a tick much slower than the target rate)
+        if dt > 1e-6:
+            inst = 1.0 / dt
+            self._render_fps = inst if self._render_fps == 0 else 0.9 * self._render_fps + 0.1 * inst
+            if dt > 3.0 / max(RENDER_HZ, 1.0):
+                self._render_stalls += 1
 
         # cloud: BlockSync hands us the merged map only when a cube changed. Keep the
         # raw snapshot so the ceiling clip can be re-applied instantly on a keypress,
@@ -434,6 +504,7 @@ class PRISMViewer:
         if m is not None:
             self._cloud_xyz_raw, self._cloud_rgb_raw = m
             self._render_cloud()
+            self._tp_cloud.add(int(getattr(self._blocksync, "last_bundle_bytes", 0)))
 
         # trajectory
         with self._traj_lock:
@@ -453,6 +524,7 @@ class PRISMViewer:
             body_col = COL_CORRECTED if fix == proto.FIX_CORRECTED else COL_DEADRECKON
             rpts, rcols = robot_segments(R, pos, body_col)
             self._robot_vis.set_data(pos=rpts, color=rcols)
+            self._last_pos = np.asarray(pos, float)
 
             leg_data, legs_valid = self._leg_tracker.get()
             if legs_valid and leg_data:
@@ -464,6 +536,68 @@ class PRISMViewer:
                 self._legs_warned = True
 
         self._update_hud()
+        if now - self._last_metrics_t >= 0.25:      # ~4 Hz dashboard refresh
+            self._last_metrics_t = now
+            self._update_metrics()
+
+    def _update_metrics(self):
+        """Render the separate telemetry window: per-path latency + throughput +
+        drops + pose + render health. Latencies use the server-published robot clock
+        offset (server/client are NTP-synced); they are RELATIVE to the link baseline
+        (the robot clock isn't absolutely synced — see docs)."""
+        for m in (self._tp_cloud, self._tp_pose, self._tp_traj, self._tp_status):
+            m.decay()
+        s = self._status or {}
+        off_ns = float(s.get("robot_offset_ms", 0.0)) * 1e6
+        now_ns = time.time_ns()
+
+        def ms(v):
+            return f"{v:6.0f} ms" if v == v else "    -- ms"
+
+        # latencies (relative / above-baseline)
+        r2s = float(s.get("robot_to_server_ms", float("nan")))
+        s2c = ((self._status_recv_ns - s["server_send_ns"]) * 1e-6
+               if s.get("server_send_ns") else float("nan"))
+        r2c = ((self._pose_recv_ns - (self._pose_ts_ns + off_ns)) * 1e-6
+               if self._pose_ts_ns else float("nan"))
+        cap2disp = ((now_ns - (s["newest_frame_robot_ns"] + off_ns)) * 1e-6
+                    if s.get("newest_frame_robot_ns") else float("nan"))
+
+        tel = self._predictor.telemetry()
+        pose_age, pose_rate, _e2e, fix = tel if tel else (float("nan"),) * 4
+        fixs = "VGGT-fix" if fix == proto.FIX_CORRECTED else "dead-reckon"
+        pos = getattr(self, "_last_pos", np.zeros(3))
+        leg_data, legs_valid = self._leg_tracker.get()
+        nfeet = len(leg_data) if (legs_valid and leg_data) else 0
+
+        lines = [
+            "── VAT TELEMETRY ───────────────────────────",
+            "LATENCY (relative, above link baseline)",
+            f"  robot → server     {ms(r2s)}",
+            f"  server → client    {ms(s2c)}",
+            f"  robot → client(pose){ms(r2c)}",
+            f"  capture → display  {ms(cap2disp)}",
+            f"  robot clock offset {off_ns*1e-6:+.0f} ms",
+            "",
+            "THROUGHPUT",
+            f"  robot → server     {float(s.get('robot_kbps',0)):6.0f} KB/s  {float(s.get('robot_fps',0)):4.1f} fps",
+            f"  cloud  → client    {self._tp_cloud.kbps:6.0f} KB/s  {self._tp_cloud.mps:4.1f}/s",
+            f"  pose   → client    {self._tp_pose.kbps:6.1f} KB/s  {self._tp_pose.mps:4.0f}/s",
+            f"  traj/status        {self._tp_traj.kbps:5.1f}/{self._tp_status.kbps:.1f} KB/s",
+            "",
+            "POSE / ODOMETRY",
+            f"  state              {fixs}",
+            f"  position   {pos[0]:+.2f} {pos[1]:+.2f} {pos[2]:+.2f} m",
+            f"  pose age/rate      {pose_age*1e3:5.0f} ms / {pose_rate:4.1f} Hz",
+            f"  legs (feet w/ FK)  {nfeet}/4",
+            "",
+            "DROPS / RENDER",
+            f"  seq gaps (frames)  {int(s.get('seq_gaps',0))}",
+            f"  cubes +chg/-rm     +{int(s.get('cubes_changed',0))}/-{int(s.get('cubes_removed',0))}",
+            f"  map points         {int(s.get('n_points',0))}",
+            f"  render             {self._render_fps:4.0f} fps  stalls {self._render_stalls}",
+        ]
+        self._mtext.text = "\n".join(lines)
 
     def _update_hud(self):
         # recompute pose receive throughput every ~0.5 s (cumulative byte deltas)
