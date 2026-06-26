@@ -776,6 +776,36 @@ The `BlockColorCache` remains only for the versioned delta API. This makes the
 live map a 1:1 match for gradio's geometry. (Residual *thickness from genuine pose
 drift over distance* is separate and still awaits loop closure — Phase 2.)
 
+### Bandwidth & latency tuning
+
+The streamed cloud is small — at 3 cm voxels with a ceiling clip a room is roughly
+20–60 k points ≈ 50–150 KB per submap every ~2–3 s (**< 1 Mbps**). **Zenoh is not
+the bottleneck** at this scale (it fragments payloads natively); a second transport
+(QUIC/WebRTC/raw TCP) would add a parallel connection and NAT/VPN traversal for no
+real gain. Reach for one only if you later stream dense Gaussian splats at video
+rate. The knobs (all in `vat.env`):
+
+- **`VOXEL_SIZE=0.03`** — 3 cm voxels, ~half the points of 2 cm.
+- **`CEILING_Z`** — drop points above this world-Z (toy-box top-down view + BW).
+  Empty = OFF (whole cloud, no slicing). Live-settable over Zenoh:
+  `zenoh put --key 'server/prism/config/ceiling_z' --payload 2.2` (send `off` to
+  disable). The clip is applied to both the stream and the on-demand snapshot.
+- **`DRACO_QUANT_BITS=10`** (≈1–2 cm over a room, fine for 3 cm voxels) and
+  **`DRACO_LEVEL=10`** (max ratio) — ~30–40 % smaller than the old 12-bit/level-7.
+- **`WINDOW_SIZE=12 OVERLAP=4`** — lower per-submap latency, more frequent clouds
+  (slightly less per-window context for PanoVGGT).
+
+> **On the block-diff degenerating to a full transfer.** The content-versioned
+> diff (below) only saves bandwidth when <~30 % of cubes change between submaps. In
+> online mapping the global mesh re-extracts every submap and marching-cubes
+> vertices shift sub-voxel, so most CRCs flip → it ships nearly the whole cloud each
+> time anyway, plus manifest/CRC/diff/request-reply overhead. It still self-heals on
+> reset and costs only one query/reply per submap, so with the payload now small
+> (above) it's kept as-is. If profiling shows the diff itself (not the payload) is
+> the stutter, replace it with a single Draco full-cloud **push** (pub/sub, client
+> replaces wholesale) — simpler and immune to the churn; the protocol hook
+> (`get_current_cloud`) is already in place.
+
 ### Cloud delivery: content-versioned block sync + Draco
 
 The cloud is delivered as a **diff over a spatial block grid** — the design that

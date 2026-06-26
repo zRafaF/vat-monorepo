@@ -59,6 +59,7 @@ class MappingServer:
         self._last_submap_t = 0.0
         self._cloud_mbps = 0.0
         self._mask = build_mask()
+        self._ceiling_z = cfg.CEILING_Z      # None = send whole cloud (no slicing)
         self._corr_gate = PoseCorrectionGate(
             cfg.CORRECTION_MAX_SPEED, cfg.CORRECTION_JUMP_MARGIN,
             cfg.CORRECTION_DEADBAND_M, cfg.CORRECTION_DEADBAND_DEG)
@@ -94,6 +95,10 @@ class MappingServer:
         self._z.declare_subscriber(_KEYS["camera_frame"], self._on_camera_frame)
         self._z.declare_queryable(_KEYS["pcd_snapshot"], self._on_snapshot_query)
         self._z.declare_subscriber(cfg.RESET_KEY, self._on_reset)
+        self._z.declare_subscriber(cfg.CEILING_KEY, self._on_ceiling)
+        log.info(f"[Server] ceiling clip: "
+                 f"{'OFF (whole cloud)' if self._ceiling_z is None else f'Z<={self._ceiling_z:.2f}m'}"
+                 f"  (set live on '{cfg.CEILING_KEY}')")
 
         threading.Thread(target=self._batch_loop, daemon=True).start()
         log.info(f"[Server] frames←'{_KEYS['camera_frame']}'  "
@@ -164,6 +169,7 @@ class MappingServer:
             if self._prism is None:
                 query.reply(query.key_expr, b""); return
             xyz, rgb, version = self._prism.current_cloud()
+            xyz, rgb = self._clip_ceiling(xyz, rgb)
             if xyz.shape[0] == 0:
                 query.reply(query.key_expr, b""); return
             query.reply(query.key_expr, proto.pack_pcd(version, xyz, rgb, is_snapshot=True))
@@ -174,6 +180,25 @@ class MappingServer:
     def _on_reset(self, sample):
         log.info("[Server] reset command received.")
         self._reset_requested = True
+
+    def _on_ceiling(self, sample):
+        """Live ceiling-height config from the client. Empty/'off'/'none'/non-finite
+        disables clipping (whole cloud sent)."""
+        try:
+            raw = bytes(sample.payload).decode("utf-8", "ignore")
+        except Exception:
+            return
+        self._ceiling_z = cfg._parse_ceiling(raw)
+        log.info(f"[Server] ceiling clip → "
+                 f"{'OFF (whole cloud)' if self._ceiling_z is None else f'Z<={self._ceiling_z:.2f}m'}"
+                 f" (from '{raw.strip()}')")
+
+    def _clip_ceiling(self, xyz, rgb):
+        """Drop points above the ceiling height (world Z-up). No-op if disabled."""
+        if self._ceiling_z is None or xyz.shape[0] == 0:
+            return xyz, rgb
+        keep = xyz[:, 2] <= self._ceiling_z
+        return xyz[keep], rgb[keep]
 
     def _do_reset(self):
         self._reset_requested = False
@@ -262,7 +287,8 @@ class MappingServer:
             for r in self._prism.process_new():
                 t_iter = time.time()
                 version = r.version
-                xyz, rgb = r.points, r.colors
+                n_full = int(r.points.shape[0])
+                xyz, rgb = self._clip_ceiling(r.points, r.colors)
                 if xyz.shape[0] == 0:
                     continue
                 # Diff-based block sync from the CURRENT surface → cubes that no
@@ -288,15 +314,20 @@ class MappingServer:
                 if r.trajectory is not None and len(r.trajectory) > 0:
                     span = r.trajectory.max(axis=0) - r.trajectory.min(axis=0)
                     extent = f"{span[0]:.1f}x{span[1]:.1f}x{span[2]:.1f}m"
+                clipped = n_full - last_pts
                 self._publish_status("processing", {
                     "map_version": int(version), "n_points": last_pts,
+                    "n_points_full": n_full, "ceiling_clipped": clipped,
+                    "ceiling_z": self._ceiling_z,
                     "cubes": n_cubes, "cubes_changed": n_changed, "cubes_removed": n_removed,
                     "manifest_kb": round(man_bytes / 1024, 1), "submap": n_sub,
                     "submap_s": round(time.time() - t_iter, 2),
                     "cloud_mbps": round(self._cloud_mbps, 3),
                     "frames_buffered": total, "trigger": trigger,
                     "seq_gaps": self._gap_count})
-                log.info(f"[Server] ✓ submap v{version}: surface {last_pts} pts | "
+                clip_note = (f" (clipped {clipped} above {self._ceiling_z:.2f}m)"
+                             if self._ceiling_z is not None else "")
+                log.info(f"[Server] ✓ submap v{version}: surface {last_pts} pts{clip_note} | "
                          f"cubes {n_cubes} (+{n_changed}/-{n_removed}) | traj {extent} | "
                          f"corr={self._corr_gate.last_reason}")
             if n_sub == 0:

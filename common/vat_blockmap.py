@@ -35,6 +35,7 @@ encode/decode (guarded import) — manifests/requests work without it.
 
 from __future__ import annotations
 
+import os
 import struct
 import zlib
 from typing import Dict, List, Tuple
@@ -53,8 +54,12 @@ MAGIC_REQUEST  = 0x42524551   # "BREQ"
 MAGIC_BUNDLE   = 0x42424E44   # "BBND"
 
 DEFAULT_CUBE_M   = 1.0
-DRACO_QUANT_BITS = 12         # ~1 mm over a room; 11 ≈ 2 mm and ~10% smaller
-DRACO_LEVEL      = 7
+# Position quantisation for the Draco blob. Points are voxel-grid-aligned, so only
+# sub-voxel accuracy is needed: 10 bits over a ~10-20 m room ≈ 1-2 cm, plenty for a
+# 3 cm voxel map and ~30-40% smaller than the old 12-bit (~1 mm) setting. Level 10
+# is Draco's max ratio (decode still ~ms). Both env-tunable without code changes.
+DRACO_QUANT_BITS = int(os.environ.get("DRACO_QUANT_BITS", "10"))
+DRACO_LEVEL      = int(os.environ.get("DRACO_LEVEL", "10"))
 _HASH_QUANT      = 1000.0     # positions hashed at 1 mm so the CRC is stable
 _KEY_OFF         = 1 << 20    # ±~1e6 cubes per axis fits 21 bits each in an int64
 

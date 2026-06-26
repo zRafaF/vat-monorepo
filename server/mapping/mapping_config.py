@@ -32,12 +32,31 @@ RESET_KEY = f"{SERVER_PREFIX}/cmd/reset"
 # ── PRISM engine ─────────────────────────────────────────────────────────────
 WEIGHTS_PATH = os.environ.get(
     "WEIGHTS_PATH", os.path.join(_HERE, "PRISM-VGGT/checkpoints/model.pt"))
-VOXEL_SIZE  = float(os.environ.get("VOXEL_SIZE", "0.02"))
+VOXEL_SIZE  = float(os.environ.get("VOXEL_SIZE", "0.03"))
 MAX_DEPTH   = float(os.environ.get("MAX_DEPTH",  "4.5"))
 FACE_SIZE   = int(os.environ.get("FACE_SIZE",    "512"))
-WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE",  "16"))
+WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE",  "12"))
 OVERLAP     = int(os.environ.get("OVERLAP",      "4"))
 PROCESSING_MODE = os.environ.get("PROCESSING_MODE", "parallel").strip().lower()
+
+
+def _parse_ceiling(raw: str):
+    """Ceiling height (world Z, m): points above it are dropped before sending.
+    Empty / 'off' / 'none' / non-finite ⇒ disabled (whole cloud sent)."""
+    s = (raw or "").strip().lower()
+    if s in ("", "off", "none", "disable", "disabled", "inf", "+inf"):
+        return None
+    try:
+        v = float(s)
+        return v if v == v and abs(v) != float("inf") else None
+    except ValueError:
+        return None
+
+
+# Ceiling-plane clip (toy-box view + bandwidth). Live-settable over Zenoh on
+# CEILING_KEY; startup default from CEILING_Z. None = send the whole cloud.
+CEILING_KEY = f"{SERVER_PREFIX}/config/ceiling_z"
+CEILING_Z = _parse_ceiling(os.environ.get("CEILING_Z", ""))
 
 # ── Cloud delivery ───────────────────────────────────────────────────────────
 # Cap points in the STREAMED snapshot (0 = no cap); full-res still via the query.
