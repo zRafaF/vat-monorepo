@@ -211,3 +211,45 @@ Decay/sliding-window bound the *map* error; neither fixes **trajectory drift** (
 elsewhere after minutes). VGGT runs open-loop with no loop closure, so pose error
 integrates without bound — closing the loop needs a pose-graph / place-recognition backend,
 which is a separate project, not a flag.
+
+---
+
+# Round 5 — make reset/sliding-window the main path (world anchor)
+
+Reset mode (`PRISM_RESET_EACH_BATCH=1`) gave clearly better geometry, but each fresh
+reconstruction came out in its OWN arbitrary frame → the cloud rotated/jumped, the robot
+floated until the next pose, and the cube diff churned massively (`+177/-167`) because the
+whole map re-landed in different cubes. Both symptoms are one root cause: no consistent
+world frame across reconstructions.
+
+**Fix — persistent rigid world anchor.** Each fresh reset reconstruction is now re-anchored
+into ONE world frame before streaming: we match the frames it shares with the previous batch
+(by capture timestamp), best-fit a RIGID SE3 (`rigid_anchor_from_poses`, averages
+`W·inv(P)` over the shared cameras + orthonormalises), and apply it to the cloud, trajectory,
+and pose correction. Result:
+
+- the cloud/robot stop rotating & jumping (consistent frame, robot stays attached);
+- static geometry lands in the same cubes/occupancy → the occupancy-CRC delta collapses to
+  the frontier (no more full resend) → the incremental renderer only touches changed cubes;
+- geometry stays clean (still a fresh reconstruction — no TSDF accumulation), while the only
+  thing that drifts is the rigid anchor (slow, bounded by the overlap), not the geometry.
+
+Anchor math is unit-tested (recovers a known SE3 to 1e-15; stays orthonormal under noise).
+Flag: `RESET_WORLD_ANCHOR` (default on with reset).
+
+## Suggested settings for the reset path
+```
+PRISM_RESET_EACH_BATCH=1 RESET_WORLD_ANCHOR=1 RESET_WINDOW_FRAMES=60 make mapping
+```
+- If residual per-batch shimmer remains, raise `CRC_QUANT_M` (coarser occupancy → absorbs
+  small recon variation → even smaller delta) or lower `RESET_WINDOW_FRAMES` (cheaper rebuild).
+- `TSDF_DECAY` is irrelevant in reset mode (nothing accumulates); leave it off there.
+
+## Remaining ideas (not yet done)
+- **Distance-based window** (`RESET_WINDOW` by metres travelled, not frame count) so the
+  window covers a consistent spatial extent regardless of speed.
+- **Anchor smoothing**: low-pass the per-batch SE3 to remove micro-jitter.
+- **Hybrid**: persistent coarse global map for context + fresh local window overlaid — keeps
+  a full map while the local region stays crisp. Bigger project.
+- **Drift/loop closure** is still the hard limit (VGGT is open-loop); the anchor bounds frame
+  jumpiness but a pose-graph backend is needed for true global consistency.

@@ -93,6 +93,11 @@ DECAY_EVERY_N = int(os.environ.get("DECAY_EVERY_N", "1"))
 # reprocesses the window each batch and keeps NO global map. 0 = off (online accum).
 PRISM_RESET_EACH_BATCH = os.environ.get("PRISM_RESET_EACH_BATCH", "0") == "1"
 RESET_WINDOW_FRAMES = int(os.environ.get("RESET_WINDOW_FRAMES", "60"))
+# Re-anchor each fresh reset reconstruction into ONE persistent world frame (rigid
+# SE3, from frames shared with the previous batch). Stops the cloud/robot rotating &
+# jumping between batches and collapses the delta to the frontier. 1 = on (recommended
+# whenever PRISM_RESET_EACH_BATCH=1).
+RESET_WORLD_ANCHOR = os.environ.get("RESET_WORLD_ANCHOR", "1") == "1"
 # Cap the camera trajectory streamed to the viewer to the last N poses (the full
 # trajectory grows without bound and is re-sent each submap). 0 = send all.
 TRAJ_MAX_POSES = int(os.environ.get("TRAJ_MAX_POSES", "300"))
