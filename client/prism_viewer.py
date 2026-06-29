@@ -55,6 +55,7 @@ import zenoh  # noqa: E402
 from kinematics import RobotStateTracker, LowStateTracker, LEG_ORDER  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))         # client/ (block_sync)
 from block_sync import BlockSync  # noqa: E402
+from vat_cloudbuffer import IncrementalCloud  # noqa: E402
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -300,16 +301,24 @@ class PRISMViewer:
         # bulk session: DIFF-BASED block sync (manifest + Draco bundles, only the
         # cubes that changed) + trajectory + server status.
         self._blocksync = BlockSync(self._z, cube_m=CUBE_SIZE, server_prefix=SERVER_PREFIX)
-        self._z.declare_subscriber(_KEYS["trajectory"], self._on_traj)
-        self._z.declare_subscriber(_KEYS["status"], self._on_status)
         self._pub_reset = self._z.declare_publisher(RESET_KEY)
         self._pub_ceiling = self._z.declare_publisher(CEILING_KEY)
+        # CONTROL lane (fast session): the small, latency-critical messages —
+        # trajectory + server status — must NOT queue behind the bulk geometry
+        # transfer, or the pose-line/HUD lag seconds behind the "green fix" flash.
+        self._z_fast.declare_subscriber(_KEYS["trajectory"], self._on_traj)
+        self._z_fast.declare_subscriber(_KEYS["status"], self._on_status)
         # low-latency session: authoritative pose + leg FK + body height
         self._z_fast.declare_subscriber(_KEYS["pose"], self._on_pose)
         self._body_tracker = RobotStateTracker(self._z_fast, ROBOT_NAME)
         self._leg_tracker = LowStateTracker(self._z_fast, ROBOT_NAME)
-        log.info(f"[Viewer] subscribed: [bulk] block-sync + trajectory | [fast] pose, "
-                 f"legs←'{ROBOT_NAME}/rt/lowstate'")
+        # Incremental render buffer: update only the cubes that changed each submap
+        # instead of re-merging + re-uploading the whole cloud (the render "stalls").
+        # VIEWER_INCREMENTAL=0 forces the simple whole-cloud merge path.
+        self._incremental = os.environ.get("VIEWER_INCREMENTAL", "1") == "1"
+        self._cloudbuf = IncrementalCloud()
+        log.info(f"[Viewer] subscribed: [bulk] block-sync(push+manifest) | "
+                 f"[fast] pose + trajectory + status  (incremental={self._incremental})")
 
     @staticmethod
     def _conf():
@@ -572,16 +581,7 @@ class PRISMViewer:
         # cloud: BlockSync hands us the merged map only when a cube changed. Keep the
         # raw snapshot so the ceiling clip can be re-applied instantly on a keypress,
         # and render through one path (which guards against any xyz/rgb mismatch).
-        m = self._blocksync.take_merged()
-        if m is not None:
-            self._cloud_xyz_raw, self._cloud_rgb_raw = m
-            try:
-                self._render_cloud()
-            except Exception as e:
-                if not getattr(self, "_cloud_warned", False):
-                    log.warning(f"[Viewer] cloud render error (suppressed): {e}")
-                    self._cloud_warned = True
-            self._tp_cloud.add(int(getattr(self._blocksync, "last_bundle_bytes", 0)))
+        self._update_cloud()
 
         # trajectory
         with self._traj_lock:
@@ -628,6 +628,38 @@ class PRISMViewer:
                 if not getattr(self, "_metrics_warned", False):
                     log.warning(f"[Viewer] metrics update error (suppressed): {e}")
                     self._metrics_warned = True
+
+    def _update_cloud(self):
+        """Refresh the render buffer from BlockSync. Incremental by default (apply
+        only the cubes that changed this submap); falls back to the whole-cloud merge
+        on any error or when VIEWER_INCREMENTAL=0. Both paths leave the raw cloud in
+        _cloud_xyz_raw/_rgb_raw so the ceiling clip can re-render instantly on a key."""
+        if self._incremental:
+            try:
+                d = self._blocksync.take_delta()
+                if d is not None:
+                    changed, removed, resync = d
+                    self._cloudbuf.apply(changed, removed, resync)
+                    self._cloud_xyz_raw, self._cloud_rgb_raw = self._cloudbuf.live()
+                    self._render_cloud()
+                    self._tp_cloud.add(int(getattr(self._blocksync, "last_push_bytes", 0))
+                                       + int(getattr(self._blocksync, "last_bundle_bytes", 0)))
+                return
+            except Exception as e:
+                if not getattr(self, "_inc_warned", False):
+                    log.warning(f"[Viewer] incremental cloud failed → merge fallback: {e}")
+                    self._inc_warned = True
+                self._incremental = False
+        m = self._blocksync.take_merged()
+        if m is not None:
+            self._cloud_xyz_raw, self._cloud_rgb_raw = m
+            try:
+                self._render_cloud()
+            except Exception as e:
+                if not getattr(self, "_cloud_warned", False):
+                    log.warning(f"[Viewer] cloud render error (suppressed): {e}")
+                    self._cloud_warned = True
+            self._tp_cloud.add(int(getattr(self._blocksync, "last_bundle_bytes", 0)))
 
     def _update_metrics(self):
         """Render the separate telemetry window: per-path latency + throughput +

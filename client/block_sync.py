@@ -1,18 +1,19 @@
 """
 VAT — Block Sync  (client side of the diff-based cloud sync)
 ============================================================
-Keeps a local cube store in lock-step with the server's map using the manifest /
-request / Draco-bundle protocol in :mod:`vat_blockmap`:
+Keeps a local cube store in lock-step with the server's map. Two paths:
 
-  1. subscribe to ``{server}/pcd/manifest`` — the server's current ``{key: crc}``;
-  2. a background thread diffs it against the local store → the cube-keys we lack
-     or whose CRC changed (and the keys to drop);
-  3. it requests the missing cubes in ONE Zenoh query (keys as the query payload)
-     to ``{server}/pcd/blocks`` and applies the Draco bundle reply, replacing those
-     cubes wholesale;
-  4. :meth:`take_merged` hands the viewer the whole cloud when it changed.
+  * PUSH (fast, steady state): subscribe ``{server}/pcd/push`` — the server proactively
+    sends the cubes that changed + the keys removed, as one Draco frame. Applied the
+    instant it arrives: no request, no round-trip. This is the low-latency path.
+  * MANIFEST (repair + bootstrap): subscribe ``{server}/pcd/manifest`` — the server's
+    current ``{key: crc}``. A background thread diffs it against the local store and
+    pulls (ONE Zenoh query to ``{server}/pcd/blocks``) any cubes a push missed/dropped
+    or that a freshly-connected client never received, and drops vanished cubes.
 
-Runs entirely off the render thread; the viewer just polls ``take_merged()``.
+:meth:`take_merged` hands the viewer the whole cloud when it changed (simple path);
+:meth:`take_delta` hands only the cubes touched since last call (incremental render).
+Both run off the render thread; the viewer just polls.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ class BlockSync:
         k = proto.keys(server_prefix=server_prefix)
         self._k_manifest = k["pcd_manifest"]
         self._k_blocks = k["pcd_blocks"]
+        self._k_push = k["pcd_push"]
         self._remote = {}
         self._lock = threading.Lock()
         self._evt = threading.Event()
@@ -47,11 +49,30 @@ class BlockSync:
         self.last_bundle_bytes = 0
         self.last_sync_ms = 0.0
         self.bytes_total = 0
+        self.last_push_cubes = 0
+        self.last_push_bytes = 0
+        self.pushes = 0
+        z.declare_subscriber(self._k_push, self._on_push)
         z.declare_subscriber(self._k_manifest, self._on_manifest)
         threading.Thread(target=self._sync_loop, daemon=True).start()
-        log.info(f"[BlockSync] manifest←'{self._k_manifest}'  blocks?'{self._k_blocks}'  "
-                 f"cube={cube_m}m")
+        log.info(f"[BlockSync] push←'{self._k_push}'  manifest←'{self._k_manifest}'  "
+                 f"blocks?'{self._k_blocks}'  cube={cube_m}m")
 
+    # ── fast path: proactive push ────────────────────────────────────────────
+    def _on_push(self, sample):
+        try:
+            buf = bytes(sample.payload)
+            _ver, n_app, n_rem = self._store.apply_push_bytes(buf)
+        except Exception as e:
+            log.debug(f"[BlockSync] bad push: {e}")
+            return
+        self.last_push_cubes = n_app
+        self.last_push_bytes = len(buf)
+        self.bytes_total += len(buf)
+        self.pushes += 1
+        self.cubes = len(self._store.blocks)
+
+    # ── repair path: manifest diff + pull ────────────────────────────────────
     def _on_manifest(self, sample):
         try:
             man = bm.unpack_manifest(bytes(sample.payload))
@@ -73,7 +94,7 @@ class BlockSync:
                 self._store.clear()
             if drop:
                 self._store.drop(drop)
-            if not need:
+            if not need:                                  # push already covered it
                 self.cubes = len(self._store.blocks)
                 continue
             try:
@@ -91,14 +112,22 @@ class BlockSync:
                 self.bytes_total += nbytes
                 self.last_sync_ms = (time.time() - t0) * 1000.0
                 self.cubes = len(self._store.blocks)
-                log.info(f"[BlockSync] synced {applied}/{len(need)} cubes  "
+                log.info(f"[BlockSync] repaired {applied}/{len(need)} cubes  "
                          f"{nbytes/1024:.0f} KB  {self.last_sync_ms:.0f} ms")
             except Exception as e:
                 log.warning(f"[BlockSync] block request failed: {e}")
 
+    # ── render-thread polls ──────────────────────────────────────────────────
     def take_merged(self):
-        """→ (xyz f32, rgb u8) of the whole map if it changed since last call, else None."""
+        """→ (xyz f32, rgb u8) of the whole map if it changed since last call, else None.
+        Note: take_merged() and take_delta() both consume the same dirty flag — the
+        viewer uses ONE of them, not both."""
         return self._store.merged()
+
+    def take_delta(self):
+        """→ (changed dict key→(xyz,rgb), removed set, full_resync bool) or None.
+        Incremental render path (update only touched cubes' GPU slots)."""
+        return self._store.take_delta()
 
     def force_resync(self):
         """Drop local state so the next manifest triggers a full refetch ('1')."""

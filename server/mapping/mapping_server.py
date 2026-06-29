@@ -88,7 +88,8 @@ class MappingServer:
             _KEYS["pose_correction"], congestion_control=zenoh.CongestionControl.DROP)
 
         self._blockpub = BlockPublisher(self._z, cube_m=cfg.CUBE_SIZE,
-                                        server_prefix=cfg.SERVER_PREFIX)
+                                        server_prefix=cfg.SERVER_PREFIX,
+                                        crc_quant_m=cfg.CRC_QUANT_M)
         try:
             self._live = self._z.liveliness().declare_token(_KEYS["live_server"])
         except Exception:
@@ -304,12 +305,13 @@ class MappingServer:
                     continue
                 # Diff-based block sync from the CURRENT surface → cubes that no
                 # longer have points are REMOVED (no accumulation/ghosting).
-                n_changed, n_removed, n_cubes, man_bytes = \
-                    self._blockpub.ingest_and_publish(xyz, rgb)
+                n_changed, n_removed, n_cubes, man_bytes, push_bytes = \
+                    self._blockpub.ingest_and_publish(xyz, rgb, map_version=version)
                 _now = time.time()
                 if self._last_submap_t:
                     dt = max(_now - self._last_submap_t, 1e-3)
-                    self._cloud_mbps = (man_bytes / dt) / 1e6
+                    # bytes actually put on the wire this submap = manifest + push
+                    self._cloud_mbps = ((man_bytes + push_bytes) / dt) / 1e6
                 self._last_submap_t = _now
 
                 if r.trajectory is not None and len(r.trajectory) > 0:
@@ -334,7 +336,8 @@ class MappingServer:
                     "n_points_full": n_full, "ceiling_clipped": clipped,
                     "ceiling_z": self._ceiling_z,
                     "cubes": n_cubes, "cubes_changed": n_changed, "cubes_removed": n_removed,
-                    "manifest_kb": round(man_bytes / 1024, 1), "submap": n_sub,
+                    "manifest_kb": round(man_bytes / 1024, 1),
+                    "push_kb": round(push_bytes / 1024, 1), "submap": n_sub,
                     "submap_s": round(time.time() - t_iter, 2),
                     "cloud_mbps": round(self._cloud_mbps, 3),
                     "frames_buffered": total, "trigger": trigger,

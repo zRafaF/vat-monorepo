@@ -60,6 +60,14 @@ class OnlinePRISMSession:
         self.engine.compute_esdf = False
         self.engine.point_cloud_only = True
         self.engine.processing_mode = cfg.PROCESSING_MODE
+        # Streaming-stability config (online ghost / breathing / bandwidth fixes):
+        #  * voxel-snap → byte-identical unchanged geometry → stable block CRCs;
+        #  * keyframe gating → don't re-integrate a static view (breathing/ghosts);
+        #  * tsdf_decay → optional active carving of stale voxels (off unless enabled).
+        self.engine.cloud_voxel_snap = cfg.CLOUD_VOXEL_SNAP
+        self.engine.keyframe_min_trans_m = cfg.KEYFRAME_MIN_TRANS_M
+        self.engine.keyframe_min_rot_deg = cfg.KEYFRAME_MIN_ROT_DEG
+        self.engine.tsdf_decay = cfg.TSDF_DECAY
         log.info(f"[PRISM] Engine ready ({cfg.summary()}).")
 
         self._frames: dict[int, FrameInput] = {}

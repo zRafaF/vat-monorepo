@@ -62,6 +62,22 @@ CEILING_Z = _parse_ceiling(os.environ.get("CEILING_Z", ""))
 # Cap points in the STREAMED snapshot (0 = no cap); full-res still via the query.
 CLOUD_STREAM_MAX_POINTS = int(os.environ.get("CLOUD_STREAM_MAX_POINTS", "60000"))
 CUBE_SIZE = float(os.environ.get("CUBE_SIZE", "1.0"))
+
+# ── Streaming stability (online ghost / breathing / bandwidth fixes) ─────────
+# Occupancy-CRC grid for block versioning (m). ~½ voxel so sub-voxel nvblox mesh
+# "breathing" doesn't churn the diff (which used to resend ~every cube each submap).
+CRC_QUANT_M = float(os.environ.get("CRC_QUANT_M", str(VOXEL_SIZE * 0.5)))
+# Emit the streamed surface as one point per voxel CENTRE (byte-identical across
+# submaps for unchanged geometry → stable CRCs). 1 = on (recommended online).
+CLOUD_VOXEL_SNAP = os.environ.get("CLOUD_VOXEL_SNAP", "1") == "1"
+# Keyframe gating: only integrate a frame into the TSDF if the camera moved enough
+# since the last integrated frame. Stops re-integrating a static scene (the cause of
+# breathing + ghost thickening + the "+119 cubes while stationary" churn). 0 = off.
+KEYFRAME_MIN_TRANS_M = float(os.environ.get("KEYFRAME_MIN_TRANS_M", "0.05"))
+KEYFRAME_MIN_ROT_DEG = float(os.environ.get("KEYFRAME_MIN_ROT_DEG", "8.0"))
+# nvblox TSDF decay (active carving of stale/unsupported voxels). OFF by default —
+# enable + tune on the rig once the decay API is confirmed for your nvblox build.
+TSDF_DECAY = os.environ.get("TSDF_DECAY", "0") == "1"
 # Cap the camera trajectory streamed to the viewer to the last N poses (the full
 # trajectory grows without bound and is re-sent each submap). 0 = send all.
 TRAJ_MAX_POSES = int(os.environ.get("TRAJ_MAX_POSES", "300"))
@@ -92,4 +108,5 @@ def summary() -> str:
     """One-line config echo for the startup log."""
     return (f"window={WINDOW_SIZE} overlap={OVERLAP} voxel={VOXEL_SIZE} "
             f"face={FACE_SIZE} mode={PROCESSING_MODE} cube={CUBE_SIZE} "
-            f"keyframe_every={PCD_KEYFRAME_EVERY}")
+            f"keyframe_every={PCD_KEYFRAME_EVERY} crc_quant={CRC_QUANT_M:.3f} "
+            f"voxel_snap={CLOUD_VOXEL_SNAP} kf_gate={KEYFRAME_MIN_TRANS_M}m/{KEYFRAME_MIN_ROT_DEG}deg")

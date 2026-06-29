@@ -93,6 +93,8 @@ def keys(robot_name: str = "go2", server_prefix: str = "server/prism") -> dict:
         # with its requested cube-keys as the query payload → Draco bundle reply.
         "pcd_manifest":    f"{server_prefix}/pcd/manifest",
         "pcd_blocks":      f"{server_prefix}/pcd/blocks",
+        # proactive push of changed+removed cubes (pub/sub, low-latency path)
+        "pcd_push":        f"{server_prefix}/pcd/push",
         "trajectory":      f"{server_prefix}/trajectory",
         "status":          f"{server_prefix}/status",
         # server → robot (DOWN)
