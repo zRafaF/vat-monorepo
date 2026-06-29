@@ -133,10 +133,16 @@ class OnlinePRISMSession:
         frames_list, lo, max_seq = self._contiguous_prefix()
         if len(frames_list) < cfg.WINDOW_SIZE:
             return
+        # Experimental: rebuild a fresh map from only the most recent frames each
+        # batch (reset=True), eliminating cross-batch accumulation/drift at the cost
+        # of reprocessing the window and keeping no global map. Default off (online).
+        reset = bool(cfg.PRISM_RESET_EACH_BATCH)
+        if reset and cfg.RESET_WINDOW_FRAMES > 0 and len(frames_list) > cfg.RESET_WINDOW_FRAMES:
+            frames_list = frames_list[-cfg.RESET_WINDOW_FRAMES:]
         try:
             for _mesh, _pcd, traj, _plane in self.engine.process_sequence(
                     frames_list, window_size=cfg.WINDOW_SIZE, overlap=cfg.OVERLAP,
-                    reset=False, finalize=False):
+                    reset=reset, finalize=False):
                 # THE FIX: publish the CURRENT TSDF surface (thin, gradio-style),
                 # not the accumulating BlockColorCache snapshot.
                 cloud = self.engine.get_current_cloud()

@@ -38,6 +38,7 @@ import json
 import time
 import logging
 import argparse
+import glob
 import threading
 from collections import deque
 
@@ -56,6 +57,7 @@ from kinematics import RobotStateTracker, LowStateTracker, LEG_ORDER  # noqa: E4
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))         # client/ (block_sync)
 from block_sync import BlockSync  # noqa: E402
 from vat_cloudbuffer import IncrementalCloud  # noqa: E402
+from urdf_robot import URDFRobot  # noqa: E402
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -83,6 +85,21 @@ CLOUD_MAX_M   = float(os.environ.get("CLOUD_MAX_M", "50.0"))
 PT_SIZE       = float(os.environ.get("PCD_POINT_SIZE", "6.0"))
 PT_SIZE_MAX   = float(os.environ.get("PCD_POINT_SIZE_MAX", "40.0"))
 CUBE_SIZE     = float(os.environ.get("CUBE_SIZE", "1.0"))   # block-sync cube edge (m)
+def _find_urdf() -> str:
+    """Locate the robot URDF for the mesh avatar. Override with GO2_URDF; otherwise
+    auto-detect a .urdf under client/b2w_description (no env var needed)."""
+    env = os.environ.get("GO2_URDF")
+    if env:
+        return env
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "b2w_description")
+    for pat in ("urdf/*.urdf", "*.urdf", "**/*.urdf"):
+        hits = sorted(glob.glob(os.path.join(base, pat), recursive=True))
+        if hits:
+            return hits[0]
+    return ""
+
+
+GO2_URDF = _find_urdf()                          # robot mesh avatar (auto-detected)
 
 _KEYS = proto.keys(ROBOT_NAME, SERVER_PREFIX)
 RESET_KEY = f"{SERVER_PREFIX}/cmd/reset"
@@ -317,6 +334,10 @@ class PRISMViewer:
         # VIEWER_INCREMENTAL=0 forces the simple whole-cloud merge path.
         self._incremental = os.environ.get("VIEWER_INCREMENTAL", "1") == "1"
         self._cloudbuf = IncrementalCloud()
+        # Robot avatar: real URDF mesh if available (toggle 'U'), else skeleton.
+        self._urdf = URDFRobot(GO2_URDF)
+        self._robot_mode = "mesh" if self._urdf.available else "skeleton"
+        self._mesh_throttle_t = 0.0
         log.info(f"[Viewer] subscribed: [bulk] block-sync(push+manifest) | "
                  f"[fast] pose + trajectory + status  (incremental={self._incremental})")
 
@@ -399,6 +420,13 @@ class PRISMViewer:
         self._legs_vis = scene.visuals.Line(parent=view.scene, connect="segments",
                                              width=3.0, antialias=True)
         self._feet_vis = scene.visuals.Markers(parent=view.scene)
+        try:
+            self._robot_mesh_vis = scene.visuals.Mesh(parent=view.scene, shading="smooth")
+            self._robot_mesh_vis.visible = False
+        except Exception as _e:
+            log.warning(f"[Viewer] mesh visual unavailable ({_e}); skeleton only.")
+            self._robot_mesh_vis = None
+            self._robot_mode = "skeleton"
         self._traj_vis = scene.visuals.Line(parent=view.scene, connect="strip",
                                              color=(1.0, 0.78, 0.24, 1.0), width=2.0)
         scene.visuals.Line(pos=ground_grid(), parent=view.scene, connect="segments",
@@ -474,6 +502,12 @@ class PRISMViewer:
                 self._set_yaw(self._yaw_offset_deg + 5)
             elif k == "/":
                 self._set_yaw(0.0)
+            elif k == "u":
+                if self._urdf.available and self._robot_mesh_vis is not None:
+                    self._robot_mode = "skeleton" if self._robot_mode == "mesh" else "mesh"
+                    log.info(f"[Viewer] robot avatar → {self._robot_mode}")
+                else:
+                    log.info("[Viewer] URDF mesh unavailable (need client/b2w_description + uv sync)")
             elif k in ("n", "m"):
                 self._pt_size = float(np.clip(self._pt_size + (2 if k == "m" else -2), 1, PT_SIZE_MAX))
                 log.info(f"[Viewer] point size = {self._pt_size:.0f} (max {PT_SIZE_MAX:.0f})")
@@ -509,7 +543,7 @@ class PRISMViewer:
     @staticmethod
     def _print_controls():
         log.info("[Viewer] keys:  ←/→ orbit · ↑/↓ tilt · W/A/S/D/Q/E pan · scroll/F zoom-fit | "
-                 "1 re-fetch | R reset | , / . yaw | N/M point size | C ceiling | [ / ] ceiling∓  "
+                 "1 re-fetch | R reset | U robot mesh/skeleton | , / . yaw | N/M size | C ceiling | [ / ] ceiling∓  "
                  "(mouse: drag orbit, shift+drag pan, scroll zoom)  +  Telemetry window")
 
     def _set_yaw(self, deg):
@@ -590,27 +624,10 @@ class PRISMViewer:
             t = traj @ _yaw_R(self._yaw_offset_deg).T if self._yaw_offset_deg else traj
             self._traj_vis.set_data(pos=t.astype(np.float32))
 
-        # robot + legs at the predicted pose
+        # robot at the predicted pose — URDF mesh or wireframe skeleton
         pred = self._predictor.step(dt)
         if pred is not None:
-            pos, quat, fix, age = pred
-            R = quat_to_R(quat)
-            if self._yaw_offset_deg:
-                Y = _yaw_R(self._yaw_offset_deg)
-                R, pos = Y @ R, Y @ pos
-            body_col = COL_CORRECTED if fix == proto.FIX_CORRECTED else COL_DEADRECKON
-            rpts, rcols = robot_segments(R, pos, body_col)
-            self._robot_vis.set_data(pos=rpts, color=rcols)
-            self._last_pos = np.asarray(pos, float)
-
-            leg_data, legs_valid = self._leg_tracker.get()
-            if legs_valid and leg_data:
-                lpts, lcols, feet, fcols = leg_segments(leg_data, R, pos)
-                self._legs_vis.set_data(pos=lpts, color=lcols)
-                self._feet_vis.set_data(feet, face_color=fcols, size=10, edge_width=0)
-            elif not self._legs_warned:
-                log.info("[Viewer] (no leg data yet — /lowstate flowing?)")
-                self._legs_warned = True
+            self._draw_robot(pred)
 
         # Overlays must never kill the render tick (a crash here froze the camera
         # and stopped the robot drawing). Isolate them.
@@ -628,6 +645,57 @@ class PRISMViewer:
                 if not getattr(self, "_metrics_warned", False):
                     log.warning(f"[Viewer] metrics update error (suppressed): {e}")
                     self._metrics_warned = True
+
+    def _draw_robot(self, pred):
+        """Draw the robot at the predicted pose. Uses the URDF mesh when in mesh mode
+        and everything lines up; otherwise (or on any failure) the wireframe skeleton.
+        Mesh/skeleton visibility is mutually exclusive so they never double-draw."""
+        pos, quat, fix, age = pred
+        R = quat_to_R(quat)
+        if self._yaw_offset_deg:
+            Y = _yaw_R(self._yaw_offset_deg)
+            R, pos = Y @ R, Y @ pos
+        self._last_pos = np.asarray(pos, float)
+
+        mesh_ok = False
+        if self._robot_mode == "mesh" and self._urdf.available and self._robot_mesh_vis is not None:
+            # throttle the (heavier) mesh rebuild to ~20 Hz
+            now = time.monotonic()
+            if now - self._mesh_throttle_t >= 0.05:
+                self._mesh_throttle_t = now
+                try:
+                    q12, _imu, jvalid = self._leg_tracker.get_joints()
+                    geom = self._urdf.world_geometry(R, pos, q12)
+                    if geom is not None:
+                        v, f = geom
+                        self._robot_mesh_vis.set_data(vertices=v, faces=f,
+                                                      color=(0.62, 0.67, 0.74, 1.0))
+                        mesh_ok = True
+                except Exception as e:
+                    if not getattr(self, "_mesh_warned", False):
+                        log.warning(f"[Viewer] mesh robot failed → skeleton: {e}")
+                        self._mesh_warned = True
+            else:
+                mesh_ok = self._robot_mesh_vis.visible          # keep last frame's choice
+
+        self._robot_mesh_vis.visible = mesh_ok if self._robot_mesh_vis is not None else False
+        self._robot_vis.visible = not mesh_ok
+        self._legs_vis.visible = not mesh_ok
+        self._feet_vis.visible = not mesh_ok
+        if mesh_ok:
+            return
+
+        body_col = COL_CORRECTED if fix == proto.FIX_CORRECTED else COL_DEADRECKON
+        rpts, rcols = robot_segments(R, pos, body_col)
+        self._robot_vis.set_data(pos=rpts, color=rcols)
+        leg_data, legs_valid = self._leg_tracker.get()
+        if legs_valid and leg_data:
+            lpts, lcols, feet, fcols = leg_segments(leg_data, R, pos)
+            self._legs_vis.set_data(pos=lpts, color=lcols)
+            self._feet_vis.set_data(feet, face_color=fcols, size=10, edge_width=0)
+        elif not self._legs_warned:
+            log.info("[Viewer] (no leg data yet — /lowstate flowing?)")
+            self._legs_warned = True
 
     def _update_cloud(self):
         """Refresh the render buffer from BlockSync. Incremental by default (apply

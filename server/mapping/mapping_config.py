@@ -77,7 +77,13 @@ KEYFRAME_MIN_TRANS_M = float(os.environ.get("KEYFRAME_MIN_TRANS_M", "0.05"))
 KEYFRAME_MIN_ROT_DEG = float(os.environ.get("KEYFRAME_MIN_ROT_DEG", "8.0"))
 # nvblox TSDF decay (active carving of stale/unsupported voxels). OFF by default —
 # enable + tune on the rig once the decay API is confirmed for your nvblox build.
-TSDF_DECAY = os.environ.get("TSDF_DECAY", "0") == "1"
+TSDF_DECAY = os.environ.get("TSDF_DECAY", "1") == "1"
+# Experimental: rebuild a FRESH map each batch (engine reset=True) over only the
+# most recent RESET_WINDOW_FRAMES frames, instead of accumulating online. Removes
+# cross-batch accumulation/drift (no ghost build-up, no "walking inside walls") but
+# reprocesses the window each batch and keeps NO global map. 0 = off (online accum).
+PRISM_RESET_EACH_BATCH = os.environ.get("PRISM_RESET_EACH_BATCH", "0") == "1"
+RESET_WINDOW_FRAMES = int(os.environ.get("RESET_WINDOW_FRAMES", "60"))
 # Cap the camera trajectory streamed to the viewer to the last N poses (the full
 # trajectory grows without bound and is re-sent each submap). 0 = send all.
 TRAJ_MAX_POSES = int(os.environ.get("TRAJ_MAX_POSES", "300"))

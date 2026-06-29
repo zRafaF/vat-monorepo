@@ -27,6 +27,11 @@ dependencies = [
     # Bring-up tools (tools/): CDR decode + JPEG decode for the diagnostic viewers
     "rosbags>=0.10",
     "opencv-python>=4.9",
+    # Optional: URDF mesh avatar (GO2_URDF + press 'U'). Guarded imports — the
+    # viewer falls back to the wireframe skeleton if these aren't installed.
+    "yourdfpy>=0.0.56",
+    "trimesh>=4.0",
+    "pycollada>=0.8",   # trimesh loads the .dae meshes via this
 ]
 
 [tool.uv]

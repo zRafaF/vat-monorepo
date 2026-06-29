@@ -541,6 +541,7 @@ class LowStateTracker:
                  lowstate_topic: str = "lowstate"):
         self._lock = threading.Lock()
         self._legs: dict = {}        # leg → {hip,thigh_root,knee,foot}
+        self._q = [0.0] * 12         # raw 12 leg joint angles (LEG_ORDER×[hip,thigh,calf])
         self._valid = False
         self._stamp_ns = 0
         # odometry fields (for the fuser's dead-reckoner)
@@ -591,6 +592,7 @@ class LowStateTracker:
             body_vx = (float(np.mean(wheel_dq)) * WHEEL_RADIUS) if wheel_dq else 0.0
             with self._lock:
                 self._legs = legs
+                self._q = q
                 self._imu_quat = imu_quat
                 self._gyro = gyro
                 self._body_vx = body_vx
@@ -612,6 +614,12 @@ class LowStateTracker:
         with self._lock:
             return (self._imu_quat.copy(), self._gyro.copy(),
                     self._body_vx, self._valid)
+
+    def get_joints(self):
+        """Returns (q12, imu_quat_xyzw, valid): the 12 leg joint angles in
+        LEG_ORDER×[hip,thigh,calf] order + body attitude — for URDF mesh FK."""
+        with self._lock:
+            return list(self._q), self._imu_quat.copy(), self._valid
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -81,15 +81,12 @@ class BlockPublisher:
             # state that produced this manifest (so manifest and push never disagree).
             do_push = 0 < len(changed) <= PUSH_MAX_CUBES
             push_blocks = self._grid.collect(changed) if do_push else None
-        buf = bm.pack_manifest(man)
-        try:
-            self._pub.put(buf)
-        except Exception:
-            log.error(f"[BlockPub] manifest publish failed:\n{traceback.format_exc()}")
-        self.last_manifest_bytes = len(buf)
-
+        # PUSH FIRST, manifest second. The client applies a push synchronously in
+        # its subscriber callback; if the manifest arrived first its repair loop would
+        # diff-and-pull the changed cubes before the push lands (the "repaired N/N
+        # cubes" latency spikes). Publishing the push first lets it win the race so the
+        # manifest diff then finds nothing to pull.
         self.last_push_bytes = 0
-        # Push when there's a bounded change OR only removals (cube_emptied cleanup).
         if do_push or (not changed and removed):
             try:
                 pbuf = bm.pack_block_push(
@@ -102,6 +99,13 @@ class BlockPublisher:
         elif len(changed) > PUSH_MAX_CUBES:
             log.info(f"[BlockPub] {len(changed)} cubes changed > cap {PUSH_MAX_CUBES}: "
                      f"manifest-only (client pulls)")
+
+        buf = bm.pack_manifest(man)
+        try:
+            self._pub.put(buf)
+        except Exception:
+            log.error(f"[BlockPub] manifest publish failed:\n{traceback.format_exc()}")
+        self.last_manifest_bytes = len(buf)
         return len(changed), len(removed), len(man), len(buf), self.last_push_bytes
 
     def reset(self):

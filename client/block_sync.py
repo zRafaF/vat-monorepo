@@ -19,6 +19,7 @@ Both run off the render thread; the viewer just polls.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -28,6 +29,11 @@ import vat_protocol as proto
 import vat_blockmap as bm
 
 log = logging.getLogger("block-sync")
+
+# Wait this long after a manifest before diff+pull, so a push (published
+# BEFORE the manifest by the server) has time to apply and the repair loop
+# finds nothing missing. 0 disables the grace.
+PUSH_GRACE_S = float(os.environ.get("BLOCK_PUSH_GRACE_S", "0.25"))
 
 
 class BlockSync:
@@ -87,6 +93,8 @@ class BlockSync:
             if not self._evt.wait(timeout=1.0):
                 continue
             self._evt.clear()
+            if PUSH_GRACE_S > 0:        # let the just-sent push land first
+                time.sleep(PUSH_GRACE_S)
             with self._lock:
                 remote = dict(self._remote)
             need, drop = bm.diff_manifest(self._store.local_manifest(), remote)
