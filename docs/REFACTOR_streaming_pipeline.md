@@ -253,3 +253,56 @@ PRISM_RESET_EACH_BATCH=1 RESET_WORLD_ANCHOR=1 RESET_WINDOW_FRAMES=60 make mappin
   a full map while the local region stays crisp. Bigger project.
 - **Drift/loop closure** is still the hard limit (VGGT is open-loop); the anchor bounds frame
   jumpiness but a pose-graph backend is needed for true global consistency.
+
+---
+
+# Round 6 — reset-mode latency: the bottleneck is RECOMPUTE, not transport
+
+Server log in reset mode: `▣ batch … in 7.82s`, with the engine printing
+`Processing Submap 0…1…2…3…4…5…6` and **re-initialising the C++ Nvblox Mapper every
+batch**. Meanwhile `cloud → client 0–10 KB/s` and `render 55 fps, stalls ~22`.
+
+**Diagnosis (not the octree / bandwidth / rendering):** reset re-runs **VGGT perception
+on the whole 60-frame window every batch** (~7 windows × ~0.85 s ≈ 6 s of inference).
+That is the 5+ s. The pose/`capture→display` spikes are a side effect — the single
+server thread is pinned reprocessing, so frame intake and corrections stall (and a 7 s
+batch means a VGGT pose correction only every 7 s, so dead-reckoning drifts between them).
+
+## Fix 1 (implemented): perception cache
+The VGGT forward is deterministic for a given set of frames, and consecutive batches
+(reset especially) re-request mostly the SAME windows. `_timed_perception` now memoises
+the forward keyed by window frame-identity (`PERC_CACHE_WINDOWS`, default 16, ~77 MB/window),
+and the cache is **deliberately not cleared on reset()** — so a fresh rebuild reuses the
+~6/7 windows it already inferred and runs the network only on the 1 genuinely new window.
+Reset perception drops ~6 s → ~0.85 s. (Geometry re-integration of the window still runs,
+~2–3 s; see Fix 2 for the rest.)
+
+## Fix 2 (recommended — re-test now): ONLINE mode + working decay
+`decay_tsdf` is now confirmed active in the log. That was the missing piece: online mode
+(`PRISM_RESET_EACH_BATCH=0`) processes only the **one new window per batch** (~1 s, as the
+online submaps in the log show) and decay carves stale/dynamic geometry — so it should now
+give reset-like freshness at ~1/7th the latency, with a consistent frame (no anchor needed,
+no jumping). The earlier "online looks worse" was with decay silently broken. **Try this
+first** — it is the lowest-latency path:
+```
+PRISM_RESET_EACH_BATCH=0 TSDF_DECAY=1 DECAY_EVERY_N=1 KEYFRAME_MAX_INTERVAL_S=1 make mapping
+```
+If stale geometry lingers, decay harder (`DECAY_EVERY_N=1`, or raise the nvblox decay rate);
+if it erodes too fast, `DECAY_EVERY_N=2`.
+
+## Immediate knob (reset path)
+`RESET_WINDOW_FRAMES=24` → ~3 windows instead of ~7 → roughly half the rebuild time, at the
+cost of a shorter map. Combine with the perception cache.
+
+## Where the time goes (per the log) — and the lever
+| Stage | reset (60-frame) before | with perception cache | online + decay |
+|---|---|---|---|
+| VGGT perception | ~6 s (7 windows) | ~0.85 s (1 new) | ~0.85 s (1 new) |
+| TSDF integrate + mesh | ~2–3 s (7 windows) | ~2–3 s | ~0.3 s (1 window) |
+| transport + render | <0.1 s | <0.1 s | <0.1 s |
+| **≈ batch latency** | **~7–8 s** | **~3–4 s** | **~1 s** |
+
+Net: transport/rendering were never the problem; the cache halves reset latency, but
+**online + working decay is the ~1 s path** and is worth testing before investing more in
+reset. If reset's geometry is still preferred, the next step is a sliding-window TSDF rebuilt
+from cached perception (re-integrate only recent windows) — keeps reset quality at ~online cost.
