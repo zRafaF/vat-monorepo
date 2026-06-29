@@ -75,6 +75,10 @@ CLOUD_VOXEL_SNAP = os.environ.get("CLOUD_VOXEL_SNAP", "1") == "1"
 # breathing + ghost thickening + the "+119 cubes while stationary" churn). 0 = off.
 KEYFRAME_MIN_TRANS_M = float(os.environ.get("KEYFRAME_MIN_TRANS_M", "0.05"))
 KEYFRAME_MIN_ROT_DEG = float(os.environ.get("KEYFRAME_MIN_ROT_DEG", "8.0"))
+# Time escape: integrate at least this often (s) even when the robot is still, so a
+# 360 camera keeps re-observing and DYNAMIC changes (moved/new objects) are caught and
+# decayed in instead of the map freezing on first sight. 0 disables the escape.
+KEYFRAME_MAX_INTERVAL_S = float(os.environ.get("KEYFRAME_MAX_INTERVAL_S", "1.0"))
 # nvblox TSDF decay (active carving of stale/unsupported voxels). OFF by default —
 # enable + tune on the rig once the decay API is confirmed for your nvblox build.
 TSDF_DECAY = os.environ.get("TSDF_DECAY", "1") == "1"

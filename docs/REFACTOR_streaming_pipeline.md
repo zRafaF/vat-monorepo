@@ -159,3 +159,55 @@ Everything accumulates; nothing is carved or windowed — the full scene for SoT
 
 Verified in-sandbox: all 13 files compile; self-tests pass; URDF loads go2w, decimates
 532k→41k verts (~0.5 ms/frame), and `URDF_SCALE` scales the avatar as expected.
+
+---
+
+# Round 4 — dynamic obstacles (backpack appears / old geometry carves)
+
+Symptoms: a backpack placed on an already-mapped table never appeared, and old
+geometry still never carved. Per the nvblox docs, this repo runs **static TSDF**
+reconstruction; full dynamic detection (Dynablox freespace + occupancy layer) is a
+ROS-node pipeline and is **not exposed in nvblox_torch**. For a TSDF map the supported
+levers are (1) keep re-observing the region and (2) decay the TSDF. Two bugs blocked both:
+
+1. **Decay was likely hitting the wrong layer.** `decay()` now introspects the build and
+   **logs every decay/deallocate method available**, prefers `decay_tsdf` (TSDF carving),
+   falls back to generic `decay`, and only uses `decay_occupancy` last — warning loudly if
+   that is all there is, because decaying the unused occupancy layer does nothing to the
+   TSDF mesh (the usual reason "old points never disappear"). It also calls
+   `deallocate_fully_decayed_blocks` so freed blocks leave the mesh and the manifest. The
+   call is signature-robust (no-arg or `mapper_id`). **Check the server log on startup for
+   `nvblox decay → decay_tsdf()`** — if it says occupancy-only, that build can't TSDF-decay
+   and you should use the sliding window (below).
+2. **Keyframe gating starved new observations.** A near-static 360° robot stopped
+   integrating, so a change in view was never seen. Added a **time escape**
+   (`KEYFRAME_MAX_INTERVAL_S`, default 1 s): integrate at least that often even when still,
+   so moved/new objects are observed and decayed in within ~1 s, while genuinely redundant
+   frames are still skipped (occupancy-CRC keeps the bandwidth ~0 when nothing changed).
+
+Also: the anti-erosion **edge mask** (drops depth discontinuities) can erase small/thin
+objects. It is now env-tunable — lower `EDGE_DILATE_PX` (e.g. 3) and/or raise
+`EDGE_REJECT_THRESH` to keep more of a small dynamic object. Default unchanged.
+
+## New flags (round 4)
+| Flag | Default | Effect |
+|---|---|---|
+| `KEYFRAME_MAX_INTERVAL_S` | `1.0` | force integration at least this often (catches dynamics); 0 disables |
+| `EDGE_DILATE_PX` | `7` | depth-edge mask dilation; lower keeps more of small/thin objects |
+| `EDGE_REJECT_THRESH` | `0.15` | depth step (m) treated as an edge; raise to keep more |
+| `EDGE_SMOOTH_THRESH` | `0.08` | depth step (m) kept as smooth surface |
+
+## If decay still cannot carve on your build
+Use the sliding window — guaranteed dynamic behaviour without nvblox decay:
+```
+PRISM_RESET_EACH_BATCH=1 RESET_WINDOW_FRAMES=60 make mapping
+```
+The map is rebuilt from only recent frames each batch, so moved objects appear and stale
+geometry is gone — at the cost of no persistent global map. For SoTA benchmarks (full
+accumulated scene) keep `TSDF_DECAY=0 PRISM_RESET_EACH_BATCH=0`.
+
+## Honest limit
+Decay/sliding-window bound the *map* error; neither fixes **trajectory drift** (ending up
+elsewhere after minutes). VGGT runs open-loop with no loop closure, so pose error
+integrates without bound — closing the loop needs a pose-graph / place-recognition backend,
+which is a separate project, not a flag.

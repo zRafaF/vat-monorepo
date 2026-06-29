@@ -67,6 +67,7 @@ class OnlinePRISMSession:
         self.engine.cloud_voxel_snap = cfg.CLOUD_VOXEL_SNAP
         self.engine.keyframe_min_trans_m = cfg.KEYFRAME_MIN_TRANS_M
         self.engine.keyframe_min_rot_deg = cfg.KEYFRAME_MIN_ROT_DEG
+        self.engine.keyframe_max_interval_s = cfg.KEYFRAME_MAX_INTERVAL_S
         self.engine.tsdf_decay = cfg.TSDF_DECAY
         self.engine.decay_every_n = cfg.DECAY_EVERY_N
         log.info(f"[PRISM] Engine ready ({cfg.summary()}).")
