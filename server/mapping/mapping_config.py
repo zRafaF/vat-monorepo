@@ -126,7 +126,9 @@ CORRECTION_DEADBAND_DEG = float(os.environ.get("CORRECTION_DEADBAND_DEG", "3.0")
 
 def summary() -> str:
     """One-line config echo for the startup log."""
-    return (f"window={WINDOW_SIZE} overlap={OVERLAP} voxel={VOXEL_SIZE} "
+    _mode = (f"RESET(win={RESET_WINDOW_FRAMES},anchor={'on' if RESET_WORLD_ANCHOR else 'off'})"
+             if PRISM_RESET_EACH_BATCH else f"ONLINE(decay={'on' if TSDF_DECAY else 'off'})")
+    return (f"MODE={_mode} window={WINDOW_SIZE} overlap={OVERLAP} voxel={VOXEL_SIZE} "
             f"face={FACE_SIZE} mode={PROCESSING_MODE} cube={CUBE_SIZE} "
             f"keyframe_every={PCD_KEYFRAME_EVERY} crc_quant={CRC_QUANT_M:.3f} "
             f"voxel_snap={CLOUD_VOXEL_SNAP} kf_gate={KEYFRAME_MIN_TRANS_M}m/{KEYFRAME_MIN_ROT_DEG}deg")

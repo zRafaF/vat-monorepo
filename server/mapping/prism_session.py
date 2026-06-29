@@ -176,6 +176,10 @@ class OnlinePRISMSession:
         if len(frames_list) < cfg.WINDOW_SIZE:
             return
         reset = bool(cfg.PRISM_RESET_EACH_BATCH)
+        if not getattr(self, "_mode_logged", False):
+            log.info(f"[PRISM] >>> MODE = {'RESET (fresh rebuild each batch)' if reset else 'ONLINE (accumulating map)'}"
+                     f"  (PRISM_RESET_EACH_BATCH={'1' if reset else '0'})")
+            self._mode_logged = True
         if reset:
             yield from self._process_reset(frames_list, max_seq)
             return
@@ -205,6 +209,8 @@ class OnlinePRISMSession:
         consistent (rigid anchor), so the cube diff only ships what actually changed."""
         if cfg.RESET_WINDOW_FRAMES > 0 and len(frames_list) > cfg.RESET_WINDOW_FRAMES:
             frames_list = frames_list[-cfg.RESET_WINDOW_FRAMES:]
+        _h0 = getattr(self.engine, "_perc_hits", 0)
+        _m0 = getattr(self.engine, "_perc_misses", 0)
         last_traj = None
         try:
             for _m, _p, traj, _pl in self.engine.process_sequence(
@@ -233,6 +239,10 @@ class OnlinePRISMSession:
         if ts_arr is not None and poses is not None and len(ts_arr) == len(poses):
             self._prev_world_poses = {int(round(float(ti) * 1e9)): (T @ np.asarray(P, np.float64))
                                       for ti, P in zip(ts_arr, poses)}
+        ran = getattr(self.engine, "_perc_misses", 0) - _m0
+        cached = getattr(self.engine, "_perc_hits", 0) - _h0
+        log.info(f"[PRISM] RESET rebuild: {len(frames_list)} frames | perception {ran} ran / "
+                 f"{cached} cached | {int(xyz.shape[0])} surface pts")
         if xyz.shape[0]:
             yield SubmapResult(version=int(cloud["version"]), points=xyz, colors=rgb,
                                trajectory=traj_w, cam_pose=cam_w, cam_ts=cam_ts)
