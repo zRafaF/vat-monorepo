@@ -24,6 +24,7 @@ from typing import Optional
 import numpy as np
 
 import mapping_config as cfg
+import vat_salt
 from frame_io import IncomingFrame
 from prism_vggt import FrameInput
 from prism_vggt.backends.panovggt import PanoVGGTBackend
@@ -109,6 +110,7 @@ class OnlinePRISMSession:
         # in the same cubes (delta collapses to the frontier).
         self._prev_world_poses = {}     # {ts_ns:int -> 4x4 world camera pose}
         self._world_anchor = np.eye(4)
+        self._salt_db = []      # [{id,ts,desc,pos}] keyframes for revisit detection (v0)
 
     # ── frame buffer ─────────────────────────────────────────────────────────
     def reset_map(self):
@@ -199,6 +201,8 @@ class OnlinePRISMSession:
                     cam_pose=cam_pose, cam_ts=cam_ts)
         except Exception:
             log.error(f"[PRISM] Engine error:\n{traceback.format_exc()}")
+        if cfg.SALT_ENABLE:
+            self._salt_step(max_seq)
         with self._lock:
             self._last_processed_seq = max_seq if max_seq is not None else self._last_processed_seq
 
@@ -268,6 +272,40 @@ class OnlinePRISMSession:
             return self._world_anchor.copy()
         self._world_anchor = rigid_anchor_from_poses(common)
         return self._world_anchor.copy()
+
+    def _salt_step(self, max_seq):
+        """SALT v0 (read-only): build a keyframe DB and LOG revisits + the pose drift
+        between the current camera and the matched older keyframe. The drift is the
+        accumulated open-loop error — large values here confirm that alignment is what
+        stops the TSDF carving (and is what loop-frame injection in v1 would fix)."""
+        try:
+            fr = self._frames.get(max_seq)
+            if fr is None:
+                return
+            ts = float(fr.timestamp)
+            cam_pose, _cam_ts = self._newest_camera_pose()
+            if cam_pose is None:
+                return
+            pos = np.asarray(cam_pose[:3, 3], np.float64)
+            desc = vat_salt.descriptor(fr.image)
+            best = None                                    # (sim, kf)
+            for kf in self._salt_db:
+                if ts - kf["ts"] < cfg.SALT_MIN_GAP_S:
+                    continue
+                sim, _shift = vat_salt.similarity(desc, kf["desc"])
+                if best is None or sim > best[0]:
+                    best = (sim, kf)
+            if best is not None and best[0] >= cfg.SALT_SIM_THRESH:
+                drift = float(np.linalg.norm(pos - best[1]["pos"]))
+                log.info(f"[SALT] revisit: sim={best[0]:.3f}  Δt={ts - best[1]['ts']:.1f}s  "
+                         f"pos_gap(drift)={drift:.2f}m  (kf #{best[1]['id']}, db={len(self._salt_db)})")
+            if not self._salt_db or (ts - self._salt_db[-1]["ts"]) >= cfg.SALT_KF_EVERY_S:
+                self._salt_db.append({"id": len(self._salt_db), "ts": ts,
+                                      "desc": desc, "pos": pos.copy()})
+                if len(self._salt_db) > cfg.SALT_DB_MAX:
+                    self._salt_db.pop(0)
+        except Exception:
+            log.debug("[SALT] step failed", exc_info=True)
 
     def _newest_camera_pose(self):
         """Newest camera pose (by capture timestamp) + its capture time, for the

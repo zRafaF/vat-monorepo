@@ -124,6 +124,17 @@ CORRECTION_DEADBAND_M   = float(os.environ.get("CORRECTION_DEADBAND_M", "0.06"))
 CORRECTION_DEADBAND_DEG = float(os.environ.get("CORRECTION_DEADBAND_DEG", "3.0"))
 
 
+# ── "SALT": loop-closure-style anchoring ─────────────────────────────────────
+# v0 = SENSING ONLY (safe, read-only): recognise revisits and LOG the pose drift,
+# to validate that drift/misalignment is what's blocking carving before we inject
+# old anchor frames into the VGGT window (v1). Online mode only.
+SALT_ENABLE     = os.environ.get("SALT_ENABLE", "1") == "1"
+SALT_KF_EVERY_S = float(os.environ.get("SALT_KF_EVERY_S", "1.0"))   # store a keyframe this often
+SALT_MIN_GAP_S  = float(os.environ.get("SALT_MIN_GAP_S", "8.0"))    # only match keyframes older than this
+SALT_SIM_THRESH = float(os.environ.get("SALT_SIM_THRESH", "0.80"))  # cosine (yaw-invariant) revisit threshold
+SALT_DB_MAX     = int(os.environ.get("SALT_DB_MAX", "800"))
+
+
 def summary() -> str:
     """One-line config echo for the startup log."""
     _mode = (f"RESET(win={RESET_WINDOW_FRAMES},anchor={'on' if RESET_WORLD_ANCHOR else 'off'})"
