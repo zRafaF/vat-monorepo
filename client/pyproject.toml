@@ -32,6 +32,7 @@ dependencies = [
     "yourdfpy>=0.0.56",
     "trimesh>=4.0",
     "pycollada>=0.8",   # trimesh loads the .dae meshes via this
+    "fast-simplification>=0.1",   # decimate the avatar meshes at load (far-view low-poly)
 ]
 
 [tool.uv]

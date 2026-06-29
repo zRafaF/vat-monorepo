@@ -91,11 +91,15 @@ def _find_urdf() -> str:
     env = os.environ.get("GO2_URDF")
     if env:
         return env
-    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "b2w_description")
-    for pat in ("urdf/*.urdf", "*.urdf", "**/*.urdf"):
-        hits = sorted(glob.glob(os.path.join(base, pat), recursive=True))
-        if hits:
-            return hits[0]
+    cdir = os.path.dirname(os.path.abspath(__file__))
+    # any client/<robot>_description folder; prefer one whose name mentions go2
+    roots = sorted(glob.glob(os.path.join(cdir, "*_description")),
+                   key=lambda p: (0 if "go2" in os.path.basename(p).lower() else 1, p))
+    for base in roots:
+        for pat in ("urdf/*.urdf", "*.urdf", "**/*.urdf"):
+            hits = sorted(glob.glob(os.path.join(base, pat), recursive=True))
+            if hits:
+                return hits[0]
     return ""
 
 

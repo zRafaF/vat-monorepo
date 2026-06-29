@@ -5,8 +5,8 @@ Loads the Unitree URDF + meshes and produces a single merged (vertices, faces) m
 for the robot at a given joint configuration + base pose, so the viewer can draw the
 real 3D model instead of the wireframe skeleton.
 
-Auto-detected from ``client/b2w_description`` (no env var needed; ``GO2_URDF``
-overrides). Fully guarded: needs ``yourdfpy`` + ``trimesh`` (+ ``pycollada`` for the
+Auto-detected from ``client/<robot>_description`` (prefers go2w; no env var needed;
+``GO2_URDF`` overrides). Fully guarded: needs ``yourdfpy`` + ``trimesh`` (+ ``pycollada`` for the
 .dae meshes). If anything is missing/unloadable, ``available`` is False and the
 viewer stays on the skeleton (reason logged once).
 
@@ -32,6 +32,12 @@ import numpy as np
 log = logging.getLogger("urdf-robot")
 
 LEG_ORDER = ["FR", "FL", "RR", "RL"]   # matches kinematics.LEG_ORDER / q ordering
+
+# Decimate each visual mesh at LOAD to ~this fraction of its faces (the robot is
+# viewed from afar, so full detail is wasted and slows the per-frame transform/upload).
+# 1.0 / <=0 disables. Precise via fast-simplification if installed; otherwise a
+# dependency-free vertex-clustering fallback. Tune with URDF_KEEP.
+KEEP_FRACTION = float(os.environ.get("URDF_KEEP", "0.06"))
 
 
 class URDFRobot:
@@ -61,8 +67,10 @@ class URDFRobot:
             self._load(urdf_path)
             self.available = self.n_vertices > 0
             if self.available:
+                raw = getattr(self, "_raw_vertices", self.n_vertices)
                 log.info(f"[URDF] loaded '{os.path.basename(urdf_path)}': "
-                         f"{len(self._joint_names)} joints, {self.n_vertices} verts — mesh ready.")
+                         f"{len(self._joint_names)} joints, {raw}→{self.n_vertices} verts "
+                         f"(decimated to {100.0*self.n_vertices/max(raw,1):.0f}%) — mesh ready.")
             else:
                 log.warning("[URDF] loaded but no mesh geometry found; skeleton only.")
         except Exception as e:
@@ -112,7 +120,7 @@ class URDFRobot:
         # Precompute per-node LOCAL vertices + ONE static faces array (with offsets).
         self._scene = self._urdf.scene
         graph = self._scene.graph
-        faces, nverts = [], 0
+        faces, nverts, raw = [], 0, 0
         for node in graph.nodes_geometry:
             _T, gname = graph.get(node)
             geom = self._scene.geometry.get(gname)
@@ -120,12 +128,53 @@ class URDFRobot:
                 continue
             v = np.asarray(geom.vertices, dtype=np.float64)
             f = np.asarray(geom.faces, dtype=np.int64)
+            raw += len(v)
+            v, f = self._decimate(v, f)              # low-poly for the far view
+            if len(f) == 0:
+                continue
             self._nodes.append((node, v))
             faces.append(f + nverts)
             nverts += len(v)
         self._faces = (np.concatenate(faces).astype(np.int32)
                        if faces else np.zeros((0, 3), np.int32))
         self.n_vertices = nverts
+        self._raw_vertices = raw
+
+    def _decimate(self, v, f):
+        """Reduce a mesh to ~KEEP_FRACTION of its faces. Precise quadric decimation
+        via fast-simplification if available; otherwise dependency-free vertex
+        clustering. Returns (v, f) unchanged if disabled or already tiny."""
+        keep = KEEP_FRACTION
+        if keep <= 0.0 or keep >= 1.0 or len(f) < 64:
+            return v, f
+        try:
+            import fast_simplification as fs
+            vv, ff = fs.simplify(v.astype(np.float32), f.astype(np.int32),
+                                 target_reduction=float(1.0 - keep))
+            vv = np.asarray(vv, np.float64)
+            ff = np.asarray(ff, np.int64)
+            if len(ff) >= 4:
+                return vv, ff
+        except Exception:
+            pass
+        return self._vertex_cluster(v, f, keep)
+
+    @staticmethod
+    def _vertex_cluster(v, f, keep):
+        """Dependency-free decimation: snap vertices to a grid sized from the bbox to
+        land near ``keep``, merge per cell (mean), remap faces, drop degenerates."""
+        lo, hi = v.min(axis=0), v.max(axis=0)
+        diag = float(np.linalg.norm(hi - lo)) or 1.0
+        target_cells = max(int(round((keep * len(v)) ** (1.0 / 3.0))), 2)
+        cell = diag / target_cells
+        keys = np.floor((v - lo) / cell).astype(np.int64)
+        uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+        new_v = np.zeros((len(uniq), 3), np.float64)
+        np.add.at(new_v, inv, v)
+        new_v /= np.bincount(inv, minlength=len(uniq))[:, None]
+        nf = inv[f]
+        good = (nf[:, 0] != nf[:, 1]) & (nf[:, 1] != nf[:, 2]) & (nf[:, 0] != nf[:, 2])
+        return new_v, nf[good]
 
     def cfg_from_q(self, q12) -> dict:
         """yourdfpy joint config from the 12 leg angles (LEG_ORDER × [hip,thigh,calf]).

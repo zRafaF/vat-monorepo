@@ -87,15 +87,16 @@ walls) but reprocesses the window (slower) and keeps **no** global map. Good A/B
 decay. Lower `RESET_WINDOW_FRAMES` if too slow.
 
 ## URDF avatar setup (client)
-The description lives at `client/b2w_description/` (urdf/ + meshes/) and is
-**auto-detected** — no env var needed (`GO2_URDF` still overrides). Just:
+The description lives at `client/<robot>_description/` (e.g. `go2w_description`,
+urdf/ + meshes/) and is **auto-detected** (prefers go2w) — no env var needed (`GO2_URDF` still overrides). Just:
 ```
 cd client && uv sync     # installs yourdfpy + trimesh + pycollada (for .dae)
 make viewer              # mesh shows automatically; press U to toggle mesh <-> skeleton
 ```
 Verified locally: the URDF loads, all 12 leg joints map (FR/FL/RR/RL × hip/thigh/calf),
-the .dae meshes resolve via the package:// path, and posed geometry builds in ~6 ms
-(legs still) / ~13 ms (legs moving), cached + throttled to 20 Hz. Mirrored/rotated/
+the .dae meshes resolve via the package:// path. Meshes are decimated at load
+(`URDF_KEEP`, default 6%) — go2w goes 532k→41k verts — so posed geometry builds in
+~0.5 ms/frame (cached + throttled to 20 Hz). Mirrored/rotated/
 bent-wrong → tweak `cfg_from_q` (joint sign map) or `_base_to_z_up` in `urdf_robot.py`;
 isolated so it can't affect anything else.
 
