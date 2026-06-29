@@ -38,6 +38,10 @@ LEG_ORDER = ["FR", "FL", "RR", "RL"]   # matches kinematics.LEG_ORDER / q orderi
 # 1.0 / <=0 disables. Precise via fast-simplification if installed; otherwise a
 # dependency-free vertex-clustering fallback. Tune with URDF_KEEP.
 KEEP_FRACTION = float(os.environ.get("URDF_KEEP", "0.06"))
+# Uniform visual scale for the avatar. The mesh is true-metric; raise this only if
+# the world/cloud is mis-scaled (low floor confidence) and you want the robot to
+# match it visually. The proper fix is calibrating CAMERA_HEIGHT / the floor anchor.
+ROBOT_SCALE = float(os.environ.get("URDF_SCALE", "1.0"))
 
 
 class URDFRobot:
@@ -214,7 +218,7 @@ class URDFRobot:
                 self._last_q = q
             R = np.asarray(base_R, dtype=np.float64).reshape(3, 3) @ self._base_to_z_up[:3, :3]
             t = np.asarray(base_t, dtype=np.float64).reshape(3)
-            return (self._posed_local @ R.T + t).astype(np.float32), self._faces
+            return ((self._posed_local * ROBOT_SCALE) @ R.T + t).astype(np.float32), self._faces
         except Exception as e:
             if not getattr(self, "_geom_warned", False):
                 log.warning(f"[URDF] geometry build failed, falling back to skeleton: {e}")

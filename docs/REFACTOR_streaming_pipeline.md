@@ -121,3 +121,41 @@ real transport — reasoned correct + flag-guarded; test on the rig.
    walls” should clear. If not, confirm the decay method name and tune the rate.
 5. Avatar: press `U` for the URDF mesh.
 6. A/B: try `PRISM_RESET_EACH_BATCH=1`; and the full-rollback env above.
+
+---
+
+# Round 3 — avatar scale, Open3D-style visuals, decay lifetime
+
+From the second round of client logs (latency now good, cloud bounded ~300k):
+
+- **Avatar scale.** The go2w mesh is true-metric (0.61×0.43×0.61 m at zero config, real
+  Go2 proportions), so it is not intrinsically small — the *map* is slightly inflated by
+  the VGGT metric scale (low floor confidence, `s≈0.59`), which makes a correct robot look
+  small against it. The real fix is calibrating `CAMERA_HEIGHT` / the floor anchor; as a
+  quick visual match, `URDF_SCALE` (default 1.0) uniformly scales the avatar.
+- **Black outlines → Open3D look.** The point cloud and feet markers drew with a black
+  edge ring (VisPy default), making everything look segmented. Now `edge_color == face_color`
+  with `edge_width=0` and marker antialiasing → clean connected points. The robot mesh uses
+  smooth shading with a brighter material, `cull_face=False`, and raised ambient so back
+  faces are not near-black.
+- **Decay as a tunable point "lifetime" (sliding window).** `TSDF_DECAY` (on) carves stale
+  voxels; `DECAY_EVERY_N` (default 1) sets how often decay runs — higher = longer lifetime /
+  gentler window, so you can trade drift-resistance vs map completeness without touching the
+  nvblox decay rate. This bounds *map* error from pose drift but cannot fix the drift itself
+  (VGGT has no online loop closure — that is the remaining architectural limit).
+
+### Benchmark mode (full accumulated scene, no sliding window)
+```
+TSDF_DECAY=0 PRISM_RESET_EACH_BATCH=0 make mapping
+```
+Everything accumulates; nothing is carved or windowed — the full scene for SoTA comparison.
+
+## New flags (round 3)
+| Flag | Default | Effect |
+|---|---|---|
+| `URDF_SCALE` | `1.0` | uniform avatar scale (visual match to a mis-scaled map) |
+| `URDF_KEEP` | `0.06` | mesh decimation target (lower = lower-poly avatar) |
+| `DECAY_EVERY_N` | `1` | apply decay every N submaps (higher = longer point lifetime) |
+
+Verified in-sandbox: all 13 files compile; self-tests pass; URDF loads go2w, decimates
+532k→41k verts (~0.5 ms/frame), and `URDF_SCALE` scales the avatar as expected.

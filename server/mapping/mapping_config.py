@@ -78,6 +78,11 @@ KEYFRAME_MIN_ROT_DEG = float(os.environ.get("KEYFRAME_MIN_ROT_DEG", "8.0"))
 # nvblox TSDF decay (active carving of stale/unsupported voxels). OFF by default —
 # enable + tune on the rig once the decay API is confirmed for your nvblox build.
 TSDF_DECAY = os.environ.get("TSDF_DECAY", "1") == "1"
+# Apply decay every N integrated submaps. Higher N = longer point "lifetime" (gentler
+# sliding window, geometry persists longer); N=1 decays every submap. Lets you trade
+# drift-resistance vs map completeness without touching the nvblox decay rate.
+# For SoTA benchmarks set TSDF_DECAY=0 → full accumulated scene, no sliding window.
+DECAY_EVERY_N = int(os.environ.get("DECAY_EVERY_N", "1"))
 # Experimental: rebuild a FRESH map each batch (engine reset=True) over only the
 # most recent RESET_WINDOW_FRAMES frames, instead of accumulating online. Removes
 # cross-batch accumulation/drift (no ghost build-up, no "walking inside walls") but

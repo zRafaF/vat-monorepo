@@ -68,6 +68,7 @@ class OnlinePRISMSession:
         self.engine.keyframe_min_trans_m = cfg.KEYFRAME_MIN_TRANS_M
         self.engine.keyframe_min_rot_deg = cfg.KEYFRAME_MIN_ROT_DEG
         self.engine.tsdf_decay = cfg.TSDF_DECAY
+        self.engine.decay_every_n = cfg.DECAY_EVERY_N
         log.info(f"[PRISM] Engine ready ({cfg.summary()}).")
 
         self._frames: dict[int, FrameInput] = {}

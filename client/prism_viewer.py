@@ -419,13 +419,23 @@ class PRISMViewer:
 
         self._cloud_vis = scene.visuals.Markers(parent=view.scene)
         self._cloud_vis.set_gl_state(depth_test=True)
+        try:
+            self._cloud_vis.antialias = 1          # soft disc edge, no hard black ring
+        except Exception:
+            pass
         self._robot_vis = scene.visuals.Line(parent=view.scene, connect="segments",
                                               width=2.0, antialias=True)
         self._legs_vis = scene.visuals.Line(parent=view.scene, connect="segments",
                                              width=3.0, antialias=True)
         self._feet_vis = scene.visuals.Markers(parent=view.scene)
         try:
-            self._robot_mesh_vis = scene.visuals.Mesh(parent=view.scene, shading="smooth")
+            self._robot_mesh_vis = scene.visuals.Mesh(parent=view.scene, shading="smooth",
+                                                      color=(0.72, 0.76, 0.82, 1.0))
+            self._robot_mesh_vis.set_gl_state(depth_test=True, cull_face=False)
+            try:        # brighten ambient so back faces are not near-black
+                self._robot_mesh_vis.shading_filter.ambient_light = (1, 1, 1, 0.6)
+            except Exception:
+                pass
             self._robot_mesh_vis.visible = False
         except Exception as _e:
             log.warning(f"[Viewer] mesh visual unavailable ({_e}); skeleton only.")
@@ -581,7 +591,9 @@ class PRISMViewer:
         x, c = xyz[keep], rgb[keep]
         rgba = np.ones((x.shape[0], 4), np.float32)
         rgba[:, :3] = c.astype(np.float32) / 255.0
-        self._cloud_vis.set_data(x.astype(np.float32), face_color=rgba,
+        # edge_color == face_color (width 0) gives a clean, connected Open3D-style
+        # point look instead of black-ringed dots.
+        self._cloud_vis.set_data(x.astype(np.float32), face_color=rgba, edge_color=rgba,
                                  size=self._pt_size, edge_width=0)
         self._cloud_n = int(x.shape[0])
         if not self._cloud_framed and x.shape[0]:
@@ -696,7 +708,7 @@ class PRISMViewer:
         if legs_valid and leg_data:
             lpts, lcols, feet, fcols = leg_segments(leg_data, R, pos)
             self._legs_vis.set_data(pos=lpts, color=lcols)
-            self._feet_vis.set_data(feet, face_color=fcols, size=10, edge_width=0)
+            self._feet_vis.set_data(feet, face_color=fcols, edge_color=fcols, size=10, edge_width=0)
         elif not self._legs_warned:
             log.info("[Viewer] (no leg data yet — /lowstate flowing?)")
             self._legs_warned = True
