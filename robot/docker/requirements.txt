@@ -2,8 +2,7 @@ eclipse-zenoh==1.9.0
 numpy>=1.24
 opencv-python-headless>=4.9
 rosbags>=0.10
-# Pose estimator backend (POSE_BACKEND=gtsam): IMU-preintegration fixed-lag smoother.
-# aarch64 wheels exist on PyPI for the Jetson; if the wheel is unavailable for this
-# Python/arch the fuser auto-falls back to the NumPy estimator (POSE_BACKEND=graph),
-# so the container still runs without it.
-gtsam>=4.2; platform_machine == "aarch64" or platform_machine == "x86_64"
+# NOTE: gtsam (POSE_BACKEND=gtsam) is installed in a SEPARATE, non-fatal Dockerfile
+# step — only a pre-release wheel (4.3a0) exists for aarch64/cp310, and pinning it here
+# would hard-fail the whole build. Kept out of this file so the container always builds;
+# if gtsam is absent the fuser auto-falls back to the NumPy estimator.

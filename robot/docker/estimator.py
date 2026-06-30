@@ -138,6 +138,11 @@ class WheelInertialEstimator:
         Does nothing if ``dt<=0`` or the sample is invalid."""
         if dt <= 0 or not valid:
             return
+        # Guard placeholder/garbage samples (some Go2 topics publish junk): a non-finite
+        # attitude/rate/speed must not poison the dead-reckoner.
+        if not (np.all(np.isfinite(imu_quat)) and np.all(np.isfinite(gyro))
+                and np.isfinite(body_vx)):
+            return
         imu_quat = quat_normalize(imu_quat)
         if not self._inited:
             self._odom_quat = imu_quat

@@ -120,8 +120,17 @@ class GTSAMImuEstimator:
         if dt <= 0 or not valid:
             return
         gyro = np.asarray(gyro, dtype=np.float64).reshape(3)
+        if not np.all(np.isfinite(gyro)):
+            gyro = np.zeros(3)
         acc = (np.asarray(accel, dtype=np.float64).reshape(3) if accel is not None
                else np.array([0.0, 0.0, _G]))          # rest reaction if no accel wired
+        # Reject a placeholder/garbage accelerometer (some topics are filled with junk):
+        # without a trustworthy specific force, substitute the rest reaction (+g up) so
+        # preintegration can't diverge into freefall — the filter then leans on the gyro
+        # and the wheel/contact odometry. A real |a| stays within a few g of gravity.
+        an = float(np.linalg.norm(acc))
+        if not np.all(np.isfinite(acc)) or an < 3.0 or an > 40.0:
+            acc = np.array([0.0, 0.0, _G])
         self._last_accel_body = acc
         self._last_t_ns = int(now_ns) if now_ns is not None else self._last_t_ns + int(dt * 1e9)
 

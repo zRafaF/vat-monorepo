@@ -43,6 +43,12 @@ ENV RMW_IMPLEMENTATION="rmw_cyclonedds_cpp"
 
 COPY robot/docker/requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
+# GTSAM pose backend (POSE_BACKEND=gtsam) — IMU-preintegration fixed-lag smoother.
+# SEPARATE + NON-FATAL: only a pre-release wheel (4.3a0) exists for aarch64/cp310, so
+# we allow --pre and never fail the build if it's missing; the fuser auto-falls back to
+# the NumPy estimator (POSE_BACKEND=graph) when gtsam can't be imported.
+RUN pip3 install --no-cache-dir --pre gtsam \
+    || echo "[build] gtsam unavailable for this arch/python — POSE_BACKEND will fall back"
 
 # ── unitree_go / unitree_api messages (so the bridge can forward Go2 topics) ──
 # /sportmodestate is unitree_go/msg/SportModeState — a CUSTOM type. rclpy can
@@ -95,6 +101,8 @@ COPY robot/docker/frame_archive.py    /app/
 COPY robot/docker/pose_fuser.py       /app/
 COPY robot/docker/kinematics.py       /app/
 COPY robot/docker/estimator.py        /app/
+COPY robot/docker/pose_graph.py       /app/
+COPY robot/docker/gtsam_estimator.py  /app/
 COPY robot/docker/teleop_bridge.py    /app/
 COPY robot/docker/start.sh            /app/
 RUN chmod +x /app/start.sh

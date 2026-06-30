@@ -590,12 +590,23 @@ class LowStateTracker:
                 np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]]))   # wxyz→xyzw
             gyro = np.asarray(msg.imu_state.gyroscope, dtype=np.float64).reshape(3)
             accel = np.asarray(msg.imu_state.accelerometer, dtype=np.float64).reshape(3)
+            # Guard placeholder/garbage IMU fields — some Go2 firmware/relays publish
+            # zeros or junk on these topics; a non-finite sample must never poison the
+            # estimator. (The accelerometer MAGNITUDE plausibility check is in the
+            # estimator, which knows the rest-reaction it expects.)
+            if not np.all(np.isfinite(imu_quat)) or np.linalg.norm(imu_quat) < 1e-6:
+                imu_quat = quat_identity()
+            if not np.all(np.isfinite(gyro)):
+                gyro = np.zeros(3)
+            if not np.all(np.isfinite(accel)):
+                accel = np.array([0.0, 0.0, 9.81])
             # Per-wheel ground speed (dq × radius). LEG/CONTACT ODOMETRY: trust only
             # wheels whose foot is in ground contact (foot_force above threshold), so a
             # lifted or unloaded (slipping) wheel doesn't corrupt the body speed. The
             # 360° robot's wheels are normally all planted; this mainly rejects the
             # transient slip during hard accel/turns that fooled the old mean-of-4.
             v_wheel = [float(ms[i].dq) * WHEEL_RADIUS for i in WHEEL_IDX if i < len(ms)]
+            v_wheel = [v if np.isfinite(v) else 0.0 for v in v_wheel]   # guard garbage dq
             try:
                 ff = [float(x) for x in msg.foot_force]
             except Exception:
