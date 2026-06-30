@@ -70,6 +70,8 @@ class SubmapResult:
     trajectory: Optional[np.ndarray]
     cam_pose: Optional[np.ndarray]   # 4x4 camera→world of the newest keyframe
     cam_ts: Optional[float]          # capture time (s) of that keyframe
+    obs_centers: Optional[np.ndarray] = None  # (M,3) camera positions added THIS submap
+    #                                            (drives the streamed-map observation-TTL)
 
 
 class OnlinePRISMSession:
@@ -90,9 +92,6 @@ class OnlinePRISMSession:
         self.engine.compute_esdf = False
         self.engine.point_cloud_only = True
         self.engine.processing_mode = cfg.PROCESSING_MODE
-        # Rebuild the displayed surface every N submaps (depth still integrates every
-        # submap). Caps the mesh-pull cost that grows with map size → less latency backup.
-        self.engine.mesh_extract_every = cfg.MESH_EXTRACT_EVERY
         # Streaming-stability config (online ghost / breathing / bandwidth fixes):
         #  * voxel-snap → byte-identical unchanged geometry → stable block CRCs;
         #  * keyframe gating → don't re-integrate a static view (breathing/ghosts);
@@ -280,6 +279,9 @@ class OnlinePRISMSession:
             yield from self._process_reset(frames_list, max_seq)
             return
         try:
+            # Track trajectory growth so each submap's NEW camera positions can be
+            # handed to the streamed-map observation-TTL (refresh only what was just seen).
+            prev_traj_len = len(self.engine.trajectory)
             for _mesh, _pcd, traj, _plane in self.engine.process_sequence(
                     frames_list, window_size=cfg.WINDOW_SIZE, overlap=cfg.OVERLAP,
                     reset=False, finalize=False):
@@ -291,11 +293,19 @@ class OnlinePRISMSession:
                 xyz, rgb = self._merge_display_base(xyz, rgb)
                 if xyz.shape[0] == 0:
                     continue
+                # Camera positions added by THIS submap (slice of the growing trajectory)
+                # → which cubes were just observed, for the observation-TTL prune.
+                full_traj = np.asarray(traj, np.float32) if traj is not None else None
+                obs_centers = None
+                if full_traj is not None and len(full_traj):
+                    obs_centers = (full_traj[prev_traj_len:] if len(full_traj) > prev_traj_len
+                                   else full_traj[-cfg.WINDOW_SIZE:])
+                    prev_traj_len = len(full_traj)
                 cam_pose, cam_ts = self._newest_camera_pose()
                 yield SubmapResult(
                     version=int(cloud["version"]), points=xyz, colors=rgb,
-                    trajectory=np.asarray(traj, np.float32) if traj is not None else None,
-                    cam_pose=cam_pose, cam_ts=cam_ts)
+                    trajectory=full_traj,
+                    cam_pose=cam_pose, cam_ts=cam_ts, obs_centers=obs_centers)
         except Exception:
             log.error(f"[PRISM] Engine error:\n{traceback.format_exc()}")
         if cfg.SALT_ENABLE:

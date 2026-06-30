@@ -38,10 +38,6 @@ FACE_SIZE   = int(os.environ.get("FACE_SIZE",    "512"))
 WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE",  "12"))
 OVERLAP     = int(os.environ.get("OVERLAP",      "4"))
 PROCESSING_MODE = os.environ.get("PROCESSING_MODE", "parallel").strip().lower()
-# Mesh extraction cadence: rebuild the displayed surface every N submaps (depth is
-# still integrated every submap). The mesh pull scales with total map size and is a
-# top per-submap cost, so N>1 is the main lever against the long-run latency backup.
-MESH_EXTRACT_EVERY = max(1, int(os.environ.get("MESH_EXTRACT_EVERY", "1")))
 
 
 def _parse_ceiling(raw: str):
@@ -102,6 +98,17 @@ TSDF_DECAY = os.environ.get("TSDF_DECAY", "1") == "1"
 # drift-resistance vs map completeness without touching the nvblox decay rate.
 # For SoTA benchmarks set TSDF_DECAY=0 → full accumulated scene, no sliding window.
 DECAY_EVERY_N = int(os.environ.get("DECAY_EVERY_N", "1"))
+# Observation-TTL on the streamed cube map (nav sliding window, client-side clearing).
+# Cubes the camera leaves behind and does NOT re-observe within this many submaps are
+# dropped from the streamed grid → they leave the manifest/push as `removed` → the
+# client clears them (no whole-map resend). A revisit re-observes and re-adds them.
+# This is what makes stale voxels actually disappear on the client; it complements the
+# TSDF decay (which carves the volume) by bounding the STREAMED map. 0 = off (keep all).
+MAP_TTL_SUBMAPS = int(os.environ.get("MAP_TTL_SUBMAPS", "0"))
+# A cube counts as "observed" this submap if its centre is within this radius (m) of any
+# of the submap's camera positions. Defaults to the sensor range (MAX_DEPTH): you can
+# only refresh what the 360° camera could actually see. Empty/0 → MAX_DEPTH.
+MAP_TTL_RADIUS_M = float(os.environ.get("MAP_TTL_RADIUS_M", "0") or 0.0) or MAX_DEPTH
 # Experimental: rebuild a FRESH map each batch (engine reset=True) over only the
 # most recent RESET_WINDOW_FRAMES frames, instead of accumulating online. Removes
 # cross-batch accumulation/drift (no ghost build-up, no "walking inside walls") but
@@ -166,7 +173,7 @@ def summary() -> str:
     _mode = (f"RESET(win={RESET_WINDOW_FRAMES},anchor={'on' if RESET_WORLD_ANCHOR else 'off'})"
              if PRISM_RESET_EACH_BATCH else f"ONLINE(decay={'on' if TSDF_DECAY else 'off'})")
     return (f"MODE={_mode} window={WINDOW_SIZE} overlap={OVERLAP} voxel={VOXEL_SIZE} "
-            f"face={FACE_SIZE} mesh_every={MESH_EXTRACT_EVERY} mode={PROCESSING_MODE} cube={CUBE_SIZE} "
+            f"face={FACE_SIZE} mode={PROCESSING_MODE} cube={CUBE_SIZE} "
             f"keyframe_every={PCD_KEYFRAME_EVERY} crc_quant={CRC_QUANT_M:.3f} "
             f"voxel_snap={CLOUD_VOXEL_SNAP} stream_voxel={STREAM_VOXEL_M} "
             f"kf_gate={KEYFRAME_MIN_TRANS_M}m/{KEYFRAME_MIN_ROT_DEG}deg")

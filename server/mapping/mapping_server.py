@@ -91,7 +91,9 @@ class MappingServer:
 
         self._blockpub = BlockPublisher(self._z, cube_m=cfg.CUBE_SIZE,
                                         server_prefix=cfg.SERVER_PREFIX,
-                                        crc_quant_m=cfg.CRC_QUANT_M)
+                                        crc_quant_m=cfg.CRC_QUANT_M,
+                                        ttl_submaps=cfg.MAP_TTL_SUBMAPS,
+                                        ttl_radius_m=cfg.MAP_TTL_RADIUS_M)
         try:
             self._live = self._z.liveliness().declare_token(_KEYS["live_server"])
         except Exception:
@@ -315,7 +317,9 @@ class MappingServer:
                 # Diff-based block sync from the CURRENT surface → cubes that no
                 # longer have points are REMOVED (no accumulation/ghosting).
                 n_changed, n_removed, n_cubes, man_bytes, push_bytes = \
-                    self._blockpub.ingest_and_publish(xyz, rgb, map_version=version)
+                    self._blockpub.ingest_and_publish(
+                        xyz, rgb, map_version=version,
+                        observed_centers=getattr(r, "obs_centers", None))
                 _now = time.time()
                 if self._last_submap_t:
                     dt = max(_now - self._last_submap_t, 1e-3)

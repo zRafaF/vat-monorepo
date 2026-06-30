@@ -120,10 +120,29 @@ class BlockGrid:
         self.crc_quant_m = float(crc_quant_m) if crc_quant_m else None
         self._hash_quant = (1.0 / self.crc_quant_m) if self.crc_quant_m else _HASH_QUANT
         self.blocks: Dict[int, Tuple[int, np.ndarray, np.ndarray]] = {}
+        # Observation-recency stamp per cube: the submap/map_version at which the cube
+        # was last seen within sensor range. Drives the optional observation-TTL prune
+        # in ingest() (stale cubes the camera left behind are dropped → they leave the
+        # manifest + push as `removed` → the client clears them). Kept SEPARATE from
+        # `blocks` so the manifest/push/bundle wire format is unchanged. Unused (empty)
+        # when ttl is off.
+        self.stamps: Dict[int, int] = {}
 
-    def ingest(self, xyz: np.ndarray, rgb: np.ndarray) -> Tuple[List[int], List[int]]:
+    def ingest(self, xyz: np.ndarray, rgb: np.ndarray,
+               stamp: int | None = None, observed_centers: np.ndarray | None = None,
+               observed_radius: float | None = None, ttl: int | None = None
+               ) -> Tuple[List[int], List[int]]:
         """Rebuild the grid from a full cloud. ``rgb`` may be float [0,1] or uint8.
-        Returns ``(changed_keys, removed_keys)`` vs. the previous state."""
+        Returns ``(changed_keys, removed_keys)`` vs. the previous state.
+
+        Observation-TTL (optional, nav sliding map): with ``ttl`` > 0 and a monotonic
+        ``stamp`` (e.g. map_version), each cube is stamped with ``stamp`` when its centre
+        lies within ``observed_radius`` of any ``observed_centers`` (this submap's camera
+        positions). A cube the camera left behind keeps its old stamp; once it has not
+        been re-observed for more than ``ttl`` stamps its points are dropped from the
+        grid, so it leaves the manifest/push as ``removed`` and the client clears it.
+        A revisit re-observes the cube and it comes straight back. ttl off → legacy
+        behaviour (every occupied cube kept; stamps unused)."""
         xyz = np.ascontiguousarray(xyz, dtype=np.float32).reshape(-1, 3)
         rgb = np.asarray(rgb).reshape(-1, 3)
         rgb_u8 = (np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8) \
@@ -132,6 +151,7 @@ class BlockGrid:
         if n == 0:
             removed = list(self.blocks.keys())
             self.blocks = {}
+            self.stamps = {}
             return [], removed
 
         keys = cube_keys(xyz, self.cube_m)
@@ -146,7 +166,27 @@ class BlockGrid:
         ends = np.append(starts[1:], n)
 
         new_blocks: Dict[int, Tuple[int, np.ndarray, np.ndarray]] = {}
+        new_stamps: Dict[int, int] = {}
         changed: List[int] = []
+
+        # Observation-TTL: decide, per unique cube, whether it was observed this submap
+        # (its centre within ``observed_radius`` of a camera position). Cubes not seen
+        # for > ttl stamps are dropped below (→ removed → client clears). See docstring.
+        ttl_on = ttl is not None and ttl > 0 and stamp is not None
+        observed = None
+        if ttl_on:
+            if observed_centers is not None and len(observed_centers) > 0:
+                oc = np.ascontiguousarray(observed_centers, np.float64).reshape(-1, 3)
+                ii = ((uniq >> 42) & 0x1FFFFF) - _KEY_OFF
+                jj = ((uniq >> 21) & 0x1FFFFF) - _KEY_OFF
+                ll = (uniq & 0x1FFFFF) - _KEY_OFF
+                centers = (np.stack([ii, jj, ll], axis=1).astype(np.float64) + 0.5) * self.cube_m
+                r = float(observed_radius) if observed_radius else (self.cube_m * 1.5)
+                d2 = ((centers[:, None, :] - oc[None, :, :]) ** 2).sum(axis=-1)
+                observed = d2.min(axis=1) <= (r * r)
+            else:                       # no camera info → never expire on uncertainty
+                observed = np.ones(uniq.shape[0], dtype=bool)
+
         # A cube's version (CRC) is GEOMETRY-ONLY by default. The colorizer
         # re-projects best-view colour for every vertex each submap, so even a
         # perfectly static surface gets slightly different colours every time — if
@@ -159,7 +199,19 @@ class BlockGrid:
         include_color = os.environ.get("BLOCKMAP_CRC_COLOR", "0") == "1"
         rgb_crc = (rgb_s >> 4) if include_color else None
         occupancy = self.crc_quant_m is not None
-        for kk, s, e in zip(uniq.tolist(), starts.tolist(), ends.tolist()):
+        for idx, (kk, s, e) in enumerate(zip(uniq.tolist(), starts.tolist(), ends.tolist())):
+            if ttl_on:
+                # Observed → fresh; else carry the prior stamp (an unknown cube is new
+                # geometry, integrated near a camera, so treat it as just-seen). Genuinely
+                # new cubes are observed, so we never need a separate "first sight" case.
+                cstamp = stamp if observed[idx] else self.stamps.get(kk, stamp)
+                # Retain the stamp even when expired so removal is STICKY: a stale cube
+                # stays known-and-stale next submap instead of looking new and flickering
+                # back in. It's only forgotten once it leaves the surface entirely (not in
+                # uniq) or is re-observed (stamp refreshed).
+                new_stamps[kk] = cstamp
+                if (stamp - cstamp) > ttl:
+                    continue            # stale → omit → reported as `removed` this submap
             cell = fq_s[s:e]
             if occupancy:
                 # OCCUPANCY CRC: hash the SET of occupied grid cells (deduped), so
@@ -176,6 +228,7 @@ class BlockGrid:
                 changed.append(kk)
         removed = [k for k in self.blocks if k not in new_blocks]
         self.blocks = new_blocks
+        self.stamps = new_stamps if ttl_on else {}
         return changed, removed
 
     def manifest(self) -> Dict[int, int]:

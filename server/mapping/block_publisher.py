@@ -46,12 +46,17 @@ class BlockPublisher:
     def __init__(self, z: zenoh.Session, cube_m: float = bm.DEFAULT_CUBE_M,
                  server_prefix: str = "server/prism",
                  quant_bits: int = bm.DRACO_QUANT_BITS, level: int = bm.DRACO_LEVEL,
-                 crc_quant_m: float | None = bm.DEFAULT_CRC_QUANT_M):
+                 crc_quant_m: float | None = bm.DEFAULT_CRC_QUANT_M,
+                 ttl_submaps: int = 0, ttl_radius_m: float | None = None):
         self._z = z
         self._grid = bm.BlockGrid(cube_m, crc_quant_m=crc_quant_m)
         self._lock = threading.Lock()
         self._quant_bits = quant_bits
         self._level = level
+        # Observation-TTL (nav sliding map): drop cubes not re-observed within
+        # ttl_submaps → they leave the manifest/push as `removed` → client clears them.
+        self._ttl_submaps = int(ttl_submaps)
+        self._ttl_radius_m = float(ttl_radius_m) if ttl_radius_m else None
         k = proto.keys(server_prefix=server_prefix)
         self._k_manifest = k["pcd_manifest"]
         self._k_blocks = k["pcd_blocks"]
@@ -70,12 +75,17 @@ class BlockPublisher:
                  f"crc_quant={'%.3fm' % crc_quant_m if crc_quant_m else 'legacy 1mm'}  "
                  f"draco q{quant_bits}/L{level}  push_cap={PUSH_MAX_CUBES}")
 
-    def ingest_and_publish(self, xyz, rgb, map_version: int = 0):
+    def ingest_and_publish(self, xyz, rgb, map_version: int = 0, observed_centers=None):
         """Rebuild the grid from the full cloud, publish the manifest, and push the
         changed+removed cubes (unless the changeset is too large).
+
+        ``observed_centers`` = this submap's camera positions; with the observation-TTL
+        enabled, cubes far from them age out and are reported as ``removed``.
         Returns (n_changed, n_removed, n_cubes, manifest_bytes, push_bytes)."""
         with self._lock:
-            changed, removed = self._grid.ingest(xyz, rgb)
+            changed, removed = self._grid.ingest(
+                xyz, rgb, stamp=map_version, observed_centers=observed_centers,
+                observed_radius=self._ttl_radius_m, ttl=self._ttl_submaps)
             man = self._grid.manifest()
             # Collect the changed cubes' geometry while we hold the lock + the grid
             # state that produced this manifest (so manifest and push never disagree).
