@@ -333,11 +333,18 @@ def unpack_trajectory(buf: bytes) -> np.ndarray:
 #   44      12     float32[3]    linear  velocity   (m/s, map frame)
 #   56      12     float32[3]    angular velocity   (rad/s, body frame)
 #   68      4      int32         fix_quality (FIX_DEADRECKON / FIX_CORRECTED)
-#   → 72 bytes, fixed size.
+#   72      12     float32[3]    linear acceleration (m/s², map frame)  [v2, appended]
+#   → 84 bytes. The accel is APPENDED after the v1 layout so a v1 reader (unpack_from,
+#     72 B) still parses; a v2 reader fills accel with zeros for a legacy 72-B buffer.
+#     It lets the client extrapolate at CONSTANT ACCELERATION (vs constant velocity) to
+#     mask network latency through accel/braking without rubber-banding.
 #
-_POSE_FMT = "!iqi" + "3f" + "4f" + "3f" + "3f" + "i"
+_POSE_FMT_V1 = "!iqi" + "3f" + "4f" + "3f" + "3f" + "i"
+_POSE_SIZE_V1 = struct.calcsize(_POSE_FMT_V1)
+assert _POSE_SIZE_V1 == 72, _POSE_SIZE_V1
+_POSE_FMT = _POSE_FMT_V1 + "3f"                  # v2: + linear_acceleration
 _POSE_SIZE = struct.calcsize(_POSE_FMT)
-assert _POSE_SIZE == 72, _POSE_SIZE
+assert _POSE_SIZE == 84, _POSE_SIZE
 
 
 @dataclass
@@ -349,6 +356,8 @@ class PoseState:
     angular_velocity: np.ndarray  # (3,)
     seq: int = 0
     fix_quality: int = FIX_DEADRECKON
+    linear_acceleration: np.ndarray = field(  # (3,) m/s², map frame (v2)
+        default_factory=lambda: np.zeros(3, dtype=np.float32))
 
 
 def pack_pose(p: PoseState) -> bytes:
@@ -356,16 +365,20 @@ def pack_pose(p: PoseState) -> bytes:
     quat = np.asarray(p.quaternion, dtype=np.float64).reshape(4)
     lin = np.asarray(p.linear_velocity, dtype=np.float64).reshape(3)
     ang = np.asarray(p.angular_velocity, dtype=np.float64).reshape(3)
+    acc = np.asarray(p.linear_acceleration, dtype=np.float64).reshape(3)
     return struct.pack(_POSE_FMT, MAGIC_POSE, int(p.timestamp_ns), int(p.seq),
-                       *pos, *quat, *lin, *ang, int(p.fix_quality))
+                       *pos, *quat, *lin, *ang, int(p.fix_quality), *acc)
 
 
 def unpack_pose(buf: bytes) -> PoseState:
-    if len(buf) < _POSE_SIZE:
+    if len(buf) < _POSE_SIZE_V1:
         raise ProtocolError("pose buffer too short")
-    vals = struct.unpack_from(_POSE_FMT, buf, 0)
+    vals = struct.unpack_from(_POSE_FMT_V1, buf, 0)
     if vals[0] != MAGIC_POSE:
         raise ProtocolError(f"bad pose magic 0x{vals[0] & 0xFFFFFFFF:08X}")
+    # v2 acceleration is appended; a legacy 72-byte buffer simply has none → zeros.
+    acc = (np.array(struct.unpack_from("!3f", buf, _POSE_SIZE_V1), dtype=np.float32)
+           if len(buf) >= _POSE_SIZE else np.zeros(3, dtype=np.float32))
     return PoseState(
         timestamp_ns=vals[1],
         seq=vals[2],
@@ -374,6 +387,7 @@ def unpack_pose(buf: bytes) -> PoseState:
         linear_velocity=np.array(vals[10:13], dtype=np.float32),
         angular_velocity=np.array(vals[13:16], dtype=np.float32),
         fix_quality=vals[16],
+        linear_acceleration=acc,
     )
 
 

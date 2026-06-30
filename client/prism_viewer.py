@@ -81,6 +81,18 @@ POSE_LOOKAHEAD_S = float(os.environ.get("POSE_LOOKAHEAD_S", "0.0"))
 # pose inter-arrival jitter. 0 = pure extrapolation (old behaviour). Net visual lag
 # ≈ POSE_RENDER_DELAY_S − POSE_LOOKAHEAD_S.
 POSE_RENDER_DELAY_S = float(os.environ.get("POSE_RENDER_DELAY_S", "0.10"))
+# ── Low-latency ADAPTIVE rendering ───────────────────────────────────────────
+# The render delay is no longer fixed: it tracks measured inter-arrival JITTER, so on
+# a clean link it shrinks toward MIN (extrapolate to ~now → lowest latency) and on a
+# bursty link it grows toward MAX (stay inside the buffer → interpolate → smooth).
+# POSE_RENDER_DELAY_S above is the fallback used only if ADAPTIVE is off.
+POSE_ADAPTIVE        = os.environ.get("POSE_ADAPTIVE", "1") == "1"
+POSE_RENDER_DELAY_MIN = float(os.environ.get("POSE_RENDER_DELAY_MIN_S", "0.0"))
+POSE_RENDER_DELAY_MAX = float(os.environ.get("POSE_RENDER_DELAY_MAX_S", "0.15"))
+POSE_JITTER_K         = float(os.environ.get("POSE_JITTER_K", "3.0"))
+# Cap on the constant-ACCELERATION extrapolation horizon (s): beyond this the avatar
+# coasts at constant velocity, so a long stall or a bad accel can't fling it away.
+POSE_EXTRAP_MAX_S     = float(os.environ.get("POSE_EXTRAP_MAX_S", "0.30"))
 CLOUD_MAX_M   = float(os.environ.get("CLOUD_MAX_M", "50.0"))
 PT_SIZE       = float(os.environ.get("PCD_POINT_SIZE", "6.0"))
 PT_SIZE_MAX   = float(os.environ.get("PCD_POINT_SIZE_MAX", "40.0"))
@@ -205,6 +217,7 @@ class PosePredictor:
         self._buf = deque(maxlen=128)     # (recv_monotonic, pose), time-ordered
         self._have = False
         self._dt_ema = 0.0
+        self._jitter_ema = 0.0          # EMA of |inter-arrival − mean| → adaptive delay
         self._e2e_ms = float("nan")
         self._disp_pos = np.zeros(3)
         self._disp_quat = quat_identity()
@@ -214,7 +227,10 @@ class PosePredictor:
             now = time.monotonic()
             if self._buf:
                 dt = now - self._buf[-1][0]
+                dev = abs(dt - self._dt_ema) if self._dt_ema > 0 else 0.0
                 self._dt_ema = dt if self._dt_ema == 0 else 0.9 * self._dt_ema + 0.1 * dt
+                self._jitter_ema = (dev if self._jitter_ema == 0
+                                    else 0.9 * self._jitter_ema + 0.1 * dev)
             self._e2e_ms = (time.time_ns() - pose.timestamp_ns) * 1e-6
             self._buf.append((now, pose))
             if not self._have:
@@ -229,13 +245,19 @@ class PosePredictor:
         buf = self._buf
         newest_recv, newest = buf[-1]
         if t >= newest_recv or len(buf) == 1:
-            # buffer dry / disconnected → velocity extrapolation with decay
+            # ahead of the buffer → CONSTANT-ACCELERATION extrapolation with decay.
+            # p(h) = p₀ + v·h + ½·a·h²  (a = streamed world accel) — tracks accel/braking
+            # far better than constant velocity. h is capped so a stall/bad accel can't
+            # fling the avatar; velocity+accel fade to 0 as the stream goes stale.
             age = time.monotonic() - newest_recv
-            horizon = (t - newest_recv) + POSE_LOOKAHEAD_S
+            horizon = min((t - newest_recv) + POSE_LOOKAHEAD_S, POSE_EXTRAP_MAX_S)
             scale = 1.0 if age <= STALE_S else max(0.0, 1.0 - (age - STALE_S) / max(DECAY_S, 1e-3))
             pos, quat = integrate_pose(newest.position, newest.quaternion,
                                        newest.linear_velocity * scale,
                                        newest.angular_velocity * scale, horizon)
+            acc = np.asarray(getattr(newest, "linear_acceleration", np.zeros(3)),
+                             dtype=np.float64).reshape(3)
+            pos = pos + 0.5 * acc * scale * (horizon * horizon)
             return pos, quat, newest.fix_quality
         # interpolate between the two samples bracketing t (scan from the recent end)
         for i in range(len(buf) - 1, 0, -1):
@@ -249,11 +271,20 @@ class PosePredictor:
         r0, p0 = buf[0]                    # t older than the whole buffer → oldest
         return p0.position, p0.quaternion, p0.fix_quality
 
+    def _render_delay(self):
+        """Adaptive render delay: ~0 on a smooth link (extrapolate to ~now → lowest
+        latency), growing with measured inter-arrival jitter so a bursty link falls
+        back inside the buffer (interpolate → smooth). Fixed value if POSE_ADAPTIVE=0."""
+        if not POSE_ADAPTIVE:
+            return POSE_RENDER_DELAY_S
+        return float(np.clip(POSE_JITTER_K * self._jitter_ema,
+                             POSE_RENDER_DELAY_MIN, POSE_RENDER_DELAY_MAX))
+
     def step(self, dt_render):
         with self._lock:
             if not self._have:
                 return None
-            t = time.monotonic() - POSE_RENDER_DELAY_S
+            t = time.monotonic() - self._render_delay()
             tgt_pos, tgt_quat, fix = self._target_at(t)
             # light critically-damped smoothing to absorb segment-boundary kinks
             alpha = 1.0 - np.exp(-dt_render / max(SMOOTH_TAU, 1e-3))

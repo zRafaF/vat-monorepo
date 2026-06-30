@@ -547,7 +547,10 @@ class LowStateTracker:
         # odometry fields (for the fuser's dead-reckoner)
         self._imu_quat = quat_identity()    # body attitude, xyzw
         self._gyro = np.zeros(3)            # body angular rate, rad/s
-        self._body_vx = 0.0                 # wheel-odometry forward speed, m/s
+        self._accel = np.array([0.0, 0.0, 9.81])  # body specific force, m/s² (rest = +g up)
+        self._body_vx = 0.0                 # contact-selected wheel forward speed, m/s
+        self._body_wz = 0.0                 # yaw rate from wheel differential, rad/s
+        self._n_contact = 4                 # wheels currently in ground contact
         self._decode = self._build_decoder()
         self._logged_failure = False
 
@@ -586,16 +589,41 @@ class LowStateTracker:
             imu_quat = quat_normalize(
                 np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]]))   # wxyz→xyzw
             gyro = np.asarray(msg.imu_state.gyroscope, dtype=np.float64).reshape(3)
-            # mean wheel angular velocity × radius → forward ground speed; the
-            # wheels are non-holonomic so lateral speed is taken as ~0.
-            wheel_dq = [float(ms[i].dq) for i in WHEEL_IDX if i < len(ms)]
-            body_vx = (float(np.mean(wheel_dq)) * WHEEL_RADIUS) if wheel_dq else 0.0
+            accel = np.asarray(msg.imu_state.accelerometer, dtype=np.float64).reshape(3)
+            # Per-wheel ground speed (dq × radius). LEG/CONTACT ODOMETRY: trust only
+            # wheels whose foot is in ground contact (foot_force above threshold), so a
+            # lifted or unloaded (slipping) wheel doesn't corrupt the body speed. The
+            # 360° robot's wheels are normally all planted; this mainly rejects the
+            # transient slip during hard accel/turns that fooled the old mean-of-4.
+            v_wheel = [float(ms[i].dq) * WHEEL_RADIUS for i in WHEEL_IDX if i < len(ms)]
+            try:
+                ff = [float(x) for x in msg.foot_force]
+            except Exception:
+                ff = []
+            thresh = float(os.environ.get("FOOT_CONTACT_FORCE", "12.0"))
+            contact = [(ff[i] > thresh) if i < len(ff) else True for i in range(len(v_wheel))]
+            sel = [v for v, c in zip(v_wheel, contact) if c] or v_wheel
+            body_vx = float(np.mean(sel)) if sel else 0.0
+            # Yaw rate from L/R wheel differential (FR,FL,RR,RL → right={0,2}, left={1,3}),
+            # a cheap cross-check on the gyro. track ~ 2*|hip_y| from leg FK; fall back const.
+            try:
+                hy = abs(legs[LEG_ORDER[0]]["hip"][1]); track = max(2.0 * hy, 0.15)
+            except Exception:
+                track = float(os.environ.get("WHEEL_TRACK_M", "0.30"))
+            if len(v_wheel) == 4:
+                v_right = 0.5 * (v_wheel[0] + v_wheel[2]); v_left = 0.5 * (v_wheel[1] + v_wheel[3])
+                body_wz = (v_right - v_left) / max(track, 1e-3)
+            else:
+                body_wz = float(gyro[2])
             with self._lock:
                 self._legs = legs
                 self._q = q
                 self._imu_quat = imu_quat
                 self._gyro = gyro
+                self._accel = accel
                 self._body_vx = body_vx
+                self._body_wz = body_wz
+                self._n_contact = int(sum(1 for c in contact if c))
                 self._valid = True
                 self._stamp_ns = time.time_ns()
         except Exception as e:
@@ -610,10 +638,20 @@ class LowStateTracker:
             return dict(self._legs), self._valid
 
     def get_odom(self):
-        """Returns (imu_quat_xyzw, gyro_body, body_vx, valid) for the fuser."""
+        """Returns (imu_quat_xyzw, gyro_body, body_vx, valid) for the fuser (legacy
+        wheel+IMU estimator)."""
         with self._lock:
             return (self._imu_quat.copy(), self._gyro.copy(),
                     self._body_vx, self._valid)
+
+    def get_imu_odom(self):
+        """Richer odometry for the GTSAM backend:
+        (imu_quat_xyzw, gyro_body(3), accel_body(3), body_vx, body_wz, n_contact, valid).
+        ``accel_body`` is the IMU specific force (m/s², ~+g up at rest); ``body_vx`` is
+        contact-selected wheel speed; ``body_wz`` the wheel-differential yaw rate."""
+        with self._lock:
+            return (self._imu_quat.copy(), self._gyro.copy(), self._accel.copy(),
+                    self._body_vx, self._body_wz, self._n_contact, self._valid)
 
     def get_joints(self):
         """Returns (q12, imu_quat_xyzw, valid): the 12 leg joint angles in

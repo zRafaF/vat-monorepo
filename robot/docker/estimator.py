@@ -124,8 +124,12 @@ class WheelInertialEstimator:
     # -- high-rate prediction -------------------------------------------------
     def predict(self, imu_quat: np.ndarray, gyro: np.ndarray,
                 body_vx: float, valid: bool, dt: float,
-                body_vy: float = 0.0, now_ns: int | None = None):
+                body_vy: float = 0.0, now_ns: int | None = None,
+                accel=None, body_wz: float | None = None):
         """Advance the state by ``dt`` from one /lowstate sample.
+
+        ``accel`` / ``body_wz`` are accepted for a uniform call with the GTSAM backend
+        and ignored here (this estimator is wheel+gyro only).
 
         ``imu_quat`` (xyzw) and ``gyro`` (rad/s, body) are the IMU attitude and
         rate; ``body_vx``/``body_vy`` are the wheel-odometry body velocity (m/s).
@@ -268,6 +272,25 @@ class WheelInertialEstimator:
     @property
     def world_vel(self):
         return self.state()[2]
+
+
+def make_estimator(att_gain: float = 0.08, pos_gain: float = 0.5,
+                   rot_gain: float = 0.5):
+    """Backend factory (POSE_BACKEND): 'gtsam' → GTSAM IMU-preintegration smoother
+    (best quality; needs the gtsam wheel); 'graph'/'blend' → the NumPy
+    WheelInertialEstimator. If GTSAM import/construction fails we fall back to the NumPy
+    estimator so the pose path never stops. Returns (estimator, note)."""
+    backend = os.environ.get("POSE_BACKEND", "graph").strip().lower()
+    if backend == "gtsam":
+        try:
+            from gtsam_estimator import GTSAMImuEstimator
+            est = GTSAMImuEstimator(pos_gain=pos_gain, rot_gain=rot_gain)
+            return est, est.backend_note
+        except Exception as e:
+            print(f"[Estimator] GTSAM backend unavailable ({e}); "
+                  f"falling back to WheelInertialEstimator")
+    est = WheelInertialEstimator(att_gain=att_gain, pos_gain=pos_gain, rot_gain=rot_gain)
+    return est, est.backend_note
 
 
 # ─────────────────────────────────────────────────────────────────────────────

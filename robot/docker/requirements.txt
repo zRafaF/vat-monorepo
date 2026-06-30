@@ -2,3 +2,8 @@ eclipse-zenoh==1.9.0
 numpy>=1.24
 opencv-python-headless>=4.9
 rosbags>=0.10
+# Pose estimator backend (POSE_BACKEND=gtsam): IMU-preintegration fixed-lag smoother.
+# aarch64 wheels exist on PyPI for the Jetson; if the wheel is unavailable for this
+# Python/arch the fuser auto-falls back to the NumPy estimator (POSE_BACKEND=graph),
+# so the container still runs without it.
+gtsam>=4.2; platform_machine == "aarch64" or platform_machine == "x86_64"

@@ -43,7 +43,7 @@ import zenoh
 import vat_protocol as proto
 from vat_protocol import PoseState, FIX_CORRECTED, FIX_DEADRECKON
 from kinematics import build_robot_model, LowStateTracker, RobotStateTracker, Transform
-from estimator import WheelInertialEstimator
+from estimator import make_estimator
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -83,9 +83,12 @@ class PoseFuser:
         self._body = RobotStateTracker(
             z, ROBOT_NAME,
             fallback_body_height=float(os.environ.get("FALLBACK_BODY_HEIGHT", "0.30")))
-        self._est = WheelInertialEstimator(att_gain=ATT_GAIN,
-                                           pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
-        log.info(f"[Fuser] correction backend: {self._est.backend_note}")
+        # Backend factory (POSE_BACKEND=gtsam|graph|blend). GTSAM = IMU-preintegration
+        # fixed-lag smoother (fuses the 500 Hz accelerometer + contact-selected wheel
+        # odometry + delayed VGGT); falls back to the NumPy estimator if gtsam is absent.
+        self._est, _note = make_estimator(att_gain=ATT_GAIN,
+                                          pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
+        log.info(f"[Fuser] estimator backend: {_note}")
         self._lock = threading.Lock()
         self._last_pub_ns = time.time_ns()
         self._corrections = 0
@@ -120,24 +123,40 @@ class PoseFuser:
         # stale by (now - capture). Hand both to the estimator so it re-anchors at
         # the right point in its history instead of teleporting the live pose.
         with self._lock:
-            self._est.correct(base_world, capture_ts_ns=c.timestamp_ns, now_ns=now)
-            self._corrections += 1
+            try:
+                self._est.correct(base_world, capture_ts_ns=c.timestamp_ns, now_ns=now)
+                self._corrections += 1
+            except Exception as e:
+                # A failed fuse (e.g. a fix older than the smoother lag) must not stop
+                # the high-rate predict/publish loop — drop this correction and continue.
+                if not getattr(self, "_corr_err_logged", False):
+                    log.warning(f"[Fuser] correction fuse failed ({e}); "
+                                f"dropping this fix, pose path continues")
+                    self._corr_err_logged = True
+                return
         log.debug(f"[Fuser] correction v{c.map_version} lag="
                   f"{(now - c.timestamp_ns) * 1e-9:.2f}s → base "
                   f"{np.round(base_world.translation, 3)}")
 
     def _publish_once(self):
         now = time.time_ns()
-        imu_quat, gyro, body_vx, valid = self._low.get_odom()
+        # Richer odometry: IMU attitude + 500 Hz accelerometer + contact-selected wheel
+        # speed + wheel-differential yaw rate. The legacy estimator ignores accel/body_wz;
+        # the GTSAM backend preintegrates the accel and uses the contact-clean velocity.
+        imu_quat, gyro, accel, body_vx, body_wz, _ncon, valid = self._low.get_imu_odom()
         body = self._body.get()
         with self._lock:
             dt = (now - self._last_pub_ns) * 1e-9
             self._last_pub_ns = now
-            self._est.predict(imu_quat, gyro, body_vx, valid, dt, now_ns=now)
+            self._est.predict(imu_quat, gyro, body_vx, valid, dt, now_ns=now,
+                              accel=accel, body_wz=body_wz)
             self._seq += 1
-            pos, quat, world_vel = self._est.state()
+            st = self._est.state()
+            pos, quat, world_vel = st[0], st[1], st[2]
+            world_acc = st[3] if len(st) > 3 else np.zeros(3)   # GTSAM exposes accel
             # Vertical comes from body height (map floor = Z 0), so the avatar
             # rises/lowers with the dog's stance instead of staying pinned.
+            pos = np.asarray(pos, dtype=np.float64).copy()
             pos[2] = body.body_height
             corrected = (now - self._est.last_correction_ns) < FIX_HOLD_S * 1e9
             fix = FIX_CORRECTED if (self._est.have_vggt and corrected) else FIX_DEADRECKON
@@ -146,9 +165,10 @@ class PoseFuser:
             timestamp_ns=now,
             seq=self._seq,
             position=pos.astype(np.float32),
-            quaternion=quat.astype(np.float32),
-            linear_velocity=world_vel.astype(np.float32),
+            quaternion=np.asarray(quat, dtype=np.float32),
+            linear_velocity=np.asarray(world_vel, dtype=np.float32),
             angular_velocity=np.asarray(gyro, dtype=np.float32),
+            linear_acceleration=np.asarray(world_acc, dtype=np.float32),
             fix_quality=fix,
         )
         try:
