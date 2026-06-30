@@ -70,6 +70,11 @@ CUBE_SIZE = float(os.environ.get("CUBE_SIZE", "1.0"))
 # sync, DECOUPLED from the TSDF voxel — keep the mapper fine (VOXEL_SIZE) for internal
 # quality while streaming coarse to fit the link. = VOXEL_SIZE → no decoupling.
 STREAM_VOXEL_M = float(os.environ.get("STREAM_VOXEL_M", str(VOXEL_SIZE)))
+# How to decimate the streamed cloud (see common/vat_decimate.py):
+#   none | voxel_centroid (default, deterministic, keeps placement) |
+#   voxel_center (deterministic, snapped) | stride (fast, NOT deterministic → CRC churn)
+STREAM_DECIMATE_MODE = os.environ.get("STREAM_DECIMATE_MODE", "voxel_centroid").strip().lower()
+STREAM_STRIDE = int(os.environ.get("STREAM_STRIDE", "3"))   # for stride mode
 # Occupancy-CRC grid (m), tied to the STREAMED density (~½ the stream voxel) so it
 # matches what actually goes on the wire.
 CRC_QUANT_M = float(os.environ.get("CRC_QUANT_M", str(max(STREAM_VOXEL_M, VOXEL_SIZE) * 0.5)))
@@ -112,6 +117,11 @@ PCD_KEYFRAME_EVERY = int(os.environ.get("PCD_KEYFRAME_EVERY", "1"))
 
 # ── Batching / frame-drop recovery ───────────────────────────────────────────
 WINDOW_TIMEOUT_S  = float(os.environ.get("WINDOW_TIMEOUT_S", "5.0"))
+# Backlog guard: if the server falls more than this many frames behind real time
+# (processing slower than capture), drop the stale backlog and resync to the most
+# recent frames so latency self-corrects instead of running away. 0 disables.
+BACKLOG_MAX_FRAMES  = int(os.environ.get("BACKLOG_MAX_FRAMES", "45"))
+BACKLOG_KEEP_FRAMES = int(os.environ.get("BACKLOG_KEEP_FRAMES", "36"))
 MIN_NEW_FRAMES    = int(os.environ.get("MIN_NEW_FRAMES", "1"))
 RETRY_TIMEOUT_S   = float(os.environ.get("RETRY_TIMEOUT_S", "0.3"))
 MAX_RETRIES_CYCLE = int(os.environ.get("MAX_RETRIES_CYCLE", str(WINDOW_SIZE)))

@@ -34,6 +34,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import mapping_config as cfg
 import vat_protocol as proto
 import vat_blockmap as bm
+import vat_decimate
 from block_publisher import BlockPublisher
 from frame_io import build_mask, decode_frame
 from prism_session import OnlinePRISMSession
@@ -307,8 +308,10 @@ class MappingServer:
                 # DECOUPLE stream density from the TSDF voxel: the mapper stays fine
                 # (VOXEL_SIZE) for internal quality, but we voxel-downsample the STREAMED
                 # cloud to STREAM_VOXEL_M (centroid → keeps placement) to fit the link.
-                if cfg.STREAM_VOXEL_M > cfg.VOXEL_SIZE * 1.001:
-                    xyz, rgb = bm.voxel_downsample(xyz, rgb, cfg.STREAM_VOXEL_M)
+                if cfg.STREAM_DECIMATE_MODE != "none":
+                    xyz, rgb = vat_decimate.decimate(
+                        xyz, rgb, mode=cfg.STREAM_DECIMATE_MODE,
+                        voxel=cfg.STREAM_VOXEL_M, stride=cfg.STREAM_STRIDE)
                 # Diff-based block sync from the CURRENT surface → cubes that no
                 # longer have points are REMOVED (no accumulation/ghosting).
                 n_changed, n_removed, n_cubes, man_bytes, push_bytes = \

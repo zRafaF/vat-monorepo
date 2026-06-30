@@ -147,6 +147,36 @@ class OnlinePRISMSession:
             return [s for s in range(lo, hi + 1) if s not in self._frames]
 
     # ── online processing ──────────────────────────────────────────────────
+    def _drop_backlog_if_behind(self) -> bool:
+        """If the server has fallen more than BACKLOG_MAX_FRAMES behind real time
+        (processing slower than capture → growing latency), drop the stale backlog and
+        resync to the most recent frames. Online mode tracks windows by frame INDEX, so
+        shifting the frame base requires an engine reset — this snaps latency back to
+        real time at the cost of a brief map rebuild (the right trade for live teleop)."""
+        cap = cfg.BACKLOG_MAX_FRAMES
+        if cap <= 0:
+            return False
+        with self._lock:
+            if not self._frames:
+                return False
+            seqs = sorted(self._frames)
+            newest = seqs[-1]
+            behind = newest - self._last_processed_seq
+            if behind <= cap:
+                return False
+            keep_from = newest - max(cfg.BACKLOG_KEEP_FRAMES, cfg.WINDOW_SIZE)
+            dropped = [sq for sq in seqs if sq < keep_from]
+            for sq in dropped:
+                del self._frames[sq]
+            self._last_processed_seq = -1
+            n_drop, n_keep = len(dropped), len(self._frames)
+        self.engine.reset()
+        self._prev_world_poses = {}
+        self._world_anchor = np.eye(4)
+        log.warning(f"[PRISM] backlog guard: {behind} frames behind (cap {cap}) → "
+                    f"dropped {n_drop} stale, kept {n_keep}, resync to recent")
+        return True
+
     def _contiguous_prefix(self):
         """Return ``(frames_list, lo, max_seq)`` for the gap-free prefix from the
         smallest buffered seq, so a frame's list index never shifts between calls
@@ -174,6 +204,7 @@ class OnlinePRISMSession:
         Reset (reset=True): rebuild a FRESH map from the recent window, then stream ONE
         result re-anchored into the persistent world frame (so it doesn't rotate/jump and
         the delta stays small). See cfg.PRISM_RESET_EACH_BATCH / RESET_WORLD_ANCHOR."""
+        self._drop_backlog_if_behind()       # latency self-correct if we fell behind
         frames_list, lo, max_seq = self._contiguous_prefix()
         if len(frames_list) < cfg.WINDOW_SIZE:
             return
