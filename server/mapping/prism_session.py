@@ -102,6 +102,10 @@ class OnlinePRISMSession:
         self.engine.keyframe_max_interval_s = cfg.KEYFRAME_MAX_INTERVAL_S
         self.engine.tsdf_decay = cfg.TSDF_DECAY
         self.engine.decay_every_n = cfg.DECAY_EVERY_N
+        # nvblox TSDF prune (nav local map): bound the volume the ESDF is built from to a
+        # sphere around the robot. Also caps the mesh-pull cost → bounds live latency.
+        # 0 = OFF (full accumulation, e.g. for SoTA benchmarks). Supersedes decay when set.
+        self.engine.tsdf_prune_radius = cfg.TSDF_PRUNE_RADIUS_M
         log.info(f"[PRISM] Engine ready ({cfg.summary()}).")
 
         self._frames: dict[int, FrameInput] = {}

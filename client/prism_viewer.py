@@ -291,6 +291,14 @@ class PRISMViewer:
         self._cloud_xyz_raw = None
         self._cloud_rgb_raw = None
         self._ceiling_z = None               # None = OFF (show whole cloud)
+        # ── 3rd-person follow camera ─────────────────────────────────────────
+        # When on, the orbit pivot (camera.center) tracks the robot, smoothed so the
+        # robot's pose jumps/corrections don't jerk the view. Orbit (arrows/mouse) and
+        # zoom (wheel) stay fully manual; pan (w/a/s/d/q/e) shifts a follow OFFSET so
+        # you can frame the robot off-centre and it sticks while following.
+        self._follow = False
+        self._follow_offset = np.zeros(3, dtype=float)   # camera.center - robot, persisted
+        self._follow_tau = float(os.environ.get("FOLLOW_SMOOTH_TAU_S", "0.4"))  # bigger = smoother/laggier
         self._last_tick = time.monotonic()
         # throughput: pose recv bytes (cloud bytes come from BlockSync stats)
         self._pose_bytes = 0
@@ -485,16 +493,18 @@ class PRISMViewer:
         def _pan_key(k):
             cam = self._view.camera
             step = 0.08 * float(getattr(cam, "scale_factor", cam.distance or 8.0))
-            c = np.array(cam.center, dtype=float)
-            if   k == "a": c[0] -= step
-            elif k == "d": c[0] += step
-            elif k == "w": c[1] += step
-            elif k == "s": c[1] -= step
-            elif k == "q": c[2] += step
-            elif k == "e": c[2] -= step
+            d = np.zeros(3, dtype=float)
+            if   k == "a": d[0] -= step
+            elif k == "d": d[0] += step
+            elif k == "w": d[1] += step
+            elif k == "s": d[1] -= step
+            elif k == "q": d[2] += step
+            elif k == "e": d[2] -= step
             else:
                 return False
-            cam.center = tuple(c)
+            cam.center = tuple(np.array(cam.center, dtype=float) + d)
+            if self._follow:
+                self._follow_offset += d        # keep the pan offset while following
             return True
 
         @canvas.events.key_press.connect
@@ -510,6 +520,8 @@ class PRISMViewer:
                 self._reset_map()
             elif k == "f":
                 self._frame_to(self._cloud_xyz_raw)
+            elif k == "t":
+                self._toggle_follow()           # 3rd-person follow on/off
             elif k == ",":
                 self._set_yaw(self._yaw_offset_deg - 5)
             elif k == ".":
@@ -557,6 +569,7 @@ class PRISMViewer:
     @staticmethod
     def _print_controls():
         log.info("[Viewer] keys:  ←/→ orbit · ↑/↓ tilt · W/A/S/D/Q/E pan · scroll/F zoom-fit | "
+                 "T follow robot (3rd-person) | "
                  "1 re-fetch | R reset | U robot mesh/skeleton | , / . yaw | N/M size | C ceiling | [ / ] ceiling∓  "
                  "(mouse: drag orbit, shift+drag pan, scroll zoom)  +  Telemetry window")
 
@@ -617,6 +630,32 @@ class PRISMViewer:
         except Exception as e:
             log.warning(f"[Viewer] frame failed (non-fatal): {e}")
 
+    def _toggle_follow(self):
+        """Toggle 3rd-person follow. On enable, seed the offset from the CURRENT view so
+        the pivot doesn't jump — it keeps your framing and just starts tracking the robot.
+        Orbit + zoom stay manual; pan adjusts the offset (see _pan_key)."""
+        cam = self._view.camera
+        self._follow = not self._follow
+        if self._follow:
+            pos = getattr(self, "_last_pos", None)
+            self._follow_offset = (np.array(cam.center, dtype=float) - np.asarray(pos, dtype=float)
+                                   if pos is not None else np.zeros(3, dtype=float))
+        log.info(f"[Viewer] 3rd-person follow {'ON' if self._follow else 'OFF'} "
+                 f"(press 't' to toggle; orbit/zoom/pan still work)")
+
+    def _follow_camera(self, dt):
+        """Ease the orbit pivot toward robot + offset with frame-rate-independent
+        exponential smoothing (tau seconds), so a jumpy robot pose never jerks the view.
+        Only camera.center moves; azimuth/elevation/distance (orbit + zoom) are untouched."""
+        pos = getattr(self, "_last_pos", None)
+        if pos is None:
+            return
+        cam = self._view.camera
+        target = np.asarray(pos, dtype=float) + self._follow_offset
+        cur = np.array(cam.center, dtype=float)
+        alpha = 1.0 - float(np.exp(-max(dt, 1e-3) / max(self._follow_tau, 1e-3)))
+        cam.center = tuple(cur + alpha * (target - cur))
+
     def _on_tick(self, event):
         now = time.monotonic()
         dt = now - self._last_tick
@@ -644,6 +683,10 @@ class PRISMViewer:
         pred = self._predictor.step(dt)
         if pred is not None:
             self._draw_robot(pred)
+
+        # 3rd-person follow: ease the orbit pivot toward the robot (jump-proof).
+        if self._follow:
+            self._follow_camera(dt)
 
         # Overlays must never kill the render tick (a crash here froze the camera
         # and stopped the robot drawing). Isolate them.

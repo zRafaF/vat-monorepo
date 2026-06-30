@@ -109,6 +109,14 @@ MAP_TTL_SUBMAPS = int(os.environ.get("MAP_TTL_SUBMAPS", "0"))
 # of the submap's camera positions. Defaults to the sensor range (MAX_DEPTH): you can
 # only refresh what the 360° camera could actually see. Empty/0 → MAX_DEPTH.
 MAP_TTL_RADIUS_M = float(os.environ.get("MAP_TTL_RADIUS_M", "0") or 0.0) or MAX_DEPTH
+# nvblox TSDF prune radius (m): clear the nvblox volume outside this sphere around the
+# robot each submap, so the ESDF used for NAVIGATION only reflects a bounded, recent
+# local map — and the mesh-pull cost (the live-latency driver) stays constant as the
+# robot travels. Note this bounds the TSDF itself, so the streamed/viewer surface is
+# also limited to this radius (the viewer shows a moving local bubble). Uses nvblox's
+# native radius-clear if available, else decay+deallocate. Supersedes TSDF_DECAY.
+# 0 = OFF → full accumulation (use 0 for SoTA benchmarks against other methods).
+TSDF_PRUNE_RADIUS_M = float(os.environ.get("TSDF_PRUNE_RADIUS_M", "0") or 0.0)
 # Experimental: rebuild a FRESH map each batch (engine reset=True) over only the
 # most recent RESET_WINDOW_FRAMES frames, instead of accumulating online. Removes
 # cross-batch accumulation/drift (no ghost build-up, no "walking inside walls") but
