@@ -100,6 +100,32 @@ def unpack_cube_key(key: int) -> Tuple[int, int, int]:
     return i - _KEY_OFF, j - _KEY_OFF, k - _KEY_OFF
 
 
+def voxel_downsample(xyz, rgb, voxel: float):
+    """Deterministic stream decimation: one point per ``voxel``-cell, placed at the
+    CENTROID of the points in that cell (NOT the cell centre) so sub-cell placement —
+    edge/thin-feature accuracy from a finer TSDF — is preserved at a coarser density.
+    Colour = per-cell mean. Deterministic ⇒ stable input gives a stable output, so the
+    occupancy-CRC deltas stay small (a stride / 'every other point' decimation would
+    NOT: it changes every batch and breaks the diff)."""
+    xyz = np.ascontiguousarray(xyz, dtype=np.float64).reshape(-1, 3)
+    rgb = np.asarray(rgb).reshape(-1, 3)
+    n = xyz.shape[0]
+    if n == 0 or not voxel or voxel <= 0:
+        return (xyz.astype(np.float32),
+                rgb.astype(np.uint8) if rgb.dtype.kind != "f" else rgb.astype(np.float32))
+    keys = np.floor(xyz / float(voxel)).astype(np.int64)
+    uniq, inv = np.unique(keys, axis=0, return_inverse=True)
+    m = uniq.shape[0]
+    counts = np.bincount(inv, minlength=m).astype(np.float64)
+    csum = np.zeros((m, 3), np.float64); np.add.at(csum, inv, xyz)
+    centroids = (csum / counts[:, None]).astype(np.float32)
+    rsum = np.zeros((m, 3), np.float64); np.add.at(rsum, inv, rgb.astype(np.float64))
+    rmean = rsum / counts[:, None]
+    cols = (rmean.astype(np.float32) if rgb.dtype.kind == "f"
+            else np.clip(np.rint(rmean), 0, 255).astype(np.uint8))
+    return centroids, cols
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Block grid  (canonical, content-versioned)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -492,6 +518,17 @@ def _selftest() -> None:
     changed2, removed2 = g.ingest((centers + jit)[keep], col2[keep])
     assert a_key in removed2 and changed2 == [], (len(changed2), removed2[:3])
     assert len(g.blocks) == n_cubes - 1
+
+    # voxel_downsample: deterministic, coarser density, centroid placement
+    dense = (rng.random((5000, 3)) * 0.5).astype(np.float32)
+    dcol = (rng.random((5000, 3)) * 255).astype(np.uint8)
+    a_xyz, a_rgb = voxel_downsample(dense, dcol, 0.04)
+    b_xyz, b_rgb = voxel_downsample(dense, dcol, 0.04)
+    assert a_xyz.shape[0] < dense.shape[0] and a_xyz.shape == a_rgb.shape
+    assert np.array_equal(a_xyz, b_xyz) and np.array_equal(a_rgb, b_rgb), "must be deterministic"
+    assert a_xyz.shape[0] <= int((0.5 / 0.04 + 2) ** 3)
+    cell_centre = (np.floor(a_xyz / 0.04) + 0.5) * 0.04
+    assert np.all(np.abs(a_xyz - cell_centre) <= 0.04 + 1e-4)   # centroid stays in its cell
 
     man = g.manifest()
     assert unpack_manifest(pack_manifest(man)) == man

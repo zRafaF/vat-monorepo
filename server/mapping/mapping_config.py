@@ -66,7 +66,13 @@ CUBE_SIZE = float(os.environ.get("CUBE_SIZE", "1.0"))
 # ── Streaming stability (online ghost / breathing / bandwidth fixes) ─────────
 # Occupancy-CRC grid for block versioning (m). ~½ voxel so sub-voxel nvblox mesh
 # "breathing" doesn't churn the diff (which used to resend ~every cube each submap).
-CRC_QUANT_M = float(os.environ.get("CRC_QUANT_M", str(VOXEL_SIZE * 0.5)))
+# Stream decimation: the LIVE cloud is voxel-downsampled to this (m) before block
+# sync, DECOUPLED from the TSDF voxel — keep the mapper fine (VOXEL_SIZE) for internal
+# quality while streaming coarse to fit the link. = VOXEL_SIZE → no decoupling.
+STREAM_VOXEL_M = float(os.environ.get("STREAM_VOXEL_M", str(VOXEL_SIZE)))
+# Occupancy-CRC grid (m), tied to the STREAMED density (~½ the stream voxel) so it
+# matches what actually goes on the wire.
+CRC_QUANT_M = float(os.environ.get("CRC_QUANT_M", str(max(STREAM_VOXEL_M, VOXEL_SIZE) * 0.5)))
 # Emit the streamed surface as one point per voxel CENTRE (byte-identical across
 # submaps for unchanged geometry → stable CRCs). 1 = on (recommended online).
 CLOUD_VOXEL_SNAP = os.environ.get("CLOUD_VOXEL_SNAP", "1") == "1"
@@ -142,4 +148,5 @@ def summary() -> str:
     return (f"MODE={_mode} window={WINDOW_SIZE} overlap={OVERLAP} voxel={VOXEL_SIZE} "
             f"face={FACE_SIZE} mode={PROCESSING_MODE} cube={CUBE_SIZE} "
             f"keyframe_every={PCD_KEYFRAME_EVERY} crc_quant={CRC_QUANT_M:.3f} "
-            f"voxel_snap={CLOUD_VOXEL_SNAP} kf_gate={KEYFRAME_MIN_TRANS_M}m/{KEYFRAME_MIN_ROT_DEG}deg")
+            f"voxel_snap={CLOUD_VOXEL_SNAP} stream_voxel={STREAM_VOXEL_M} "
+            f"kf_gate={KEYFRAME_MIN_TRANS_M}m/{KEYFRAME_MIN_ROT_DEG}deg")
