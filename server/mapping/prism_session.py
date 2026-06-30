@@ -90,6 +90,9 @@ class OnlinePRISMSession:
         self.engine.compute_esdf = False
         self.engine.point_cloud_only = True
         self.engine.processing_mode = cfg.PROCESSING_MODE
+        # Rebuild the displayed surface every N submaps (depth still integrates every
+        # submap). Caps the mesh-pull cost that grows with map size → less latency backup.
+        self.engine.mesh_extract_every = cfg.MESH_EXTRACT_EVERY
         # Streaming-stability config (online ghost / breathing / bandwidth fixes):
         #  * voxel-snap → byte-identical unchanged geometry → stable block CRCs;
         #  * keyframe gating → don't re-integrate a static view (breathing/ghosts);
@@ -111,6 +114,11 @@ class OnlinePRISMSession:
         self._prev_world_poses = {}     # {ts_ns:int -> 4x4 world camera pose}
         self._world_anchor = np.eye(4)
         self._salt_db = []      # [{id,ts,desc,pos}] keyframes for revisit detection (v0)
+        # Display-only surface preserved across a backlog resync so the viewer doesn't
+        # blank out while the live (nav) TSDF rebuilds clean. NEVER fed to the TSDF/ESDF,
+        # so no stale geometry leaks into navigation; ages out after a few submaps.
+        self._display_base = None        # (xyz f32 (N,3), rgb u8 (N,3)) or None
+        self._base_hold = 0              # submaps left before the base ages out
 
     # ── frame buffer ─────────────────────────────────────────────────────────
     def reset_map(self):
@@ -119,6 +127,8 @@ class OnlinePRISMSession:
             self._last_processed_seq = -1
             self._prev_world_poses = {}
             self._world_anchor = np.eye(4)
+            self._display_base = None
+            self._base_hold = 0
         self.engine.reset()
         log.info("[PRISM] Map reset — TSDF + colorizer + frame buffer cleared.")
 
@@ -147,12 +157,60 @@ class OnlinePRISMSession:
             return [s for s in range(lo, hi + 1) if s not in self._frames]
 
     # ── online processing ──────────────────────────────────────────────────
+    def _freeze_display_base(self):
+        """Snapshot the current colored TSDF surface as a DISPLAY-ONLY base, held for
+        RESYNC_BASE_HOLD_SUBMAPS submaps, so the viewer keeps far geometry instead of
+        blanking while the live TSDF rebuilds. Voxel-deduped to bound memory. NEVER fed
+        back into the TSDF/ESDF → navigation only ever sees freshly rebuilt geometry.
+
+        NOTE (honest limitation): the rebuilt map starts in a FRESH world frame, and we
+        cannot rigidly re-anchor across a backlog time-skip without relocalization (loop
+        closure, Phase 2). So the held base is a static ghost in the PRE-resync frame and
+        may visibly seam against the new map until it ages out. It is a stopgap for
+        display continuity, not a metric merge — hence display-only + a short hold."""
+        if not cfg.RESYNC_PRESERVE_DISPLAY:
+            self._display_base = None
+            self._base_hold = 0
+            return
+        try:
+            c = self.engine.get_current_cloud()
+            xyz, rgb = c.get("points"), c.get("colors")
+            if xyz is None or xyz.shape[0] == 0:
+                return
+            xyz, rgb = self.engine._voxel_snap(
+                np.asarray(xyz, np.float32), np.asarray(rgb), cfg.STREAM_VOXEL_M)
+            self._display_base = (xyz.astype(np.float32), rgb.astype(np.uint8))
+            self._base_hold = max(1, cfg.RESYNC_BASE_HOLD_SUBMAPS)
+        except Exception:
+            log.debug("[PRISM] display-base freeze failed", exc_info=True)
+            self._display_base, self._base_hold = None, 0
+
+    def _merge_display_base(self, xyz, rgb):
+        """Overlay the frozen display-only base on the live surface (viewer continuity)
+        and age it one submap. No-op once expired/empty. Display only — not part of the
+        metric map handed to navigation."""
+        base = self._display_base
+        if base is None:
+            return xyz, rgb
+        self._base_hold -= 1
+        if self._base_hold <= 0:
+            self._display_base = None          # aged out → live map now covers the area
+        bx, bc = base
+        if xyz is None or xyz.shape[0] == 0:
+            return bx, bc
+        xyz = np.concatenate([np.asarray(xyz, np.float32), bx], axis=0)
+        rgb = np.concatenate([np.asarray(rgb, np.uint8), bc], axis=0)
+        return xyz, rgb
+
     def _drop_backlog_if_behind(self) -> bool:
         """If the server has fallen more than BACKLOG_MAX_FRAMES behind real time
         (processing slower than capture → growing latency), drop the stale backlog and
         resync to the most recent frames. Online mode tracks windows by frame INDEX, so
         shifting the frame base requires an engine reset — this snaps latency back to
-        real time at the cost of a brief map rebuild (the right trade for live teleop)."""
+        real time at the cost of a brief map rebuild (the right trade for live teleop).
+
+        The live (nav) TSDF rebuilds clean; the viewer keeps the last surface as a
+        display-only base (see _freeze_display_base) so it doesn't blank out."""
         cap = cfg.BACKLOG_MAX_FRAMES
         if cap <= 0:
             return False
@@ -170,11 +228,16 @@ class OnlinePRISMSession:
                 del self._frames[sq]
             self._last_processed_seq = -1
             n_drop, n_keep = len(dropped), len(self._frames)
+        # Preserve the last surface for the viewer BEFORE wiping the engine.
+        self._freeze_display_base()
         self.engine.reset()
         self._prev_world_poses = {}
         self._world_anchor = np.eye(4)
+        held = self._display_base[0].shape[0] if self._display_base is not None else 0
         log.warning(f"[PRISM] backlog guard: {behind} frames behind (cap {cap}) → "
-                    f"dropped {n_drop} stale, kept {n_keep}, resync to recent")
+                    f"dropped {n_drop} stale, kept {n_keep}, resync to recent"
+                    + (f"; holding {held} display-only pts for {self._base_hold} submaps"
+                       if held else ""))
         return True
 
     def _contiguous_prefix(self):
@@ -223,6 +286,9 @@ class OnlinePRISMSession:
                 # publish the CURRENT TSDF surface (thin, gradio-style)
                 cloud = self.engine.get_current_cloud()
                 xyz, rgb = cloud["points"], cloud["colors"]
+                # Overlay any frozen display-only base (viewer continuity after a
+                # backlog resync); ages out on its own. Not part of the nav TSDF.
+                xyz, rgb = self._merge_display_base(xyz, rgb)
                 if xyz.shape[0] == 0:
                     continue
                 cam_pose, cam_ts = self._newest_camera_pose()

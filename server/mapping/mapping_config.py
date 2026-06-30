@@ -38,6 +38,10 @@ FACE_SIZE   = int(os.environ.get("FACE_SIZE",    "512"))
 WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE",  "12"))
 OVERLAP     = int(os.environ.get("OVERLAP",      "4"))
 PROCESSING_MODE = os.environ.get("PROCESSING_MODE", "parallel").strip().lower()
+# Mesh extraction cadence: rebuild the displayed surface every N submaps (depth is
+# still integrated every submap). The mesh pull scales with total map size and is a
+# top per-submap cost, so N>1 is the main lever against the long-run latency backup.
+MESH_EXTRACT_EVERY = max(1, int(os.environ.get("MESH_EXTRACT_EVERY", "1")))
 
 
 def _parse_ceiling(raw: str):
@@ -122,6 +126,12 @@ WINDOW_TIMEOUT_S  = float(os.environ.get("WINDOW_TIMEOUT_S", "5.0"))
 # recent frames so latency self-corrects instead of running away. 0 disables.
 BACKLOG_MAX_FRAMES  = int(os.environ.get("BACKLOG_MAX_FRAMES", "45"))
 BACKLOG_KEEP_FRAMES = int(os.environ.get("BACKLOG_KEEP_FRAMES", "36"))
+# Backlog-resync display continuity: on a resync the live (nav) TSDF rebuilds clean,
+# but the viewer keeps the last colored surface as a DISPLAY-ONLY base so it never
+# blanks out. The base never feeds the live TSDF/ESDF (no stale geometry in nav) and
+# ages out after RESYNC_BASE_HOLD_SUBMAPS submaps to avoid a lingering seam.
+RESYNC_PRESERVE_DISPLAY  = os.environ.get("RESYNC_PRESERVE_DISPLAY", "1") == "1"
+RESYNC_BASE_HOLD_SUBMAPS = int(os.environ.get("RESYNC_BASE_HOLD_SUBMAPS", "8"))
 MIN_NEW_FRAMES    = int(os.environ.get("MIN_NEW_FRAMES", "1"))
 RETRY_TIMEOUT_S   = float(os.environ.get("RETRY_TIMEOUT_S", "0.3"))
 MAX_RETRIES_CYCLE = int(os.environ.get("MAX_RETRIES_CYCLE", str(WINDOW_SIZE)))
@@ -156,7 +166,7 @@ def summary() -> str:
     _mode = (f"RESET(win={RESET_WINDOW_FRAMES},anchor={'on' if RESET_WORLD_ANCHOR else 'off'})"
              if PRISM_RESET_EACH_BATCH else f"ONLINE(decay={'on' if TSDF_DECAY else 'off'})")
     return (f"MODE={_mode} window={WINDOW_SIZE} overlap={OVERLAP} voxel={VOXEL_SIZE} "
-            f"face={FACE_SIZE} mode={PROCESSING_MODE} cube={CUBE_SIZE} "
+            f"face={FACE_SIZE} mesh_every={MESH_EXTRACT_EVERY} mode={PROCESSING_MODE} cube={CUBE_SIZE} "
             f"keyframe_every={PCD_KEYFRAME_EVERY} crc_quant={CRC_QUANT_M:.3f} "
             f"voxel_snap={CLOUD_VOXEL_SNAP} stream_voxel={STREAM_VOXEL_M} "
             f"kf_gate={KEYFRAME_MIN_TRANS_M}m/{KEYFRAME_MIN_ROT_DEG}deg")
