@@ -43,7 +43,11 @@ import zenoh
 import vat_protocol as proto
 from vat_protocol import PoseState, FIX_CORRECTED, FIX_DEADRECKON
 from kinematics import build_robot_model, LowStateTracker, RobotStateTracker, Transform
-from estimator import make_estimator
+# NumPy wheel+IMU estimator (the proven default). The GTSAM IMU-preintegration backend
+# (estimator.make_estimator / gtsam_estimator.py) stays in the tree as experimental —
+# it was reverted here because its fixed-lag solve stalls the 50 Hz loop on the Jetson
+# (high pose latency). Re-wire it via make_estimator once tuned with the replay harness.
+from estimator import WheelInertialEstimator
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -83,12 +87,9 @@ class PoseFuser:
         self._body = RobotStateTracker(
             z, ROBOT_NAME,
             fallback_body_height=float(os.environ.get("FALLBACK_BODY_HEIGHT", "0.30")))
-        # Backend factory (POSE_BACKEND=gtsam|graph|blend). GTSAM = IMU-preintegration
-        # fixed-lag smoother (fuses the 500 Hz accelerometer + contact-selected wheel
-        # odometry + delayed VGGT); falls back to the NumPy estimator if gtsam is absent.
-        self._est, _note = make_estimator(att_gain=ATT_GAIN,
-                                          pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
-        log.info(f"[Fuser] estimator backend: {_note}")
+        self._est = WheelInertialEstimator(att_gain=ATT_GAIN,
+                                           pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
+        log.info(f"[Fuser] estimator backend: {self._est.backend_note}")
         self._lock = threading.Lock()
         self._last_pub_ns = time.time_ns()
         self._corrections = 0
@@ -140,35 +141,31 @@ class PoseFuser:
 
     def _publish_once(self):
         now = time.time_ns()
-        # Richer odometry: IMU attitude + 500 Hz accelerometer + contact-selected wheel
-        # speed + wheel-differential yaw rate. The legacy estimator ignores accel/body_wz;
-        # the GTSAM backend preintegrates the accel and uses the contact-clean velocity.
-        imu_quat, gyro, accel, body_vx, body_wz, _ncon, valid = self._low.get_imu_odom()
+        imu_quat, gyro, body_vx, valid = self._low.get_odom()
         body = self._body.get()
         with self._lock:
             dt = (now - self._last_pub_ns) * 1e-9
             self._last_pub_ns = now
-            self._est.predict(imu_quat, gyro, body_vx, valid, dt, now_ns=now,
-                              accel=accel, body_wz=body_wz)
+            self._est.predict(imu_quat, gyro, body_vx, valid, dt, now_ns=now)
             self._seq += 1
-            st = self._est.state()
-            pos, quat, world_vel = st[0], st[1], st[2]
-            world_acc = st[3] if len(st) > 3 else np.zeros(3)   # GTSAM exposes accel
+            pos, quat, world_vel = self._est.state()
             # Vertical comes from body height (map floor = Z 0), so the avatar
             # rises/lowers with the dog's stance instead of staying pinned.
-            pos = np.asarray(pos, dtype=np.float64).copy()
             pos[2] = body.body_height
             corrected = (now - self._est.last_correction_ns) < FIX_HOLD_S * 1e9
             fix = FIX_CORRECTED if (self._est.have_vggt and corrected) else FIX_DEADRECKON
 
+        # linear_acceleration left at its zero default → the client extrapolator degrades
+        # to constant-velocity (exactly the previous behaviour) while keeping the new
+        # low-latency adaptive render delay. Populate it again if a backend that estimates
+        # world accel is re-enabled.
         pose = PoseState(
             timestamp_ns=now,
             seq=self._seq,
             position=pos.astype(np.float32),
-            quaternion=np.asarray(quat, dtype=np.float32),
-            linear_velocity=np.asarray(world_vel, dtype=np.float32),
+            quaternion=quat.astype(np.float32),
+            linear_velocity=world_vel.astype(np.float32),
             angular_velocity=np.asarray(gyro, dtype=np.float32),
-            linear_acceleration=np.asarray(world_acc, dtype=np.float32),
             fix_quality=fix,
         )
         try:
