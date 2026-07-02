@@ -77,6 +77,7 @@ class OnlinePRISMSession:
         self.engine.point_cloud_only = True
         self.engine.processing_mode = cfg.PROCESSING_MODE
         self.engine.soft_reset = cfg.SOFT_RESET
+        self.engine.reset_extract_last_only = cfg.RESET_EXTRACT_LAST_ONLY
         # Streaming-stability config (voxel-snap for byte-identical unchanged geometry;
         # keyframe gating so a static view isn't re-integrated; decay only matters for
         # the deprecated online path — reset mode never accumulates, so nothing to carve).
@@ -152,9 +153,27 @@ class OnlinePRISMSession:
 
     def _process_reset(self, frames_list, max_seq):
         """Reset mode: rebuild from only the most recent frames, re-anchor the fresh
-        cloud + poses into the persistent world frame, and yield ONE result."""
-        if cfg.RESET_WINDOW_FRAMES > 0 and len(frames_list) > cfg.RESET_WINDOW_FRAMES:
-            frames_list = frames_list[-cfg.RESET_WINDOW_FRAMES:]
+        cloud + poses into the persistent world frame, and yield ONE result.
+
+        The window start is snapped to the sliding-window STRIDE grid (window_size -
+        overlap) in absolute-seq space. That makes each batch's window groupings land on
+        the SAME absolute frames as the previous batch's (shifted by whole strides), so
+        the engine's perception cache — keyed by frame identity — actually HITS and only
+        the newest window is re-inferred instead of re-running VGGT over the whole window
+        (the "7 ran / 0 cached" → ~1 ran). Cost: the newest up-to-(stride-1) frames wait
+        for the next batch. max_seq is the newest buffered seq; frames_list covers
+        [lo .. max_seq] contiguously."""
+        stride = max(1, cfg.WINDOW_SIZE - cfg.OVERLAP)
+        n = len(frames_list)
+        lo = max_seq - n + 1                       # absolute seq of frames_list[0]
+        want = cfg.RESET_WINDOW_FRAMES if cfg.RESET_WINDOW_FRAMES > 0 else n
+        want = max(want, cfg.WINDOW_SIZE)
+        raw_start = max_seq - want + 1             # newest-anchored desired start
+        start = raw_start - (raw_start % stride)   # snap DOWN to the stride grid (stable)
+        if start < lo:
+            start = lo
+        if start > lo:
+            frames_list = frames_list[start - lo:]
         _h0 = getattr(self.engine, "_perc_hits", 0)
         _m0 = getattr(self.engine, "_perc_misses", 0)
         last_traj = None

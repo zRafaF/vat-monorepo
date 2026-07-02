@@ -138,7 +138,16 @@ TSDF_PRUNE_RADIUS_M = float(os.environ.get("TSDF_PRUNE_RADIUS_M", "0") or 0.0)
 # Reset is done IN PLACE via mapper.clear() (see SOFT_RESET) so it is cheap.
 # 0 = DEPRECATED online-accumulate path (kept behind the flag for A/B on the rig).
 PRISM_RESET_EACH_BATCH = os.environ.get("PRISM_RESET_EACH_BATCH", "1") == "1"
-RESET_WINDOW_FRAMES = int(os.environ.get("RESET_WINDOW_FRAMES", "60"))
+# Frames rebuilt each reset batch. Favor-latency default = 20 = WINDOW_SIZE + one stride
+# (12 + 8) → exactly 2 sliding windows, so a batch re-integrates only ~2 windows and (with
+# the stride-aligned perception cache) re-infers only the newest one. Larger = more area
+# shown but more per-batch reprocessing (60 ≈ 7 windows ≈ the ~10s batches we're cutting).
+# Best set to WINDOW_SIZE + k*(WINDOW_SIZE-OVERLAP) so windows tile the frames exactly.
+RESET_WINDOW_FRAMES = int(os.environ.get("RESET_WINDOW_FRAMES", "20"))
+# Reset mode: extract + colour the mesh ONCE on the last window (integrate-only on the
+# intermediate windows), colouring from all accumulated keyframes. Cuts redundant mesh
+# pulls/colouring. 0 = extract every window (old behaviour). See engine.reset_extract_last_only.
+RESET_EXTRACT_LAST_ONLY = os.environ.get("RESET_EXTRACT_LAST_ONLY", "1") == "1"
 # Soft reset: wipe the nvblox volume + color cache IN PLACE (mapper.clear()) on each
 # per-batch reset instead of reconstructing the Mapper (CUDA re-alloc + block-hash
 # regrow — the reset-latency cost). 1 = on (recommended). 0 = full reconstruct.

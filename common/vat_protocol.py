@@ -190,7 +190,16 @@ _QMAX = 65535.0
 
 
 def _rgb_to_u8(rgb: np.ndarray) -> bytes:
-    u = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+    """Pack RGB to uint8 bytes. Accepts EITHER float in [0,1] OR uint8/int in [0,255]
+    (auto-detected): integer dtype, or any value > 1, is treated as [0,255]. This makes
+    pack_pcd robust to callers that pass nvblox's native uint8 colors (the "all white"
+    bug: [0,255] floats were being clipped to 1 → 255 → white)."""
+    a = np.asarray(rgb)
+    is_255 = np.issubdtype(a.dtype, np.integer) or (a.size and float(np.nanmax(a)) > 1.0)
+    if is_255:
+        u = np.clip(a.astype(np.float32), 0.0, 255.0)
+        return np.ascontiguousarray((u + 0.5).astype(np.uint8)).tobytes()
+    u = np.clip(a.astype(np.float32), 0.0, 1.0)
     return np.ascontiguousarray((u * 255.0 + 0.5).astype(np.uint8)).tobytes()
 
 
