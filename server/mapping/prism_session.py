@@ -187,6 +187,15 @@ class OnlinePRISMSession:
             self._buffer.mark_processed(max_seq)
             return
 
+        # Reset mode: the metric scale is fully determined once this batch's window is
+        # built (it scaled the geometry we're about to ship). The cross-window scale
+        # warm-up (SCALE_WARMUP_WINDOWS) is meant for the long ONLINE run; a short reset
+        # window would never reach it, leaving _scale_committed=False forever — which
+        # makes the PoseCorrectionGate suppress EVERY correction (the robot then never
+        # gets its VGGT pose). So mark the scale committed at the end of each reset batch.
+        if not getattr(self.engine, "_scale_committed", False):
+            self.engine._scale_committed = True
+
         cloud = self.engine.get_current_cloud()
         xyz, rgb = cloud["points"], cloud["colors"]
         ts_arr, poses = self.engine.get_poses()

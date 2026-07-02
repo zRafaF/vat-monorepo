@@ -35,8 +35,8 @@ WEIGHTS_PATH = os.environ.get(
 VOXEL_SIZE  = float(os.environ.get("VOXEL_SIZE", "0.03"))
 MAX_DEPTH   = float(os.environ.get("MAX_DEPTH",  "4.5"))
 FACE_SIZE   = int(os.environ.get("FACE_SIZE",    "512"))
-WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE",  "12"))
-OVERLAP     = int(os.environ.get("OVERLAP",      "4"))
+WINDOW_SIZE = int(os.environ.get("WINDOW_SIZE",  "9"))
+OVERLAP     = int(os.environ.get("OVERLAP",      "3"))
 PROCESSING_MODE = os.environ.get("PROCESSING_MODE", "parallel").strip().lower()
 
 
@@ -81,7 +81,7 @@ CUBE_SIZE = float(os.environ.get("CUBE_SIZE", "1.0"))
 # for reconstruction quality while streaming COARSER to fit the link and keep the
 # per-submap snapshot small. Default 5cm ≈ ⅓ fewer points than the 3cm map for a
 # barely-visible quality drop. Set = VOXEL_SIZE for no decoupling (finest stream).
-STREAM_VOXEL_M = float(os.environ.get("STREAM_VOXEL_M", "0.05"))
+STREAM_VOXEL_M = float(os.environ.get("STREAM_VOXEL_M", "0.06"))
 # How to decimate the streamed cloud (see common/vat_decimate.py):
 #   none | voxel_centroid (default, deterministic, keeps placement) |
 #   voxel_center (deterministic, snapped) | stride (fast, NOT deterministic → CRC churn)
@@ -143,7 +143,8 @@ PRISM_RESET_EACH_BATCH = os.environ.get("PRISM_RESET_EACH_BATCH", "1") == "1"
 # the stride-aligned perception cache) re-infers only the newest one. Larger = more area
 # shown but more per-batch reprocessing (60 ≈ 7 windows ≈ the ~10s batches we're cutting).
 # Best set to WINDOW_SIZE + k*(WINDOW_SIZE-OVERLAP) so windows tile the frames exactly.
-RESET_WINDOW_FRAMES = int(os.environ.get("RESET_WINDOW_FRAMES", "20"))
+# Default 15 = 9 + 1*6 → 2 windows with WINDOW_SIZE=9, OVERLAP=3 (stride 6).
+RESET_WINDOW_FRAMES = int(os.environ.get("RESET_WINDOW_FRAMES", "15"))
 # Reset mode: extract + colour the mesh ONCE on the last window (integrate-only on the
 # intermediate windows), colouring from all accumulated keyframes. Cuts redundant mesh
 # pulls/colouring. 0 = extract every window (old behaviour). See engine.reset_extract_last_only.
