@@ -175,17 +175,6 @@ test_link: sync-client
 	@echo ">> Reminder: 'make router' (SERVER) + robot bridge must be running."
 	$(CLIENT_RUN) ../tools/check_link.py
 
-# Latency benchmark — separate WiFi/medium from zenoh/processing.
-# 1) On the target host (ROBOT for the pose path): make probe-responder NAME=robot
-# 2) From the client:                              make latency TARGET=<target-ip> NAME=robot
-probe-responder: sync-client
-	@echo ">> echo responder (run this ON the target host: robot or server)"
-	PROBE_NAME=$(or $(NAME),server) $(CLIENT_RUN) ../tools/probe_responder.py
-
-latency: sync-client
-	@echo ">> measuring medium (ICMP) vs zenoh RTT — start 'make probe-responder NAME=$(or $(NAME),server)' on the target first."
-	TARGET_IP=$(TARGET) PROBE_NAME=$(or $(NAME),server) $(CLIENT_RUN) ../tools/latency_probe.py
-
 # Stage 1a — [ROBOT] preview the Theta straight off UVC (camera alone, no Zenoh).
 # Runs on the robot host with its OpenCV; uses THETA_DEVICE / THETA_GST_PIPELINE.
 test_frames_robot:

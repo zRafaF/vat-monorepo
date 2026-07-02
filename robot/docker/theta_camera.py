@@ -70,6 +70,12 @@ log = logging.getLogger("theta-camera")
 ROBOT_NAME      = os.environ.get("ROBOT_NAME",      "go2")
 ZENOH_CONNECT   = os.environ.get("ZENOH_CONNECT",   "tcp/127.0.0.1:7447")
 JPEG_QUALITY    = int(os.environ.get("JPEG_QUALITY", "85"))
+# Transmit codec for the live frame: "webp" (≈25-35% smaller than JPEG at equal quality
+# → less robot-uplink bandwidth, which is what starves the pose stream) or "jpeg". The
+# server decodes transparently (cv2.imdecode sniffs the format from magic bytes), so only
+# this encoder changes. WEBP_QUALITY is 0-100 (visually ~= JPEG quality).
+FRAME_CODEC     = os.environ.get("FRAME_CODEC", "webp").strip().lower()
+WEBP_QUALITY    = int(os.environ.get("WEBP_QUALITY", "82"))
 LOSSLESS        = os.environ.get("LOSSLESS", "").lower() in ("1", "true", "yes")
 CAMERA_FPS      = float(os.environ.get("CAMERA_FPS", "30.0"))
 SHARP_DOWNSCALE = float(os.environ.get("SHARPNESS_DOWNSCALE", "0.5"))
@@ -383,6 +389,12 @@ class FrameDecimator:
                             interpolation=cv2.INTER_AREA)
         if LOSSLESS:
             ok, jbuf = cv2.imencode(".png", tx)
+        elif FRAME_CODEC == "webp":
+            ok, jbuf = cv2.imencode(".webp", tx,
+                                    [cv2.IMWRITE_WEBP_QUALITY, WEBP_QUALITY])
+            if not ok:      # OpenCV without WebP support → fall back to JPEG
+                ok, jbuf = cv2.imencode(".jpg", tx,
+                                        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         else:
             ok, jbuf = cv2.imencode(".jpg", tx,
                                     [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
