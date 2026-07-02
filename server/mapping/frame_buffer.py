@@ -87,6 +87,24 @@ class FrameBuffer:
             gap = s if s <= seqs[-1] else None
             return frames_list, lo, max_seq, gap
 
+    def contiguous_from(self, start_seq: int):
+        """Return ``(frames_list, max_seq, gap)`` for the gap-free run starting at
+        ``start_seq`` (inclusive). Used by the hybrid ONLINE batches: they must always
+        feed the engine frames from the SAME fixed base seq so a frame's list index
+        never shifts between calls (the engine tracks online windows by index). Returns
+        ``([], None, None)`` if ``start_seq`` isn't buffered."""
+        with self._lock:
+            if start_seq not in self._frames:
+                return [], None, None
+            frames_list, s = [], start_seq
+            while s in self._frames:
+                frames_list.append(self._frames[s])
+                s += 1
+            max_seq = s - 1
+            seqs_hi = max(self._frames)
+            gap = s if s <= seqs_hi else None
+            return frames_list, max_seq, gap
+
     # ── trimming (bound memory / latency) ──────────────────────────────────────
     def trim_to_recent(self, keep_last_n: int) -> int:
         """Drop all but the newest ``keep_last_n`` seqs (reset mode only ever needs the

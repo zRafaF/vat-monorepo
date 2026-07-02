@@ -66,9 +66,13 @@ CEILING_Z = _parse_ceiling(os.environ.get("CEILING_Z", ""))
 #       manifest/diff/pull round-trip. Pairs with reset-each-batch (the map is already
 #       rebuilt whole + bounded each batch, so "just send the whole map" is the simplest
 #       and lowest-latency path). Keep the map fine (VOXEL_SIZE) and stream coarse.
-#   "blocks" — DEPRECATED diff-based cube sync (manifest + push + Draco pull). Kept for
-#       A/B on the rig; slated for removal once snapshot mode is validated.
-STREAM_MODE = os.environ.get("STREAM_MODE", "snapshot").strip().lower()
+#   "blocks" (default) — diff-based cube sync (manifest + push + Draco pull): each submap
+#       streams ONLY the cubes that changed + the ones that vanished, so the per-update
+#       payload is tiny and the realtime pose stream isn't starved by a big burst. This is
+#       what makes the hybrid (RESET_PERIOD_SUBMAPS>1) responsive; also keeps whole-map
+#       bursts off the wire even at reset (the world-anchored rebuild lands in the same
+#       cubes → small delta). Client uses block_sync.BlockSync.
+STREAM_MODE = os.environ.get("STREAM_MODE", "blocks").strip().lower()
 # Cap points in the STREAMED snapshot (0 = no cap); full-res still via the query.
 CLOUD_STREAM_MAX_POINTS = int(os.environ.get("CLOUD_STREAM_MAX_POINTS", "60000"))
 CUBE_SIZE = float(os.environ.get("CUBE_SIZE", "1.0"))
@@ -149,6 +153,13 @@ RESET_WINDOW_FRAMES = int(os.environ.get("RESET_WINDOW_FRAMES", "15"))
 # intermediate windows), colouring from all accumulated keyframes. Cuts redundant mesh
 # pulls/colouring. 0 = extract every window (old behaviour). See engine.reset_extract_last_only.
 RESET_EXTRACT_LAST_ONLY = os.environ.get("RESET_EXTRACT_LAST_ONLY", "1") == "1"
+# HYBRID reset period (batches between full rebuilds). Full reset every N batches; the
+# N-1 batches in between EXTEND the map online (incremental, one new window each) and
+# stream only small block deltas — so the per-update payload is tiny and the realtime
+# pose stream isn't starved by a big whole-map burst. The periodic reset wipes the
+# online drift. 1 = reset EVERY batch (cleanest; each batch still streams a delta vs the
+# previous cloud). >1 = true online-between hybrid. Pairs with STREAM_MODE=blocks.
+RESET_PERIOD_SUBMAPS = int(os.environ.get("RESET_PERIOD_SUBMAPS", "3"))
 # Soft reset: wipe the nvblox volume + color cache IN PLACE (mapper.clear()) on each
 # per-batch reset instead of reconstructing the Mapper (CUDA re-alloc + block-hash
 # regrow — the reset-latency cost). 1 = on (recommended). 0 = full reconstruct.

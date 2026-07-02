@@ -53,8 +53,11 @@ class NavEsdfPublisher:
 
     def __init__(self, z: zenoh.Session):
         self._z = z
+        # BACKGROUND: the ESDF slice is bulk data and must yield to the realtime pose
+        # stream, same rationale as the cloud snapshot.
         self._pub = z.declare_publisher(
-            cfg.NAV_ESDF_KEY, congestion_control=zenoh.CongestionControl.DROP)
+            cfg.NAV_ESDF_KEY, congestion_control=zenoh.CongestionControl.DROP,
+            priority=zenoh.Priority.BACKGROUND)
         self._every = max(1, int(cfg.NAV_ESDF_EVERY_N))
         self._height = None
         if cfg.NAV_ESDF_HEIGHT_M not in ("", None):

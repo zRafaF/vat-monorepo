@@ -70,9 +70,10 @@ log = logging.getLogger("prism-viewer")
 ZENOH_ROUTER  = os.environ.get("ZENOH_ROUTER",  "tcp/127.0.0.1:7447")
 ROBOT_NAME    = os.environ.get("ROBOT_NAME",    "go2")
 SERVER_PREFIX = os.environ.get("SERVER_PREFIX", "server/prism")
-# Cloud transport, must match the server: "snapshot" (whole-map replace, default) or
-# "blocks" (DEPRECATED diff-based block sync). See server mapping_config.STREAM_MODE.
-STREAM_MODE   = os.environ.get("STREAM_MODE", "snapshot").strip().lower()
+# Cloud transport, must match the server: "blocks" (diff-based delta sync, default —
+# small per-update payloads so the pose stream isn't starved) or "snapshot" (whole-map
+# replace, simplest). See server mapping_config.STREAM_MODE.
+STREAM_MODE   = os.environ.get("STREAM_MODE", "blocks").strip().lower()
 RENDER_HZ     = float(os.environ.get("RENDER_HZ", "60.0"))
 STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))

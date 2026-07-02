@@ -48,8 +48,14 @@ class SnapshotPublisher:
         # DROP: a snapshot replaces the whole cloud, so shedding one on a momentarily
         # slow link is harmless — the next submap's snapshot repairs it. This keeps the
         # geometry stream from head-of-line-blocking the session.
+        # BACKGROUND priority: the bulk cloud must YIELD to the realtime pose stream
+        # (published DATA_HIGH by the robot). Zenoh interleaves higher-priority messages
+        # between this cloud's fragments, so a big snapshot no longer delays pose ON A
+        # SHARED transport. (Full isolation still needs pose+cloud on one session — see
+        # the delta-streaming plan; this tag is the harmless, always-correct half.)
         self._pub = z.declare_publisher(
-            self._k_snapshot, congestion_control=zenoh.CongestionControl.DROP)
+            self._k_snapshot, congestion_control=zenoh.CongestionControl.DROP,
+            priority=zenoh.Priority.BACKGROUND)
         self.last_snapshot_bytes = 0
         self.last_points = 0
         log.info(f"[SnapshotPub] snapshot→'{self._k_snapshot}'  "

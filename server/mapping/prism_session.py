@@ -94,6 +94,11 @@ class OnlinePRISMSession:
         self._anchor = WorldAnchor(enabled=cfg.RESET_WORLD_ANCHOR)
         self.last_world_anchor = np.eye(4)   # local→world SE3 of the last batch (nav ESDF)
         self._mode_logged = False
+        # Hybrid state: reset when _batch_count == 0, then online-extend until it wraps
+        # (mod RESET_PERIOD_SUBMAPS). _hybrid_base_seq is the fixed frame-list base the
+        # online batches feed the engine from, so window indices stay stable across calls.
+        self._batch_count = 0
+        self._hybrid_base_seq: Optional[int] = None
 
     # ── frame buffer (delegated) ───────────────────────────────────────────────
     def reset_map(self):
@@ -120,36 +125,72 @@ class OnlinePRISMSession:
 
     # ── processing ─────────────────────────────────────────────────────────────
     def process_new(self):
-        """Generator yielding a :class:`SubmapResult` per submap."""
-        reset = bool(cfg.PRISM_RESET_EACH_BATCH)
+        """Generator yielding a :class:`SubmapResult` per submap.
+
+        Hybrid schedule (reset mode): a FULL rebuild every RESET_PERIOD_SUBMAPS batches
+        (clears accumulated drift, streams the clean surface); the batches in between
+        EXTEND the map online (one new window) and stream small deltas. Everything is
+        expressed in the persistent world frame (the reset's rigid anchor), so online and
+        reset clouds line up and the block-diff stays tiny. RESET_PERIOD_SUBMAPS=1 →
+        reset every batch. PRISM_RESET_EACH_BATCH=0 → the deprecated pure-online path."""
+        reset_mode = bool(cfg.PRISM_RESET_EACH_BATCH)
+        period = max(1, cfg.RESET_PERIOD_SUBMAPS)
         if not self._mode_logged:
-            log.info(f"[PRISM] >>> MODE = "
-                     f"{'RESET (fresh rebuild each batch)' if reset else 'ONLINE (accumulating map) [DEPRECATED]'}"
-                     f"  (PRISM_RESET_EACH_BATCH={'1' if reset else '0'})")
+            if not reset_mode:
+                msg = "ONLINE (accumulating) [DEPRECATED]"
+            elif period <= 1:
+                msg = "RESET every batch + delta stream"
+            else:
+                msg = f"HYBRID (full reset every {period} batches, online in between)"
+            log.info(f"[PRISM] >>> MODE = {msg}")
             self._mode_logged = True
 
-        if reset:
-            # Bound the buffer: reset mode only ever uses the recent window, so keep a
-            # little more than one window and drop the rest (else the dict grows forever
-            # and latency creeps back up — the exact failure mode we're fixing).
-            keep = max(cfg.RESET_WINDOW_FRAMES, cfg.WINDOW_SIZE) + cfg.WINDOW_SIZE
-            dropped = self._buffer.trim_to_recent(keep)
-            if dropped:
-                log.debug(f"[PRISM] trimmed {dropped} old frames (reset window={keep})")
-        else:
+        if not reset_mode:
             self._drop_backlog_if_behind()
+            frames_list, lo, max_seq, gap = self._buffer.contiguous_prefix()
+            if gap is not None:
+                log.warning(f"[PRISM] frame gap at seq={gap}; contiguous prefix "
+                            f"[{lo}..{max_seq}] only")
+            if len(frames_list) >= cfg.WINDOW_SIZE:
+                yield from self._process_online(frames_list, max_seq, self.last_world_anchor)
+            return
 
+        # ── reset-based (pure reset or hybrid) ──────────────────────────────────
+        want_reset = (self._hybrid_base_seq is None) or (self._batch_count == 0)
+
+        if not want_reset:
+            # ONLINE extend from the fixed base so window indices stay stable.
+            frames_list, max_seq, gap = self._buffer.contiguous_from(self._hybrid_base_seq)
+            if gap is not None or len(frames_list) < cfg.WINDOW_SIZE:
+                if gap is not None:
+                    log.warning(f"[PRISM] online gap at seq={gap} → forcing a reset")
+                    want_reset = True
+                else:
+                    return  # not enough new frames yet; wait (don't advance the counter)
+            else:
+                did = False
+                for r in self._process_online(frames_list, max_seq, self.last_world_anchor):
+                    did = True
+                    yield r
+                if did:
+                    self._batch_count = (self._batch_count + 1) % period
+                return
+
+        # RESET batch: trim to the recent window, rebuild fresh, re-anchor to world.
+        keep = max(cfg.RESET_WINDOW_FRAMES, cfg.WINDOW_SIZE) + cfg.WINDOW_SIZE
+        self._buffer.trim_to_recent(keep)
         frames_list, lo, max_seq, gap = self._buffer.contiguous_prefix()
         if gap is not None:
-            log.warning(f"[PRISM] frame gap at seq={gap}; processing contiguous prefix "
+            log.warning(f"[PRISM] frame gap at seq={gap}; contiguous prefix "
                         f"[{lo}..{max_seq}] only")
         if len(frames_list) < cfg.WINDOW_SIZE:
             return
-
-        if reset:
-            yield from self._process_reset(frames_list, max_seq)
-        else:
-            yield from self._process_online(frames_list, max_seq)
+        did = False
+        for r in self._process_reset(frames_list, max_seq):
+            did = True
+            yield r
+        if did:
+            self._batch_count = (self._batch_count + 1) % period
 
     def _process_reset(self, frames_list, max_seq):
         """Reset mode: rebuild from only the most recent frames, re-anchor the fresh
@@ -174,6 +215,9 @@ class OnlinePRISMSession:
             start = lo
         if start > lo:
             frames_list = frames_list[start - lo:]
+        # Fixed base the subsequent hybrid ONLINE batches feed the engine from, so their
+        # window indices align with this reset's grid (stable _done_starts).
+        self._hybrid_base_seq = start
         _h0 = getattr(self.engine, "_perc_hits", 0)
         _m0 = getattr(self.engine, "_perc_misses", 0)
         last_traj = None
@@ -220,9 +264,15 @@ class OnlinePRISMSession:
                                world_anchor=T)
         self._buffer.mark_processed(max_seq)
 
-    def _process_online(self, frames_list, max_seq):
-        """DEPRECATED online-accumulate path. Streams each submap's current TSDF surface
-        from ONE growing map. Kept behind PRISM_RESET_EACH_BATCH=0 for A/B only."""
+    def _process_online(self, frames_list, max_seq, world_T=None):
+        """Extend the current map online (reset=False) and stream each new submap's
+        surface. Used BOTH as the hybrid's between-reset extension (world_T = the last
+        reset's anchor, so online geometry lands in the same world frame as the reset —
+        the block-diff then stays tiny) and as the deprecated pure-online path
+        (world_T=None ⇒ identity). The map keeps growing until the next reset wipes it."""
+        T = np.asarray(world_T if world_T is not None else np.eye(4), np.float64)
+        R, t = T[:3, :3], T[:3, 3]
+        has_T = not np.allclose(T, np.eye(4))
         try:
             prev_traj_len = len(self.engine.trajectory)
             for _mesh, _pcd, traj, _plane in self.engine.process_sequence(
@@ -232,17 +282,28 @@ class OnlinePRISMSession:
                 xyz, rgb = cloud["points"], cloud["colors"]
                 if xyz.shape[0] == 0:
                     continue
+                if has_T:
+                    xyz = (np.asarray(xyz, np.float64) @ R.T + t).astype(np.float32)
                 full_traj = np.asarray(traj, np.float32) if traj is not None else None
                 obs_centers = None
                 if full_traj is not None and len(full_traj):
                     obs_centers = (full_traj[prev_traj_len:] if len(full_traj) > prev_traj_len
                                    else full_traj[-cfg.WINDOW_SIZE:])
                     prev_traj_len = len(full_traj)
-                cam_pose, cam_ts = self._newest_camera_pose()
+                    if has_T:
+                        full_traj = (np.asarray(full_traj, np.float64) @ R.T + t).astype(np.float32)
+                        if obs_centers is not None and len(obs_centers):
+                            obs_centers = (np.asarray(obs_centers, np.float64) @ R.T + t).astype(np.float32)
+                cam_local, cam_ts = self._newest_camera_pose()
+                cam_w = (T @ np.asarray(cam_local, np.float64)) if cam_local is not None else None
                 yield SubmapResult(
                     version=int(cloud["version"]), points=xyz, colors=rgb,
-                    trajectory=full_traj, cam_pose=cam_pose, cam_ts=cam_ts,
-                    world_anchor=np.eye(4), obs_centers=obs_centers)
+                    trajectory=full_traj, cam_pose=cam_w, cam_ts=cam_ts,
+                    world_anchor=T, obs_centers=obs_centers)
+            # Keep the world anchor's reference poses fresh so the NEXT reset has recent
+            # overlapping frames to re-anchor against (else it would jump).
+            ts_arr, poses = self.engine.get_poses()
+            self._anchor.remember(ts_arr, poses, T)
         except Exception:
             log.error(f"[PRISM] Engine error:\n{traceback.format_exc()}")
         self._buffer.mark_processed(max_seq)
