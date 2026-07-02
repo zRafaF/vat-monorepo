@@ -105,6 +105,10 @@ class OnlinePRISMSession:
         self._buffer.clear()
         self._anchor.reset()
         self.last_world_anchor = np.eye(4)
+        # Clear hybrid state so the next batch does a fresh RESET (not an online extend
+        # from a now-dropped base seq — which would find no frames and stream nothing).
+        self._batch_count = 0
+        self._hybrid_base_seq = None
         # Explicit user reset → full reconstruct (infrequent; guarantees a clean Mapper).
         self.engine.reset(soft=False)
         log.info("[PRISM] Map reset — TSDF + colorizer + frame buffer cleared.")

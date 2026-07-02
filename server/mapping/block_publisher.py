@@ -61,12 +61,16 @@ class BlockPublisher:
         self._k_manifest = k["pcd_manifest"]
         self._k_blocks = k["pcd_blocks"]
         self._k_push = k["pcd_push"]
-        self._pub = z.declare_publisher(
-            self._k_manifest, congestion_control=zenoh.CongestionControl.DROP)
-        # Push rides its own publisher; DROP so a momentarily slow link sheds the
+        # DATA_LOW priority on both cloud channels: they yield to the realtime pose
+        # stream (DATA_HIGH from the robot) so a cloud burst can't starve pose, but stay
+        # above BACKGROUND so they still deliver. DROP so a momentarily slow link sheds a
         # delta (the next manifest diff repairs it) instead of head-of-line-blocking.
+        self._pub = z.declare_publisher(
+            self._k_manifest, congestion_control=zenoh.CongestionControl.DROP,
+            priority=zenoh.Priority.DATA_LOW)
         self._pub_push = z.declare_publisher(
-            self._k_push, congestion_control=zenoh.CongestionControl.DROP)
+            self._k_push, congestion_control=zenoh.CongestionControl.DROP,
+            priority=zenoh.Priority.DATA_LOW)
         self._qbl = z.declare_queryable(self._k_blocks, self._on_request)
         self.last_manifest_bytes = 0
         self.last_push_bytes = 0
