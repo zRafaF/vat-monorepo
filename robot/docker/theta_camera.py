@@ -281,12 +281,20 @@ class FrameDecimator:
 
     @staticmethod
     def _declare_reliable_publisher(z, key):
+        # Priority DATA (not DATA_HIGH): the bulk camera stream must sit BELOW the
+        # realtime pose (DATA_HIGH), so on the shared robot WiFi uplink the pose is
+        # scheduled ahead of the big JPEG frames instead of competing at equal priority
+        # (the cause of the pose "chug" during frame bursts). Kept RELIABLE+BLOCK so
+        # mapping frames still arrive; if the uplink is genuinely saturated (confirm with
+        # tools/latency_probe.py), switching this to DROP lets it shed frames under
+        # congestion and frees more airtime for pose (frames are recoverable via the
+        # camera_frame_get retransmit query).
         for kwargs in (
             dict(congestion_control=zenoh.CongestionControl.BLOCK,
                  reliability=zenoh.Reliability.RELIABLE,
-                 priority=zenoh.Priority.DATA_HIGH),
+                 priority=zenoh.Priority.DATA),
             dict(congestion_control=zenoh.CongestionControl.BLOCK,
-                 priority=zenoh.Priority.DATA_HIGH),
+                 priority=zenoh.Priority.DATA),
             dict(congestion_control=zenoh.CongestionControl.BLOCK),
         ):
             try:
