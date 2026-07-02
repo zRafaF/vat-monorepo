@@ -97,6 +97,9 @@ def keys(robot_name: str = "go2", server_prefix: str = "server/prism") -> dict:
         "pcd_push":        f"{server_prefix}/pcd/push",
         "trajectory":      f"{server_prefix}/trajectory",
         "status":          f"{server_prefix}/status",
+        # server → nav/client: horizontal ESDF slice (world-frame collision field),
+        # sent as a colored pack_pcd cloud (distance→color). See mapping/nav_esdf.py.
+        "esdf_slice":      f"{server_prefix}/esdf_slice",
         # server → robot (DOWN)
         "pose_correction": f"{server_prefix}/pose_correction",
         # robot → client (UP), relayed by the router

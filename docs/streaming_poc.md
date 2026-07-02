@@ -1,5 +1,44 @@
 # PRISM Streaming POC
 
+> ## ⚠️ Architecture update — read this first (2026-07)
+>
+> The mapping/streaming pipeline was reworked. Several sections below describe the
+> **previous** design and are kept for history; where they conflict with this banner,
+> the banner wins (this is a "trust but verify" correction — some older "fixed" notes
+> below were optimistic).
+>
+> **What is true now (defaults):**
+>
+> - **Reset-each-batch is the default** (`PRISM_RESET_EACH_BATCH=1`). Each batch is a
+>   fresh reconstruction over the most recent `RESET_WINDOW_FRAMES` frames, rigidly
+>   re-anchored into one persistent world frame. This is the "rolling mini-gradio":
+>   no cross-batch accumulation, no revisit ghosts, bounded map → constant latency.
+>   The old **online-accumulate** path (`=0`) is **DEPRECATED** (it accumulated drift
+>   and grew latency — the thick/ghosted walls; the block-diff sections below describe
+>   its transport).
+> - **Reset is done IN PLACE** via `mapper.clear()` (`SOFT_RESET=1`), reusing the
+>   nvblox allocation + block hash — so resetting each batch is cheap (no CUDA
+>   re-alloc / hash regrow, which was the "restart takes a while" cost).
+> - **Streaming is whole-map snapshots** (`STREAM_MODE=snapshot`): each submap the
+>   server publishes the entire current surface, coarse-voxelised to `STREAM_VOXEL_M`
+>   (default 5 cm, decoupled from the 3 cm map), as one compressed `pack_pcd` on
+>   `pcd_snapshot`; the client replaces its cloud wholesale. The **block-diff sync**
+>   (manifest / push / Draco pull — `vat_blockmap.py`, `block_publisher.py`,
+>   `block_sync.py`) is **DEPRECATED**, kept behind `STREAM_MODE=blocks` for A/B.
+> - **TSDF decay / `TSDF_PRUNE_RADIUS_M`**: the current `nvblox_torch` build exposes
+>   `decay()` and `clear()` but **no** `clearOutsideRadius`, so the radius-prune path
+>   silently falls back to decay. Reset mode makes both moot (nothing accumulates).
+> - **"SALT" revisit logging was removed** (`common/vat_salt.py` deleted). It was a
+>   read-only diagnostic; it already confirmed the point it was measuring — open-loop
+>   revisit drift up to ~3.6 m — which is *why* reset mode (not carving) is the fix.
+> - **Navigation ESDF** is published each submap as a world-frame slice on
+>   `server/prism/esdf_slice` (`server/mapping/nav_esdf.py`); `COMPUTE_ESDF=1`.
+> - Server modules were split: `frame_buffer.py`, `world_anchor.py`,
+>   `snapshot_publisher.py`, `nav_esdf.py` alongside `prism_session.py`.
+>
+> Loop closure is still future work; reset mode sidesteps the need for it at the cost
+> of not keeping a single global map.
+
 End-to-end live point cloud from the **RICOH Theta X** on the Go2 robot → PRISM-VGGT mapping server → Rerun 3D viewer on any machine. (The camera was switched from the Insta360 — see [archive](archive/insta360.md).)
 
 This POC also carries the **robot pose** end-to-end. Per the [system architecture](architecture.md#pose-state-estimation), the robot — not the server — is authoritative for its global pose. The data path is:

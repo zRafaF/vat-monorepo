@@ -10,10 +10,12 @@ It renders:
     between samples), green when VGGT-corrected / amber when coasting;
   * the four **legs** from ``/lowstate`` forward kinematics + the selfie-stick;
   * the camera **trajectory**;
-  * the PRISM **point cloud**, STREAMED — the server pushes a full (compressed,
-    16-bit-quantised + zlib) snapshot per submap and each one *replaces* the local
-    cloud, so it stays aligned and never accumulates stale/duplicated blocks. Decode
-    runs in a worker thread (off the GL + zenoh-callback threads).
+  * the PRISM **point cloud**, STREAMED. In the default ``STREAM_MODE=snapshot`` the
+    server pushes a full (compressed, 16-bit-quantised + zlib) snapshot per submap and
+    each one *replaces* the local cloud (``snapshot_sync.SnapshotSync``), so it stays
+    aligned and never accumulates stale/duplicated blocks — pairs with reset-each-batch
+    mapping. ``STREAM_MODE=blocks`` selects the DEPRECATED diff-based block sync
+    (``block_sync.BlockSync``). The selected sync is polled off the GL thread.
   * a **latency HUD** (top-left): pose age / rate / capture→display e2e / fix
     quality, and cloud point-count / age / rate.
 
@@ -56,6 +58,7 @@ import zenoh  # noqa: E402
 from kinematics import RobotStateTracker, LowStateTracker, LEG_ORDER  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))         # client/ (block_sync)
 from block_sync import BlockSync  # noqa: E402
+from snapshot_sync import SnapshotSync  # noqa: E402
 from vat_cloudbuffer import IncrementalCloud  # noqa: E402
 from urdf_robot import URDFRobot  # noqa: E402
 
@@ -67,6 +70,9 @@ log = logging.getLogger("prism-viewer")
 ZENOH_ROUTER  = os.environ.get("ZENOH_ROUTER",  "tcp/127.0.0.1:7447")
 ROBOT_NAME    = os.environ.get("ROBOT_NAME",    "go2")
 SERVER_PREFIX = os.environ.get("SERVER_PREFIX", "server/prism")
+# Cloud transport, must match the server: "snapshot" (whole-map replace, default) or
+# "blocks" (DEPRECATED diff-based block sync). See server mapping_config.STREAM_MODE.
+STREAM_MODE   = os.environ.get("STREAM_MODE", "snapshot").strip().lower()
 RENDER_HZ     = float(os.environ.get("RENDER_HZ", "60.0"))
 STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))
@@ -358,9 +364,15 @@ class PRISMViewer:
         self._z_fast = self._open(self._conf())          # isolate low-latency pose/legs
         log.info("[Viewer] Connected (2 sessions: bulk + low-latency).")
 
-        # bulk session: DIFF-BASED block sync (manifest + Draco bundles, only the
-        # cubes that changed) + trajectory + server status.
-        self._blocksync = BlockSync(self._z, cube_m=CUBE_SIZE, server_prefix=SERVER_PREFIX)
+        # bulk session cloud transport, chosen by STREAM_MODE (must match the server):
+        #   snapshot — whole-map replace each submap (default; pairs with reset mode).
+        #   blocks   — DEPRECATED diff-based sync (manifest + push + Draco pull).
+        # Both expose take_delta()/take_merged()/force_resync() + the HUD telemetry.
+        if STREAM_MODE == "snapshot":
+            self._blocksync = SnapshotSync(self._z, server_prefix=SERVER_PREFIX,
+                                           request_snapshot=request_snapshot)
+        else:
+            self._blocksync = BlockSync(self._z, cube_m=CUBE_SIZE, server_prefix=SERVER_PREFIX)
         self._pub_reset = self._z.declare_publisher(RESET_KEY)
         self._pub_ceiling = self._z.declare_publisher(CEILING_KEY)
         # CONTROL lane (fast session): the small, latency-critical messages —
@@ -381,7 +393,7 @@ class PRISMViewer:
         self._urdf = URDFRobot(GO2_URDF)
         self._robot_mode = "mesh" if self._urdf.available else "skeleton"
         self._mesh_throttle_t = 0.0
-        log.info(f"[Viewer] subscribed: [bulk] block-sync(push+manifest) | "
+        log.info(f"[Viewer] subscribed: [bulk] cloud={STREAM_MODE} | "
                  f"[fast] pose + trajectory + status  (incremental={self._incremental})")
 
     @staticmethod

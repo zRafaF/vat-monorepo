@@ -59,6 +59,16 @@ CEILING_KEY = f"{SERVER_PREFIX}/config/ceiling_z"
 CEILING_Z = _parse_ceiling(os.environ.get("CEILING_Z", ""))
 
 # ── Cloud delivery ───────────────────────────────────────────────────────────
+# Streaming transport for the map point cloud:
+#   "snapshot" (default) — publish the WHOLE current TSDF surface, coarse-voxelised to
+#       STREAM_VOXEL_M, as one compressed pack_pcd snapshot per submap (pcd_snapshot).
+#       The client replaces its cloud wholesale, so nothing accumulates and there is no
+#       manifest/diff/pull round-trip. Pairs with reset-each-batch (the map is already
+#       rebuilt whole + bounded each batch, so "just send the whole map" is the simplest
+#       and lowest-latency path). Keep the map fine (VOXEL_SIZE) and stream coarse.
+#   "blocks" — DEPRECATED diff-based cube sync (manifest + push + Draco pull). Kept for
+#       A/B on the rig; slated for removal once snapshot mode is validated.
+STREAM_MODE = os.environ.get("STREAM_MODE", "snapshot").strip().lower()
 # Cap points in the STREAMED snapshot (0 = no cap); full-res still via the query.
 CLOUD_STREAM_MAX_POINTS = int(os.environ.get("CLOUD_STREAM_MAX_POINTS", "60000"))
 CUBE_SIZE = float(os.environ.get("CUBE_SIZE", "1.0"))
@@ -66,10 +76,12 @@ CUBE_SIZE = float(os.environ.get("CUBE_SIZE", "1.0"))
 # ── Streaming stability (online ghost / breathing / bandwidth fixes) ─────────
 # Occupancy-CRC grid for block versioning (m). ~½ voxel so sub-voxel nvblox mesh
 # "breathing" doesn't churn the diff (which used to resend ~every cube each submap).
-# Stream decimation: the LIVE cloud is voxel-downsampled to this (m) before block
-# sync, DECOUPLED from the TSDF voxel — keep the mapper fine (VOXEL_SIZE) for internal
-# quality while streaming coarse to fit the link. = VOXEL_SIZE → no decoupling.
-STREAM_VOXEL_M = float(os.environ.get("STREAM_VOXEL_M", str(VOXEL_SIZE)))
+# Stream decimation: the LIVE cloud is voxel-downsampled to this (m) before it is
+# sent, DECOUPLED from the TSDF voxel — keep the mapper fine (VOXEL_SIZE, default 3cm)
+# for reconstruction quality while streaming COARSER to fit the link and keep the
+# per-submap snapshot small. Default 5cm ≈ ⅓ fewer points than the 3cm map for a
+# barely-visible quality drop. Set = VOXEL_SIZE for no decoupling (finest stream).
+STREAM_VOXEL_M = float(os.environ.get("STREAM_VOXEL_M", "0.05"))
 # How to decimate the streamed cloud (see common/vat_decimate.py):
 #   none | voxel_centroid (default, deterministic, keeps placement) |
 #   voxel_center (deterministic, snapped) | stride (fast, NOT deterministic → CRC churn)
@@ -117,12 +129,24 @@ MAP_TTL_RADIUS_M = float(os.environ.get("MAP_TTL_RADIUS_M", "0") or 0.0) or MAX_
 # native radius-clear if available, else decay+deallocate. Supersedes TSDF_DECAY.
 # 0 = OFF → full accumulation (use 0 for SoTA benchmarks against other methods).
 TSDF_PRUNE_RADIUS_M = float(os.environ.get("TSDF_PRUNE_RADIUS_M", "0") or 0.0)
-# Experimental: rebuild a FRESH map each batch (engine reset=True) over only the
-# most recent RESET_WINDOW_FRAMES frames, instead of accumulating online. Removes
-# cross-batch accumulation/drift (no ghost build-up, no "walking inside walls") but
-# reprocesses the window each batch and keeps NO global map. 0 = off (online accum).
-PRISM_RESET_EACH_BATCH = os.environ.get("PRISM_RESET_EACH_BATCH", "0") == "1"
+# PRIMARY MODE (default ON): rebuild a FRESH map each batch (engine reset=True) over
+# only the most recent RESET_WINDOW_FRAMES frames, instead of accumulating online.
+# This is the "rolling mini-gradio": each batch is one internally-consistent
+# reconstruction, so cross-batch pose drift and revisit ghosts never accumulate (the
+# thick/duplicated walls) and the map stays bounded → constant live latency. The
+# fresh clouds are re-anchored into ONE persistent world frame (RESET_WORLD_ANCHOR).
+# Reset is done IN PLACE via mapper.clear() (see SOFT_RESET) so it is cheap.
+# 0 = DEPRECATED online-accumulate path (kept behind the flag for A/B on the rig).
+PRISM_RESET_EACH_BATCH = os.environ.get("PRISM_RESET_EACH_BATCH", "1") == "1"
 RESET_WINDOW_FRAMES = int(os.environ.get("RESET_WINDOW_FRAMES", "60"))
+# Soft reset: wipe the nvblox volume + color cache IN PLACE (mapper.clear()) on each
+# per-batch reset instead of reconstructing the Mapper (CUDA re-alloc + block-hash
+# regrow — the reset-latency cost). 1 = on (recommended). 0 = full reconstruct.
+SOFT_RESET = os.environ.get("SOFT_RESET", "1") == "1"
+# Recompute the ESDF each submap so the navigation stack can query collision distances
+# (nav_esdf publishes a world-frame slice; see NAV_ESDF_* below). Bounded + cheap in
+# reset mode because the map is a small local window. 0 = skip ESDF (viewer-only).
+COMPUTE_ESDF = os.environ.get("COMPUTE_ESDF", "1") == "1"
 # Re-anchor each fresh reset reconstruction into ONE persistent world frame (rigid
 # SE3, from frames shared with the previous batch). Stops the cloud/robot rotating &
 # jumping between batches and collapses the delta to the frontier. 1 = on (recommended
@@ -165,23 +189,27 @@ CORRECTION_DEADBAND_M   = float(os.environ.get("CORRECTION_DEADBAND_M", "0.06"))
 CORRECTION_DEADBAND_DEG = float(os.environ.get("CORRECTION_DEADBAND_DEG", "3.0"))
 
 
-# ── "SALT": loop-closure-style anchoring ─────────────────────────────────────
-# v0 = SENSING ONLY (safe, read-only): recognise revisits and LOG the pose drift,
-# to validate that drift/misalignment is what's blocking carving before we inject
-# old anchor frames into the VGGT window (v1). Online mode only.
-SALT_ENABLE     = os.environ.get("SALT_ENABLE", "1") == "1"
-SALT_KF_EVERY_S = float(os.environ.get("SALT_KF_EVERY_S", "1.0"))   # store a keyframe this often
-SALT_MIN_GAP_S  = float(os.environ.get("SALT_MIN_GAP_S", "8.0"))    # only match keyframes older than this
-SALT_SIM_THRESH = float(os.environ.get("SALT_SIM_THRESH", "0.80"))  # cosine (yaw-invariant) revisit threshold
-SALT_DB_MAX     = int(os.environ.get("SALT_DB_MAX", "800"))
+# ── Navigation ESDF (world-frame collision field) ────────────────────────────
+# When COMPUTE_ESDF=1, publish a horizontal ESDF slice (signed distance to the
+# nearest obstacle, meters) for the nav stack. In reset mode the nvblox volume lives
+# in the fresh reconstruction's LOCAL frame; nav_esdf transforms the slice into the
+# persistent WORLD frame using the same rigid anchor as the streamed cloud, so the
+# planner and the viewer share one frame.
+NAV_ESDF_PUBLISH  = os.environ.get("NAV_ESDF_PUBLISH", "1") == "1"
+NAV_ESDF_KEY      = f"{SERVER_PREFIX}/esdf_slice"
+NAV_ESDF_RES_M    = float(os.environ.get("NAV_ESDF_RES_M", "0.05"))  # slice sample spacing
+# Slice height above the floor (world Z, m). Empty ⇒ median trajectory height.
+NAV_ESDF_HEIGHT_M = os.environ.get("NAV_ESDF_HEIGHT_M", "").strip()
+NAV_ESDF_EVERY_N  = int(os.environ.get("NAV_ESDF_EVERY_N", "1"))     # publish every N submaps
 
 
 def summary() -> str:
     """One-line config echo for the startup log."""
-    _mode = (f"RESET(win={RESET_WINDOW_FRAMES},anchor={'on' if RESET_WORLD_ANCHOR else 'off'})"
-             if PRISM_RESET_EACH_BATCH else f"ONLINE(decay={'on' if TSDF_DECAY else 'off'})")
-    return (f"MODE={_mode} window={WINDOW_SIZE} overlap={OVERLAP} voxel={VOXEL_SIZE} "
-            f"face={FACE_SIZE} mode={PROCESSING_MODE} cube={CUBE_SIZE} "
-            f"keyframe_every={PCD_KEYFRAME_EVERY} crc_quant={CRC_QUANT_M:.3f} "
-            f"voxel_snap={CLOUD_VOXEL_SNAP} stream_voxel={STREAM_VOXEL_M} "
+    _mode = (f"RESET(win={RESET_WINDOW_FRAMES},soft={'on' if SOFT_RESET else 'off'},"
+             f"anchor={'on' if RESET_WORLD_ANCHOR else 'off'})"
+             if PRISM_RESET_EACH_BATCH else f"ONLINE[deprecated](decay={'on' if TSDF_DECAY else 'off'})")
+    return (f"MODE={_mode} stream={STREAM_MODE} esdf={'on' if COMPUTE_ESDF else 'off'} "
+            f"window={WINDOW_SIZE} overlap={OVERLAP} voxel={VOXEL_SIZE} "
+            f"face={FACE_SIZE} proc={PROCESSING_MODE} cube={CUBE_SIZE} "
+            f"stream_voxel={STREAM_VOXEL_M} voxel_snap={CLOUD_VOXEL_SNAP} "
             f"kf_gate={KEYFRAME_MIN_TRANS_M}m/{KEYFRAME_MIN_ROT_DEG}deg")

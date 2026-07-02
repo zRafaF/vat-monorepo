@@ -1,31 +1,40 @@
 """
-VAT mapping server — online PRISM session.
+VAT mapping server — PRISM session (engine driver).
+===================================================
 
-Owns the PRISM-VGGT engine and the seq-keyed frame buffer, and drives the engine
-in ONLINE mode (``reset=False``) over the contiguous, gap-free prefix of received
-frames. Each processed submap yields the CURRENT TSDF surface (the thin cloud the
-offline/gradio path shows) plus the trajectory and the latest camera pose.
+Owns the PRISM-VGGT engine and drives it over the buffered frames. Two modes:
 
-Why the current surface and not ``get_point_cloud_snapshot()``: the BlockColorCache
-behind that snapshot only ever adds/updates blocks (never removes), so it
-ACCUMULATES every block ever seen → thick/fuzzy/duplicated walls. The current
-nvblox surface is re-derived each submap, so a shifted surface replaces the old
-geometry (thin 1-voxel walls), matching gradio.
+* RESET (default, ``PRISM_RESET_EACH_BATCH=1``): rebuild a FRESH map from only the
+  most recent ``RESET_WINDOW_FRAMES`` frames each batch (a "rolling mini-gradio"),
+  then re-anchor that fresh reconstruction into ONE persistent world frame
+  (:class:`world_anchor.WorldAnchor`) and stream ONE result. No global map is kept,
+  so cross-batch pose drift and revisit ghosts never accumulate and the map stays
+  bounded → constant live latency. The reset is done IN PLACE via ``mapper.clear()``
+  (engine ``SOFT_RESET``), so it is cheap.
+
+* ONLINE (``PRISM_RESET_EACH_BATCH=0``) — DEPRECATED: keep the accumulating map and
+  stream each submap's current TSDF surface. Retained behind the flag for A/B on the
+  rig; accumulates drift/ghosts and grows latency (the reason reset mode is default).
+
+Frame bookkeeping lives in :class:`frame_buffer.FrameBuffer`; the persistent world
+frame in :class:`world_anchor.WorldAnchor`. This module is just the glue that turns
+buffered frames into :class:`SubmapResult`s.
 """
 
 from __future__ import annotations
 
-import threading
-import traceback
 import logging
+import os
+import traceback
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
 import mapping_config as cfg
-import vat_salt
 from frame_io import IncomingFrame
+from frame_buffer import FrameBuffer
+from world_anchor import WorldAnchor
 from prism_vggt import FrameInput
 from prism_vggt.backends.panovggt import PanoVGGTBackend
 from prism_vggt.engine import StreamingWindowEngine
@@ -33,53 +42,25 @@ from prism_vggt.engine import StreamingWindowEngine
 log = logging.getLogger("mapping-server")
 
 
-def _orthonormalize(R: np.ndarray) -> np.ndarray:
-    """Nearest rotation matrix to R (SVD; fixes any reflection)."""
-    U, _, Vt = np.linalg.svd(R)
-    Rn = U @ Vt
-    if np.linalg.det(Rn) < 0:
-        U[:, -1] *= -1.0
-        Rn = U @ Vt
-    return Rn
-
-
-def rigid_anchor_from_poses(common):
-    """Best-fit RIGID transform (SE3, scale=1) mapping a fresh reconstruction's LOCAL
-    frame to the persistent WORLD frame, from corresponding camera poses.
-
-    ``common`` = list of ``(P_local 4x4, P_world 4x4)`` for frames shared with the
-    previous batch. Each pair implies a candidate ``T = P_world @ inv(P_local)``; for a
-    consistent rigid scene they agree, so we average translation and orthonormalise the
-    mean rotation. Using full poses (not just positions) stays well-conditioned even
-    when the camera barely moved (a near-static robot)."""
-    Rs, ts = [], []
-    for P_local, P_world in common:
-        T = np.asarray(P_world, np.float64) @ np.linalg.inv(np.asarray(P_local, np.float64))
-        Rs.append(T[:3, :3]); ts.append(T[:3, 3])
-    out = np.eye(4)
-    out[:3, :3] = _orthonormalize(np.mean(np.stack(Rs), axis=0))
-    out[:3, 3] = np.mean(np.stack(ts), axis=0)
-    return out
-
-
 @dataclass
 class SubmapResult:
     version: int
-    points: np.ndarray          # (N,3) float32 — CURRENT TSDF surface
-    colors: np.ndarray          # (N,3) uint8
+    points: np.ndarray               # (N,3) float32 — CURRENT TSDF surface (world frame)
+    colors: np.ndarray               # (N,3) uint8
     trajectory: Optional[np.ndarray]
     cam_pose: Optional[np.ndarray]   # 4x4 camera→world of the newest keyframe
     cam_ts: Optional[float]          # capture time (s) of that keyframe
-    obs_centers: Optional[np.ndarray] = None  # (M,3) camera positions added THIS submap
-    #                                            (drives the streamed-map observation-TTL)
+    world_anchor: Optional[np.ndarray] = None   # 4x4 local→world SE3 used this batch
+    #                                             (identity in online mode; drives nav ESDF)
+    obs_centers: Optional[np.ndarray] = None    # (M,3) camera positions added THIS submap
+    #                                             (blocks-mode observation-TTL only)
 
 
 class OnlinePRISMSession:
-    """PRISM engine + seq-keyed frame buffer, driven online."""
+    """PRISM engine + seq-keyed frame buffer, driven in reset (default) or online mode."""
 
     def __init__(self, weights_path: str):
         log.info("[PRISM] Loading PanoVGGT perception backend...")
-        import os
         self.perception = PanoVGGTBackend(
             config_path=os.path.join(os.path.dirname(weights_path),
                                      "..", "third_party", "PanoVGGT",
@@ -89,239 +70,89 @@ class OnlinePRISMSession:
         self.engine = StreamingWindowEngine(
             perception=self.perception, voxel_size=cfg.VOXEL_SIZE,
             max_depth=cfg.MAX_DEPTH, face_size=cfg.FACE_SIZE)
-        self.engine.compute_esdf = False
+        # ESDF for navigation (world-frame slice published by nav_esdf). Bounded + cheap
+        # in reset mode because the volume is a small recent-window local map.
+        self.engine.compute_esdf = cfg.COMPUTE_ESDF
+        self.engine.esdf_slice_resolution = cfg.NAV_ESDF_RES_M
         self.engine.point_cloud_only = True
         self.engine.processing_mode = cfg.PROCESSING_MODE
-        # Streaming-stability config (online ghost / breathing / bandwidth fixes):
-        #  * voxel-snap → byte-identical unchanged geometry → stable block CRCs;
-        #  * keyframe gating → don't re-integrate a static view (breathing/ghosts);
-        #  * tsdf_decay → optional active carving of stale voxels (off unless enabled).
+        self.engine.soft_reset = cfg.SOFT_RESET
+        # Streaming-stability config (voxel-snap for byte-identical unchanged geometry;
+        # keyframe gating so a static view isn't re-integrated; decay only matters for
+        # the deprecated online path — reset mode never accumulates, so nothing to carve).
         self.engine.cloud_voxel_snap = cfg.CLOUD_VOXEL_SNAP
         self.engine.keyframe_min_trans_m = cfg.KEYFRAME_MIN_TRANS_M
         self.engine.keyframe_min_rot_deg = cfg.KEYFRAME_MIN_ROT_DEG
         self.engine.keyframe_max_interval_s = cfg.KEYFRAME_MAX_INTERVAL_S
         self.engine.tsdf_decay = cfg.TSDF_DECAY
         self.engine.decay_every_n = cfg.DECAY_EVERY_N
-        # nvblox TSDF prune (nav local map): bound the volume the ESDF is built from to a
-        # sphere around the robot. Also caps the mesh-pull cost → bounds live latency.
-        # 0 = OFF (full accumulation, e.g. for SoTA benchmarks). Supersedes decay when set.
         self.engine.tsdf_prune_radius = cfg.TSDF_PRUNE_RADIUS_M
         log.info(f"[PRISM] Engine ready ({cfg.summary()}).")
 
-        self._frames: dict[int, FrameInput] = {}
-        self._lock = threading.Lock()
-        self._last_processed_seq = -1
-        # reset-mode world anchor: keep successive fresh reconstructions in ONE
-        # world frame so the cloud doesn't rotate/jump and static geometry lands
-        # in the same cubes (delta collapses to the frontier).
-        self._prev_world_poses = {}     # {ts_ns:int -> 4x4 world camera pose}
-        self._world_anchor = np.eye(4)
-        self._salt_db = []      # [{id,ts,desc,pos}] keyframes for revisit detection (v0)
-        # Display-only surface preserved across a backlog resync so the viewer doesn't
-        # blank out while the live (nav) TSDF rebuilds clean. NEVER fed to the TSDF/ESDF,
-        # so no stale geometry leaks into navigation; ages out after a few submaps.
-        self._display_base = None        # (xyz f32 (N,3), rgb u8 (N,3)) or None
-        self._base_hold = 0              # submaps left before the base ages out
+        self._buffer = FrameBuffer()
+        self._anchor = WorldAnchor(enabled=cfg.RESET_WORLD_ANCHOR)
+        self.last_world_anchor = np.eye(4)   # local→world SE3 of the last batch (nav ESDF)
+        self._mode_logged = False
 
-    # ── frame buffer ─────────────────────────────────────────────────────────
+    # ── frame buffer (delegated) ───────────────────────────────────────────────
     def reset_map(self):
-        with self._lock:
-            self._frames.clear()
-            self._last_processed_seq = -1
-            self._prev_world_poses = {}
-            self._world_anchor = np.eye(4)
-            self._display_base = None
-            self._base_hold = 0
-        self.engine.reset()
+        self._buffer.clear()
+        self._anchor.reset()
+        self.last_world_anchor = np.eye(4)
+        # Explicit user reset → full reconstruct (infrequent; guarantees a clean Mapper).
+        self.engine.reset(soft=False)
         log.info("[PRISM] Map reset — TSDF + colorizer + frame buffer cleared.")
 
     def add_frame(self, seq: int, frame: IncomingFrame) -> bool:
         fi = FrameInput(image=frame.image, mask=frame.mask,
                         camera_height=frame.camera_height, timestamp=frame.timestamp)
-        with self._lock:
-            new = seq not in self._frames
-            self._frames[seq] = fi
-            return new
+        return self._buffer.add(seq, fi)
 
     def has_seq(self, seq: int) -> bool:
-        with self._lock:
-            return seq in self._frames
+        return self._buffer.has(seq)
 
     def stats(self):
-        with self._lock:
-            if not self._frames:
-                return 0, None, None, 0
-            seqs = sorted(self._frames)
-            new = sum(1 for s in seqs if s > self._last_processed_seq)
-            return len(self._frames), seqs[0], seqs[-1], new
+        return self._buffer.stats()
 
     def missing_seqs(self, lo: int, hi: int) -> list[int]:
-        with self._lock:
-            return [s for s in range(lo, hi + 1) if s not in self._frames]
+        return self._buffer.missing(lo, hi)
 
-    # ── online processing ──────────────────────────────────────────────────
-    def _freeze_display_base(self):
-        """Snapshot the current colored TSDF surface as a DISPLAY-ONLY base, held for
-        RESYNC_BASE_HOLD_SUBMAPS submaps, so the viewer keeps far geometry instead of
-        blanking while the live TSDF rebuilds. Voxel-deduped to bound memory. NEVER fed
-        back into the TSDF/ESDF → navigation only ever sees freshly rebuilt geometry.
-
-        NOTE (honest limitation): the rebuilt map starts in a FRESH world frame, and we
-        cannot rigidly re-anchor across a backlog time-skip without relocalization (loop
-        closure, Phase 2). So the held base is a static ghost in the PRE-resync frame and
-        may visibly seam against the new map until it ages out. It is a stopgap for
-        display continuity, not a metric merge — hence display-only + a short hold."""
-        if not cfg.RESYNC_PRESERVE_DISPLAY:
-            self._display_base = None
-            self._base_hold = 0
-            return
-        try:
-            c = self.engine.get_current_cloud()
-            xyz, rgb = c.get("points"), c.get("colors")
-            if xyz is None or xyz.shape[0] == 0:
-                return
-            xyz, rgb = self.engine._voxel_snap(
-                np.asarray(xyz, np.float32), np.asarray(rgb), cfg.STREAM_VOXEL_M)
-            self._display_base = (xyz.astype(np.float32), rgb.astype(np.uint8))
-            self._base_hold = max(1, cfg.RESYNC_BASE_HOLD_SUBMAPS)
-        except Exception:
-            log.debug("[PRISM] display-base freeze failed", exc_info=True)
-            self._display_base, self._base_hold = None, 0
-
-    def _merge_display_base(self, xyz, rgb):
-        """Overlay the frozen display-only base on the live surface (viewer continuity)
-        and age it one submap. No-op once expired/empty. Display only — not part of the
-        metric map handed to navigation."""
-        base = self._display_base
-        if base is None:
-            return xyz, rgb
-        self._base_hold -= 1
-        if self._base_hold <= 0:
-            self._display_base = None          # aged out → live map now covers the area
-        bx, bc = base
-        if xyz is None or xyz.shape[0] == 0:
-            return bx, bc
-        xyz = np.concatenate([np.asarray(xyz, np.float32), bx], axis=0)
-        rgb = np.concatenate([np.asarray(rgb, np.uint8), bc], axis=0)
-        return xyz, rgb
-
-    def _drop_backlog_if_behind(self) -> bool:
-        """If the server has fallen more than BACKLOG_MAX_FRAMES behind real time
-        (processing slower than capture → growing latency), drop the stale backlog and
-        resync to the most recent frames. Online mode tracks windows by frame INDEX, so
-        shifting the frame base requires an engine reset — this snaps latency back to
-        real time at the cost of a brief map rebuild (the right trade for live teleop).
-
-        The live (nav) TSDF rebuilds clean; the viewer keeps the last surface as a
-        display-only base (see _freeze_display_base) so it doesn't blank out."""
-        cap = cfg.BACKLOG_MAX_FRAMES
-        if cap <= 0:
-            return False
-        with self._lock:
-            if not self._frames:
-                return False
-            seqs = sorted(self._frames)
-            newest = seqs[-1]
-            behind = newest - self._last_processed_seq
-            if behind <= cap:
-                return False
-            keep_from = newest - max(cfg.BACKLOG_KEEP_FRAMES, cfg.WINDOW_SIZE)
-            dropped = [sq for sq in seqs if sq < keep_from]
-            for sq in dropped:
-                del self._frames[sq]
-            self._last_processed_seq = -1
-            n_drop, n_keep = len(dropped), len(self._frames)
-        # Preserve the last surface for the viewer BEFORE wiping the engine.
-        self._freeze_display_base()
-        self.engine.reset()
-        self._prev_world_poses = {}
-        self._world_anchor = np.eye(4)
-        held = self._display_base[0].shape[0] if self._display_base is not None else 0
-        log.warning(f"[PRISM] backlog guard: {behind} frames behind (cap {cap}) → "
-                    f"dropped {n_drop} stale, kept {n_keep}, resync to recent"
-                    + (f"; holding {held} display-only pts for {self._base_hold} submaps"
-                       if held else ""))
-        return True
-
-    def _contiguous_prefix(self):
-        """Return ``(frames_list, lo, max_seq)`` for the gap-free prefix from the
-        smallest buffered seq, so a frame's list index never shifts between calls
-        (the engine tracks windows by index; a shifted index breaks the overlap
-        correspondence and causes the progressive misalignment we chased)."""
-        with self._lock:
-            if not self._frames:
-                return [], None, None
-            seqs = sorted(self._frames)
-            lo = seqs[0]
-            frames_list, s = [], lo
-            while s in self._frames:
-                frames_list.append(self._frames[s])
-                s += 1
-            max_seq = s - 1
-            if s <= seqs[-1]:
-                log.warning(f"[PRISM] frame gap at seq={s} (have up to {seqs[-1]}); "
-                            f"processing contiguous prefix [{lo}..{max_seq}] only")
-            return frames_list, lo, max_seq
-
+    # ── processing ─────────────────────────────────────────────────────────────
     def process_new(self):
-        """Generator yielding a :class:`SubmapResult` per submap.
-
-        Online (reset=False): keep the accumulated map, stream each submap.
-        Reset (reset=True): rebuild a FRESH map from the recent window, then stream ONE
-        result re-anchored into the persistent world frame (so it doesn't rotate/jump and
-        the delta stays small). See cfg.PRISM_RESET_EACH_BATCH / RESET_WORLD_ANCHOR."""
-        self._drop_backlog_if_behind()       # latency self-correct if we fell behind
-        frames_list, lo, max_seq = self._contiguous_prefix()
-        if len(frames_list) < cfg.WINDOW_SIZE:
-            return
+        """Generator yielding a :class:`SubmapResult` per submap."""
         reset = bool(cfg.PRISM_RESET_EACH_BATCH)
-        if not getattr(self, "_mode_logged", False):
-            log.info(f"[PRISM] >>> MODE = {'RESET (fresh rebuild each batch)' if reset else 'ONLINE (accumulating map)'}"
+        if not self._mode_logged:
+            log.info(f"[PRISM] >>> MODE = "
+                     f"{'RESET (fresh rebuild each batch)' if reset else 'ONLINE (accumulating map) [DEPRECATED]'}"
                      f"  (PRISM_RESET_EACH_BATCH={'1' if reset else '0'})")
             self._mode_logged = True
+
+        if reset:
+            # Bound the buffer: reset mode only ever uses the recent window, so keep a
+            # little more than one window and drop the rest (else the dict grows forever
+            # and latency creeps back up — the exact failure mode we're fixing).
+            keep = max(cfg.RESET_WINDOW_FRAMES, cfg.WINDOW_SIZE) + cfg.WINDOW_SIZE
+            dropped = self._buffer.trim_to_recent(keep)
+            if dropped:
+                log.debug(f"[PRISM] trimmed {dropped} old frames (reset window={keep})")
+        else:
+            self._drop_backlog_if_behind()
+
+        frames_list, lo, max_seq, gap = self._buffer.contiguous_prefix()
+        if gap is not None:
+            log.warning(f"[PRISM] frame gap at seq={gap}; processing contiguous prefix "
+                        f"[{lo}..{max_seq}] only")
+        if len(frames_list) < cfg.WINDOW_SIZE:
+            return
+
         if reset:
             yield from self._process_reset(frames_list, max_seq)
-            return
-        try:
-            # Track trajectory growth so each submap's NEW camera positions can be
-            # handed to the streamed-map observation-TTL (refresh only what was just seen).
-            prev_traj_len = len(self.engine.trajectory)
-            for _mesh, _pcd, traj, _plane in self.engine.process_sequence(
-                    frames_list, window_size=cfg.WINDOW_SIZE, overlap=cfg.OVERLAP,
-                    reset=False, finalize=False):
-                # publish the CURRENT TSDF surface (thin, gradio-style)
-                cloud = self.engine.get_current_cloud()
-                xyz, rgb = cloud["points"], cloud["colors"]
-                # Overlay any frozen display-only base (viewer continuity after a
-                # backlog resync); ages out on its own. Not part of the nav TSDF.
-                xyz, rgb = self._merge_display_base(xyz, rgb)
-                if xyz.shape[0] == 0:
-                    continue
-                # Camera positions added by THIS submap (slice of the growing trajectory)
-                # → which cubes were just observed, for the observation-TTL prune.
-                full_traj = np.asarray(traj, np.float32) if traj is not None else None
-                obs_centers = None
-                if full_traj is not None and len(full_traj):
-                    obs_centers = (full_traj[prev_traj_len:] if len(full_traj) > prev_traj_len
-                                   else full_traj[-cfg.WINDOW_SIZE:])
-                    prev_traj_len = len(full_traj)
-                cam_pose, cam_ts = self._newest_camera_pose()
-                yield SubmapResult(
-                    version=int(cloud["version"]), points=xyz, colors=rgb,
-                    trajectory=full_traj,
-                    cam_pose=cam_pose, cam_ts=cam_ts, obs_centers=obs_centers)
-        except Exception:
-            log.error(f"[PRISM] Engine error:\n{traceback.format_exc()}")
-        if cfg.SALT_ENABLE:
-            self._salt_step(max_seq)
-        with self._lock:
-            self._last_processed_seq = max_seq if max_seq is not None else self._last_processed_seq
+        else:
+            yield from self._process_online(frames_list, max_seq)
 
     def _process_reset(self, frames_list, max_seq):
         """Reset mode: rebuild from only the most recent frames, re-anchor the fresh
-        cloud + poses into the persistent world frame, and yield ONE result. No global
-        map is kept; geometry stays clean (no accumulation), the world frame stays
-        consistent (rigid anchor), so the cube diff only ships what actually changed."""
+        cloud + poses into the persistent world frame, and yield ONE result."""
         if cfg.RESET_WINDOW_FRAMES > 0 and len(frames_list) > cfg.RESET_WINDOW_FRAMES:
             frames_list = frames_list[-cfg.RESET_WINDOW_FRAMES:]
         _h0 = getattr(self.engine, "_perc_hits", 0)
@@ -334,14 +165,14 @@ class OnlinePRISMSession:
                 last_traj = traj
         except Exception:
             log.error(f"[PRISM] Engine error (reset):\n{traceback.format_exc()}")
-            with self._lock:
-                self._last_processed_seq = max_seq if max_seq is not None else self._last_processed_seq
+            self._buffer.mark_processed(max_seq)
             return
 
         cloud = self.engine.get_current_cloud()
         xyz, rgb = cloud["points"], cloud["colors"]
         ts_arr, poses = self.engine.get_poses()
-        T = self._reset_world_anchor(ts_arr, poses)          # local -> world (SE3)
+        T = self._anchor.compute(ts_arr, poses)          # local -> world (SE3)
+        self.last_world_anchor = T
         R, t = T[:3, :3], T[:3, 3]
         if xyz.shape[0]:
             xyz = (np.asarray(xyz, np.float64) @ R.T + t).astype(np.float32)
@@ -350,77 +181,63 @@ class OnlinePRISMSession:
             traj_w = (np.asarray(last_traj, np.float64) @ R.T + t).astype(np.float32)
         cam_local, cam_ts = self._newest_camera_pose()
         cam_w = (T @ np.asarray(cam_local, np.float64)) if cam_local is not None else None
-        # remember this batch's WORLD poses (keyed by capture-time ns) for the next anchor
-        if ts_arr is not None and poses is not None and len(ts_arr) == len(poses):
-            self._prev_world_poses = {int(round(float(ti) * 1e9)): (T @ np.asarray(P, np.float64))
-                                      for ti, P in zip(ts_arr, poses)}
+        self._anchor.remember(ts_arr, poses, T)
         ran = getattr(self.engine, "_perc_misses", 0) - _m0
         cached = getattr(self.engine, "_perc_hits", 0) - _h0
         log.info(f"[PRISM] RESET rebuild: {len(frames_list)} frames | perception {ran} ran / "
                  f"{cached} cached | {int(xyz.shape[0])} surface pts")
         if xyz.shape[0]:
             yield SubmapResult(version=int(cloud["version"]), points=xyz, colors=rgb,
-                               trajectory=traj_w, cam_pose=cam_w, cam_ts=cam_ts)
-        with self._lock:
-            self._last_processed_seq = max_seq if max_seq is not None else self._last_processed_seq
+                               trajectory=traj_w, cam_pose=cam_w, cam_ts=cam_ts,
+                               world_anchor=T)
+        self._buffer.mark_processed(max_seq)
 
-    def _reset_world_anchor(self, ts_arr, poses):
-        """SE3 mapping the current fresh-reconstruction local frame to the persistent
-        world frame, from frames shared (by capture timestamp) with the previous batch.
-        First batch / anchoring off → identity (defines the world). Too little overlap →
-        reuse the last anchor to avoid a hard jump."""
-        if (not cfg.RESET_WORLD_ANCHOR or not self._prev_world_poses
-                or ts_arr is None or poses is None or len(ts_arr) != len(poses)):
-            return np.eye(4)
-        common = []
-        for ti, P in zip(ts_arr, poses):
-            w = self._prev_world_poses.get(int(round(float(ti) * 1e9)))
-            if w is not None:
-                common.append((np.asarray(P, np.float64), np.asarray(w, np.float64)))
-        if len(common) < 3:
-            log.warning(f"[PRISM] reset anchor: only {len(common)} overlapping frames — "
-                        f"reusing last anchor (world may shift)")
-            return self._world_anchor.copy()
-        self._world_anchor = rigid_anchor_from_poses(common)
-        return self._world_anchor.copy()
-
-    def _salt_step(self, max_seq):
-        """SALT v0 (read-only): build a keyframe DB and LOG revisits + the pose drift
-        between the current camera and the matched older keyframe. The drift is the
-        accumulated open-loop error — large values here confirm that alignment is what
-        stops the TSDF carving (and is what loop-frame injection in v1 would fix)."""
+    def _process_online(self, frames_list, max_seq):
+        """DEPRECATED online-accumulate path. Streams each submap's current TSDF surface
+        from ONE growing map. Kept behind PRISM_RESET_EACH_BATCH=0 for A/B only."""
         try:
-            fr = self._frames.get(max_seq)
-            if fr is None:
-                return
-            ts = float(fr.timestamp)
-            cam_pose, _cam_ts = self._newest_camera_pose()
-            if cam_pose is None:
-                return
-            pos = np.asarray(cam_pose[:3, 3], np.float64)
-            desc = vat_salt.descriptor(fr.image)
-            best = None                                    # (sim, kf)
-            for kf in self._salt_db:
-                if ts - kf["ts"] < cfg.SALT_MIN_GAP_S:
+            prev_traj_len = len(self.engine.trajectory)
+            for _mesh, _pcd, traj, _plane in self.engine.process_sequence(
+                    frames_list, window_size=cfg.WINDOW_SIZE, overlap=cfg.OVERLAP,
+                    reset=False, finalize=False):
+                cloud = self.engine.get_current_cloud()
+                xyz, rgb = cloud["points"], cloud["colors"]
+                if xyz.shape[0] == 0:
                     continue
-                sim, _shift = vat_salt.similarity(desc, kf["desc"])
-                if best is None or sim > best[0]:
-                    best = (sim, kf)
-            if best is not None and best[0] >= cfg.SALT_SIM_THRESH:
-                drift = float(np.linalg.norm(pos - best[1]["pos"]))
-                log.info(f"[SALT] revisit: sim={best[0]:.3f}  Δt={ts - best[1]['ts']:.1f}s  "
-                         f"pos_gap(drift)={drift:.2f}m  (kf #{best[1]['id']}, db={len(self._salt_db)})")
-            if not self._salt_db or (ts - self._salt_db[-1]["ts"]) >= cfg.SALT_KF_EVERY_S:
-                self._salt_db.append({"id": len(self._salt_db), "ts": ts,
-                                      "desc": desc, "pos": pos.copy()})
-                if len(self._salt_db) > cfg.SALT_DB_MAX:
-                    self._salt_db.pop(0)
+                full_traj = np.asarray(traj, np.float32) if traj is not None else None
+                obs_centers = None
+                if full_traj is not None and len(full_traj):
+                    obs_centers = (full_traj[prev_traj_len:] if len(full_traj) > prev_traj_len
+                                   else full_traj[-cfg.WINDOW_SIZE:])
+                    prev_traj_len = len(full_traj)
+                cam_pose, cam_ts = self._newest_camera_pose()
+                yield SubmapResult(
+                    version=int(cloud["version"]), points=xyz, colors=rgb,
+                    trajectory=full_traj, cam_pose=cam_pose, cam_ts=cam_ts,
+                    world_anchor=np.eye(4), obs_centers=obs_centers)
         except Exception:
-            log.debug("[SALT] step failed", exc_info=True)
+            log.error(f"[PRISM] Engine error:\n{traceback.format_exc()}")
+        self._buffer.mark_processed(max_seq)
+
+    def _drop_backlog_if_behind(self) -> bool:
+        """(Online mode) If the server fell more than BACKLOG_MAX_FRAMES behind real
+        time, drop the stale backlog and resync to recent frames so latency
+        self-corrects. Online tracks windows by index, so shifting the base requires an
+        engine reset. The viewer briefly blanks while the map rebuilds (reset mode, the
+        default, does not have this problem)."""
+        cap = cfg.BACKLOG_MAX_FRAMES
+        if cap <= 0 or self._buffer.behind() <= cap:
+            return False
+        keep = max(cfg.BACKLOG_KEEP_FRAMES, cfg.WINDOW_SIZE)
+        dropped = self._buffer.trim_to_recent(keep)
+        self.engine.reset(soft=self.engine.soft_reset)
+        self._anchor.reset()
+        log.warning(f"[PRISM] backlog guard: dropped {dropped} stale frames, resync to recent")
+        return True
 
     def _newest_camera_pose(self):
-        """Newest camera pose (by capture timestamp) + its capture time, for the
-        pose correction. Append order isn't time order across windows/overlap."""
+        """Newest camera pose (by capture timestamp) + its capture time. Append order
+        isn't time order across windows/overlap."""
         try:
             ts, poses = self.engine.get_poses()
             if poses is None or len(poses) == 0:
@@ -434,7 +251,12 @@ class OnlinePRISMSession:
 
     # ── full-res on-demand snapshot (the press-1 / make fetch_pcd path) ───────
     def current_cloud(self):
-        """The current TSDF surface as ``(xyz float32, rgb uint8, version)`` — same
-        source as the streamed cloud, so the on-demand fetch can't disagree with it."""
+        """The current TSDF surface as ``(xyz float32, rgb uint8, version)`` in the
+        WORLD frame — same source as the streamed cloud, so the on-demand fetch can't
+        disagree with it."""
         c = self.engine.get_current_cloud()
-        return c["points"], c["colors"], int(c["version"])
+        xyz, rgb = c["points"], c["colors"]
+        T = self.last_world_anchor
+        if xyz.shape[0] and not np.allclose(T, np.eye(4)):
+            xyz = (np.asarray(xyz, np.float64) @ T[:3, :3].T + T[:3, 3]).astype(np.float32)
+        return xyz, rgb, int(c["version"])

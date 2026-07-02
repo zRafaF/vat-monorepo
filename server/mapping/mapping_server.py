@@ -36,6 +36,8 @@ import vat_protocol as proto
 import vat_blockmap as bm
 import vat_decimate
 from block_publisher import BlockPublisher
+from snapshot_publisher import SnapshotPublisher
+from nav_esdf import NavEsdfPublisher
 from frame_io import build_mask, decode_frame
 from prism_session import OnlinePRISMSession
 from pose_estimation import (
@@ -89,11 +91,24 @@ class MappingServer:
         self._pub_pose_cor = self._z.declare_publisher(
             _KEYS["pose_correction"], congestion_control=zenoh.CongestionControl.DROP)
 
-        self._blockpub = BlockPublisher(self._z, cube_m=cfg.CUBE_SIZE,
-                                        server_prefix=cfg.SERVER_PREFIX,
-                                        crc_quant_m=cfg.CRC_QUANT_M,
-                                        ttl_submaps=cfg.MAP_TTL_SUBMAPS,
-                                        ttl_radius_m=cfg.MAP_TTL_RADIUS_M)
+        # Streaming transport: whole-map snapshot (default) or the DEPRECATED diff-based
+        # block sync. Both expose the same ingest_and_publish/reset interface.
+        if cfg.STREAM_MODE == "snapshot":
+            self._blockpub = SnapshotPublisher(self._z, server_prefix=cfg.SERVER_PREFIX,
+                                               max_points=cfg.CLOUD_STREAM_MAX_POINTS)
+        else:
+            log.warning("[Server] STREAM_MODE=blocks is the DEPRECATED diff path "
+                        "(kept for A/B; snapshot mode is recommended).")
+            self._blockpub = BlockPublisher(self._z, cube_m=cfg.CUBE_SIZE,
+                                            server_prefix=cfg.SERVER_PREFIX,
+                                            crc_quant_m=cfg.CRC_QUANT_M,
+                                            ttl_submaps=cfg.MAP_TTL_SUBMAPS,
+                                            ttl_radius_m=cfg.MAP_TTL_RADIUS_M)
+        # Navigation ESDF (world-frame collision field), published each submap when
+        # ESDF is on. None when disabled → the submap loop skips it.
+        self._nav = (NavEsdfPublisher(self._z)
+                     if (cfg.NAV_ESDF_PUBLISH and cfg.COMPUTE_ESDF) else None)
+
         try:
             self._live = self._z.liveliness().declare_token(_KEYS["live_server"])
         except Exception:
@@ -332,6 +347,15 @@ class MappingServer:
                                  if cfg.TRAJ_MAX_POSES > 0 else r.trajectory)
                     self._pub_traj.put(proto.pack_trajectory(traj_send))
                     self._publish_pose_correction(version, r.cam_pose, r.trajectory, r.cam_ts)
+
+                # Navigation ESDF slice in the persistent world frame (same anchor as
+                # the streamed cloud), for the planner + viz. Best-effort.
+                if self._nav is not None:
+                    try:
+                        self._nav.publish(self._prism.engine,
+                                          getattr(r, "world_anchor", None), submap_index=n_sub)
+                    except Exception:
+                        log.debug("[Server] nav ESDF publish failed", exc_info=True)
 
                 n_sub += 1
                 last_pts = int(xyz.shape[0])
