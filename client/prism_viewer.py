@@ -111,6 +111,34 @@ CLOUD_MAX_M   = float(os.environ.get("CLOUD_MAX_M", "50.0"))
 PT_SIZE       = float(os.environ.get("PCD_POINT_SIZE", "6.0"))
 PT_SIZE_MAX   = float(os.environ.get("PCD_POINT_SIZE_MAX", "40.0"))
 CUBE_SIZE     = float(os.environ.get("CUBE_SIZE", "1.0"))   # block-sync cube edge (m)
+
+
+def _env_vec3(name, default):
+    """Parse 'x,y,z' from the environment into a 3-tuple; fall back to default."""
+    s = os.environ.get(name, "")
+    try:
+        v = tuple(float(x) for x in s.split(","))
+        return v if len(v) == 3 else default
+    except Exception:
+        return default
+
+
+# ── Lit-surfel cloud rendering ───────────────────────────────────────────────
+# Render the streamed points as LIT, scene-scaled discs ("surfels") instead of flat
+# fixed-pixel splats: VisPy's Markers `spherical` shading fakes a per-point sphere
+# normal in the fragment shader (no transmitted normals needed → zero protocol change)
+# and `scaling='scene'` sizes each disc in metres so neighbouring points merge into a
+# solid, shaded surface. This buys most of the "looks like a mesh" legibility win
+# without the mesh-streaming/diff cost. Falls back to flat discs if the GL/VisPy build
+# rejects the attributes. PCD_SURFEL=0 restores the old flat-splat look.
+PCD_SURFEL         = os.environ.get("PCD_SURFEL", "1") == "1"
+# Disc diameter in METRES when surfels are on (scene-scaled). ~= the streamed voxel
+# pitch (STREAM_VOXEL_M, default 0.08) so discs tile the surface without big gaps.
+PCD_SURFEL_SIZE_M  = float(os.environ.get("PCD_SURFEL_SIZE_M", "0.08"))
+PCD_SURFEL_SIZE_MAX_M = float(os.environ.get("PCD_SURFEL_SIZE_MAX_M", "0.5"))
+PCD_LIGHT_DIR      = _env_vec3("PCD_LIGHT_DIR", (0.3, 0.3, -1.0))   # world dir toward scene
+PCD_LIGHT_COLOR    = _env_vec3("PCD_LIGHT_COLOR", (1.0, 1.0, 1.0))
+PCD_LIGHT_AMBIENT  = float(os.environ.get("PCD_LIGHT_AMBIENT", "0.35"))
 def _find_urdf() -> str:
     """Locate the robot URDF for the mesh avatar. Override with GO2_URDF; otherwise
     auto-detect a .urdf under client/b2w_description (no env var needed)."""
@@ -378,7 +406,9 @@ class PRISMViewer:
         self._legs_warned = False
         self._cloud_framed = False
         self._cloud_n = 0
-        self._pt_size = PT_SIZE
+        # Surfel mode: size is in METRES (data units, scaling on); flat mode: pixels.
+        self._surfel = PCD_SURFEL
+        self._pt_size = PCD_SURFEL_SIZE_M if self._surfel else PT_SIZE
         # latest merged cloud (pre-display-filter) kept so the ceiling clip can be
         # re-applied instantly on a keypress without waiting for the next submap
         self._cloud_xyz_raw = None
@@ -531,6 +561,31 @@ class PRISMViewer:
             self._cloud_vis.antialias = 1          # soft disc edge, no hard black ring
         except Exception:
             pass
+        # Lit-surfel shading: fake a per-point sphere normal in the fragment shader so
+        # the cloud reads as a solid, shaded surface. Each attribute is guarded so an
+        # older/limited VisPy build silently degrades to flat discs instead of crashing.
+        if self._surfel:
+            ok = True
+            try:
+                self._cloud_vis.spherical = True      # fake a per-point sphere normal
+                self._cloud_vis.scaling = True        # size is in DATA units (metres)
+            except Exception as e:
+                ok = False
+                log.warning(f"[Viewer] surfel shading unavailable ({e}); flat discs.")
+            # `light_position` is VisPy's light DIRECTION vector for spherical markers.
+            for attr, val in (("light_position", PCD_LIGHT_DIR),
+                              ("light_color", PCD_LIGHT_COLOR),
+                              ("light_ambient", PCD_LIGHT_AMBIENT)):
+                try:
+                    setattr(self._cloud_vis, attr, val)
+                except Exception:
+                    pass          # non-fatal: defaults still give shaded spheres
+            if not ok:
+                self._surfel = False
+                self._pt_size = PT_SIZE
+            else:
+                log.info(f"[Viewer] lit surfels ON  disc={self._pt_size*100:.0f}cm  "
+                         f"ambient={PCD_LIGHT_AMBIENT}  (PCD_SURFEL=0 for flat splats)")
         self._robot_vis = scene.visuals.Line(parent=view.scene, connect="segments",
                                               width=2.0, antialias=True)
         self._legs_vis = scene.visuals.Line(parent=view.scene, connect="segments",
@@ -635,8 +690,14 @@ class PRISMViewer:
                 else:
                     log.info("[Viewer] URDF mesh unavailable (need client/b2w_description + uv sync)")
             elif k in ("n", "m"):
-                self._pt_size = float(np.clip(self._pt_size + (2 if k == "m" else -2), 1, PT_SIZE_MAX))
-                log.info(f"[Viewer] point size = {self._pt_size:.0f} (max {PT_SIZE_MAX:.0f})")
+                if self._surfel:            # size is a world diameter in metres
+                    step = 0.01 if k == "m" else -0.01
+                    self._pt_size = float(np.clip(self._pt_size + step, 0.01, PCD_SURFEL_SIZE_MAX_M))
+                    log.info(f"[Viewer] surfel disc = {self._pt_size*100:.0f} cm "
+                             f"(max {PCD_SURFEL_SIZE_MAX_M*100:.0f} cm)")
+                else:                       # size is fixed pixels
+                    self._pt_size = float(np.clip(self._pt_size + (2 if k == "m" else -2), 1, PT_SIZE_MAX))
+                    log.info(f"[Viewer] point size = {self._pt_size:.0f} px (max {PT_SIZE_MAX:.0f})")
                 self._render_cloud()        # re-render so the size change shows now
             elif k == "c":                      # toggle ceiling clip on/off
                 self._set_ceiling(None if self._ceiling_z is not None else CEILING_START)
@@ -705,7 +766,9 @@ class PRISMViewer:
         rgba = np.ones((x.shape[0], 4), np.float32)
         rgba[:, :3] = c.astype(np.float32) / 255.0
         # edge_color == face_color (width 0) gives a clean, connected Open3D-style
-        # point look instead of black-ringed dots.
+        # point look instead of black-ringed dots. The `scaling`/`spherical` state was
+        # set once on the visual (surfel mode): `size` is then a real-world diameter in
+        # metres and discs tile into a lit surface; flat mode leaves it fixed-pixel.
         self._cloud_vis.set_data(x.astype(np.float32), face_color=rgba, edge_color=rgba,
                                  size=self._pt_size, edge_width=0)
         self._cloud_n = int(x.shape[0])
