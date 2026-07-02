@@ -75,6 +75,13 @@ SERVER_PREFIX = os.environ.get("SERVER_PREFIX", "server/prism")
 # replace, simplest). See server mapping_config.STREAM_MODE.
 STREAM_MODE   = os.environ.get("STREAM_MODE", "blocks").strip().lower()
 RENDER_HZ     = float(os.environ.get("RENDER_HZ", "60.0"))
+# Cloud rebuild+GPU-upload rate, DECOUPLED from RENDER_HZ. The pose predictor steps and
+# the avatar redraws every render tick (RENDER_HZ) — cheap — but the whole-cloud set_data()
+# GPU upload is the expensive per-tick op on the single-process/GIL-bound client and, at
+# 60 Hz, it starves the render thread AND the pose callbacks (both latencies spiked together
+# in telemetry). Coalescing it to a lower rate keeps the pose stream smooth; block deltas
+# accumulate losslessly in the store between uploads. 0 = every tick (old behaviour).
+CLOUD_RENDER_HZ = float(os.environ.get("CLOUD_RENDER_HZ", "10.0"))
 STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))
 SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
@@ -212,52 +219,95 @@ def ground_grid(size=4.0, step=0.5):
 class PosePredictor:
     """Interpolating pose predictor (multiplayer-netcode style).
 
-    Buffers recent poses by receipt time and renders the avatar at ``now -
-    POSE_RENDER_DELAY_S``, INTERPOLATING between the two buffered poses bracketing
-    that instant. This is smooth and never overshoots, so it doesn't rubber-band.
-    Only when the buffer runs dry (the stream stalled) does it fall back to
-    velocity EXTRAPOLATION (with staleness decay) so a disconnected robot coasts to
-    a stop instead of freezing."""
+    Buffers recent poses on a **source-clock timeline** (the fuser's per-sample
+    ``timestamp_ns``, robot clock) and renders the avatar at ``source_now −
+    render_delay``, INTERPOLATING between the two buffered poses bracketing that
+    instant. This is smooth and never overshoots, so it doesn't rubber-band. Only
+    when the buffer runs dry (the stream stalled) does it fall back to velocity
+    EXTRAPOLATION (with staleness decay) so a disconnected robot coasts to a stop.
 
-    def __init__(self):
+    Why source time and not packet receipt time (the previous, jumpy behaviour):
+    the client is a single Python process, so a heavy cloud decode / GPU upload
+    can stall the pose callback and deliver a *burst* of poses at once. Keyed on
+    receipt time, a burst collapses many distinct instants onto ~one timestamp →
+    interpolation is ill-conditioned and the avatar teleports/bounces, and the
+    receipt-jitter EMA explodes so the adaptive delay swings. Keyed on each pose's
+    OWN timestamp, a burst still lands at the correct positions on the timeline, so
+    playback stays smooth no matter how bursty the arrival is. A per-stream
+    transport-offset (rolling min of recv−source) maps the local monotonic clock
+    onto the source timeline without trusting absolute NTP sync."""
+
+    _OFFSET_WIN_S = 5.0        # rolling window for the min-transport-offset estimate
+    _CLOCK_RESET_S = 5.0       # source ts older than newest by this → treat as clock jump
+
+    def __init__(self, now_fn=time.monotonic):
+        self._now = now_fn                # injectable for deterministic unit tests
         self._lock = threading.Lock()
-        self._buf = deque(maxlen=128)     # (recv_monotonic, pose), time-ordered
+        # (src_t seconds [robot clock], recv_monotonic, pose), sorted by src_t
+        self._buf = deque(maxlen=256)
         self._have = False
-        self._dt_ema = 0.0
-        self._jitter_ema = 0.0          # EMA of |inter-arrival − mean| → adaptive delay
+        self._off_win = deque()           # (recv_monotonic, transport_delay) window
+        self._offset = None               # min transport delay (s): source→local map
+        self._src_dt_ema = 0.0            # source-cadence inter-arrival (→ rate + delay)
+        self._jitter_ema = 0.0            # EMA of transport delay ABOVE the min → delay
         self._e2e_ms = float("nan")
+        self._last_recv_mono = 0.0
         self._disp_pos = np.zeros(3)
         self._disp_quat = quat_identity()
 
+    def _reset_locked(self):
+        self._buf.clear()
+        self._off_win.clear()
+        self._offset = None
+        self._src_dt_ema = 0.0
+        self._jitter_ema = 0.0
+        self._have = False
+
     def on_pose(self, pose):
         with self._lock:
-            now = time.monotonic()
+            now = self._now()
+            src_t = int(pose.timestamp_ns) * 1e-9
             if self._buf:
-                dt = now - self._buf[-1][0]
-                dev = abs(dt - self._dt_ema) if self._dt_ema > 0 else 0.0
-                self._dt_ema = dt if self._dt_ema == 0 else 0.9 * self._dt_ema + 0.1 * dt
-                self._jitter_ema = (dev if self._jitter_ema == 0
-                                    else 0.9 * self._jitter_ema + 0.1 * dev)
-            self._e2e_ms = (time.time_ns() - pose.timestamp_ns) * 1e-6
-            self._buf.append((now, pose))
+                newest_src = self._buf[-1][0]
+                if src_t < newest_src - self._CLOCK_RESET_S:
+                    self._reset_locked()          # source clock stepped → start fresh
+                elif src_t <= newest_src:
+                    return                         # out-of-order / duplicate → drop
+            # transport delay for this sample; rolling MIN absorbs the source↔local
+            # clock epoch offset (they are NOT NTP-synced) and gives the link baseline.
+            delay = now - src_t
+            self._off_win.append((now, delay))
+            while self._off_win and now - self._off_win[0][0] > self._OFFSET_WIN_S:
+                self._off_win.popleft()
+            self._offset = min(d for _, d in self._off_win)
+            excess = max(0.0, delay - self._offset)     # transport jitter above baseline
+            self._jitter_ema = (excess if self._jitter_ema == 0
+                                else 0.9 * self._jitter_ema + 0.1 * excess)
+            if self._buf:
+                d_src = src_t - self._buf[-1][0]
+                self._src_dt_ema = (d_src if self._src_dt_ema == 0
+                                    else 0.9 * self._src_dt_ema + 0.1 * d_src)
+            self._e2e_ms = (time.time_ns() - int(pose.timestamp_ns)) * 1e-6
+            self._last_recv_mono = now
+            self._buf.append((src_t, now, pose))
             if not self._have:
                 self._disp_pos = pose.position.astype(np.float64)
                 self._disp_quat = quat_normalize(pose.quaternion)
                 self._have = True
 
-    def _target_at(self, t):
-        """Pose at render time ``t`` (monotonic): interpolate within the buffer, or
-        extrapolate from the newest sample if ``t`` is past it. Returns
+    def _target_at(self, t_src, now):
+        """Pose at source-timeline instant ``t_src``: interpolate within the buffer, or
+        extrapolate from the newest sample if ``t_src`` is past it. Returns
         ``(pos, quat, fix)``. Caller holds the lock."""
         buf = self._buf
-        newest_recv, newest = buf[-1]
-        if t >= newest_recv or len(buf) == 1:
+        newest_src, newest_recv, newest = buf[-1]
+        if t_src >= newest_src or len(buf) == 1:
             # ahead of the buffer → CONSTANT-ACCELERATION extrapolation with decay.
             # p(h) = p₀ + v·h + ½·a·h²  (a = streamed world accel) — tracks accel/braking
-            # far better than constant velocity. h is capped so a stall/bad accel can't
-            # fling the avatar; velocity+accel fade to 0 as the stream goes stale.
-            age = time.monotonic() - newest_recv
-            horizon = min((t - newest_recv) + POSE_LOOKAHEAD_S, POSE_EXTRAP_MAX_S)
+            # far better than constant velocity. h (source-domain) is capped so a stall or
+            # bad accel can't fling the avatar; vel+accel fade to 0 as the stream goes stale.
+            age = now - newest_recv                       # real (wall) staleness
+            horizon = max(0.0, min((t_src - newest_src) + POSE_LOOKAHEAD_S, POSE_EXTRAP_MAX_S))
             scale = 1.0 if age <= STALE_S else max(0.0, 1.0 - (age - STALE_S) / max(DECAY_S, 1e-3))
             pos, quat = integrate_pose(newest.position, newest.quaternion,
                                        newest.linear_velocity * scale,
@@ -266,47 +316,52 @@ class PosePredictor:
                              dtype=np.float64).reshape(3)
             pos = pos + 0.5 * acc * scale * (horizon * horizon)
             return pos, quat, newest.fix_quality
-        # interpolate between the two samples bracketing t (scan from the recent end)
+        # interpolate between the two samples bracketing t_src (scan from the recent end)
         for i in range(len(buf) - 1, 0, -1):
-            r0, p0 = buf[i - 1]
-            r1, p1 = buf[i]
-            if r0 <= t <= r1:
-                a = (t - r0) / max(r1 - r0, 1e-6)
+            s0, _, p0 = buf[i - 1]
+            s1, _, p1 = buf[i]
+            if s0 <= t_src <= s1:
+                a = (t_src - s0) / max(s1 - s0, 1e-6)
                 pos = (1 - a) * p0.position + a * p1.position
                 quat = quat_slerp(quat_normalize(p0.quaternion), quat_normalize(p1.quaternion), a)
                 return pos, quat, p1.fix_quality
-        r0, p0 = buf[0]                    # t older than the whole buffer → oldest
+        s0, _, p0 = buf[0]                 # t_src older than the whole buffer → oldest
         return p0.position, p0.quaternion, p0.fix_quality
 
     def _render_delay(self):
-        """Adaptive render delay: ~0 on a smooth link (extrapolate to ~now → lowest
-        latency), growing with measured inter-arrival jitter so a bursty link falls
-        back inside the buffer (interpolate → smooth). Fixed value if POSE_ADAPTIVE=0."""
+        """Adaptive render delay (source-timeline): sit ~one source frame behind the
+        newest sample plus a jitter margin, so on a clean link we interpolate one frame
+        back (low latency, no overshoot) and on a bursty link we grow to stay inside the
+        buffer (interpolate → smooth). Fixed value if POSE_ADAPTIVE=0."""
         if not POSE_ADAPTIVE:
             return POSE_RENDER_DELAY_S
-        return float(np.clip(POSE_JITTER_K * self._jitter_ema,
+        base = self._src_dt_ema if self._src_dt_ema > 0 else 0.0
+        return float(np.clip(base + POSE_JITTER_K * self._jitter_ema,
                              POSE_RENDER_DELAY_MIN, POSE_RENDER_DELAY_MAX))
 
     def step(self, dt_render):
         with self._lock:
             if not self._have:
                 return None
-            t = time.monotonic() - self._render_delay()
-            tgt_pos, tgt_quat, fix = self._target_at(t)
+            now = self._now()
+            # map the local monotonic clock onto the source timeline, then step back
+            # by the render delay. offset = min transport delay (source→local).
+            t_src = (now - (self._offset or 0.0)) - self._render_delay()
+            tgt_pos, tgt_quat, fix = self._target_at(t_src, now)
             # light critically-damped smoothing to absorb segment-boundary kinks
             alpha = 1.0 - np.exp(-dt_render / max(SMOOTH_TAU, 1e-3))
             self._disp_pos = (1 - alpha) * self._disp_pos + alpha * np.asarray(tgt_pos, float)
             self._disp_quat = quat_slerp(self._disp_quat, quat_normalize(tgt_quat), alpha)
-            age = time.monotonic() - self._buf[-1][0]
+            age = now - self._last_recv_mono
             return self._disp_pos.copy(), self._disp_quat.copy(), fix, age
 
     def telemetry(self):
         with self._lock:
             if not self._have:
                 return None
-            age = time.monotonic() - self._buf[-1][0]
-            rate = (1.0 / self._dt_ema) if self._dt_ema > 1e-6 else float("nan")
-            return age, rate, self._e2e_ms, self._buf[-1][1].fix_quality
+            age = self._now() - self._last_recv_mono
+            rate = (1.0 / self._src_dt_ema) if self._src_dt_ema > 1e-6 else float("nan")
+            return age, rate, self._e2e_ms, self._buf[-1][2].fix_quality
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,6 +414,7 @@ class PRISMViewer:
         self._render_fps = 0.0
         self._render_stalls = 0
         self._last_metrics_t = 0.0
+        self._last_cloud_t = 0.0          # throttles the cloud GPU upload (CLOUD_RENDER_HZ)
 
         log.info(f"[Viewer] Connecting to Zenoh at {ZENOH_ROUTER}...")
         self._z = self._open(self._conf())
@@ -714,7 +770,12 @@ class PRISMViewer:
         # cloud: BlockSync hands us the merged map only when a cube changed. Keep the
         # raw snapshot so the ceiling clip can be re-applied instantly on a keypress,
         # and render through one path (which guards against any xyz/rgb mismatch).
-        self._update_cloud()
+        # THROTTLED off the pose/render tick: the heavy whole-cloud GPU upload runs at
+        # CLOUD_RENDER_HZ (deltas coalesce losslessly in the store meanwhile) so it can't
+        # stall the per-tick pose predictor step + avatar redraw below.
+        if CLOUD_RENDER_HZ <= 0 or (now - self._last_cloud_t) >= 1.0 / CLOUD_RENDER_HZ:
+            self._last_cloud_t = now
+            self._update_cloud()
 
         # trajectory
         with self._traj_lock:
