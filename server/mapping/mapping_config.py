@@ -60,7 +60,7 @@ CEILING_Z = _parse_ceiling(os.environ.get("CEILING_Z", ""))
 
 # ── Cloud delivery ───────────────────────────────────────────────────────────
 # Streaming transport for the map point cloud:
-#   "snapshot" (default) — publish the WHOLE current TSDF surface, coarse-voxelised to
+#   "snapshot" (alternative) — publish the WHOLE current TSDF surface, coarse-voxelised to
 #       STREAM_VOXEL_M, as one compressed pack_pcd snapshot per submap (pcd_snapshot).
 #       The client replaces its cloud wholesale, so nothing accumulates and there is no
 #       manifest/diff/pull round-trip. Pairs with reset-each-batch (the map is already

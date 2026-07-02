@@ -396,7 +396,10 @@ def base_height_above_ground(legs: dict, body_rotation=None) -> Optional[float]:
           for p in legs.values() if "foot" in p]
     if not fz:
         return None
-    return float(max(-np.mean(fz), 0.0))
+    # ``foot`` is the wheel HUB (the calf tip), and the contact patch is one WHEEL_RADIUS
+    # below it — so the base sits (-mean(hub_z) + radius) above the TRUE floor. Omitting
+    # the radius reads the whole robot one radius too low (wheels sunk to their hubs).
+    return float(max(-np.mean(fz) + WHEEL_RADIUS, 0.0))
 
 
 def camera_height_above_ground(legs: dict, body_rotation, stick_xyz,

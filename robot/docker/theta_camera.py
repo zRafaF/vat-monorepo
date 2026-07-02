@@ -496,7 +496,12 @@ def main():
     log.info(f"Connecting to Zenoh at {ZENOH_CONNECT}...")
     z = _open_session()
     fps, ws = _get_config()
-    enc_label = "PNG (lossless)" if LOSSLESS else f"JPEG q={JPEG_QUALITY}"
+    if LOSSLESS:
+        enc_label = "PNG (lossless)"
+    elif FRAME_CODEC == "webp":
+        enc_label = f"WebP q={WEBP_QUALITY} (JPEG q={JPEG_QUALITY} fallback)"
+    else:
+        enc_label = f"JPEG q={JPEG_QUALITY}"
     log.info(f"Connected. Theta UVC → '{KEY_OUTPUT}'  @ {fps}Hz  "
              f"window={ws}  encode={enc_label}")
     _tx = f"{TRANSMIT_WIDTH}x{TRANSMIT_HEIGHT}" if TRANSMIT_WIDTH > 0 else "capture-res"

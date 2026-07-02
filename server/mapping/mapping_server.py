@@ -91,14 +91,15 @@ class MappingServer:
         self._pub_pose_cor = self._z.declare_publisher(
             _KEYS["pose_correction"], congestion_control=zenoh.CongestionControl.DROP)
 
-        # Streaming transport: whole-map snapshot (default) or the DEPRECATED diff-based
-        # block sync. Both expose the same ingest_and_publish/reset interface.
+        # Streaming transport: diff-based block sync (default — small per-update payloads
+        # that don't starve the pose stream) or the whole-map snapshot alternative. Both
+        # expose the same ingest_and_publish/reset interface.
         if cfg.STREAM_MODE == "snapshot":
+            log.info("[Server] STREAM_MODE=snapshot (whole-map replace per submap).")
             self._blockpub = SnapshotPublisher(self._z, server_prefix=cfg.SERVER_PREFIX,
                                                max_points=cfg.CLOUD_STREAM_MAX_POINTS)
         else:
-            log.warning("[Server] STREAM_MODE=blocks is the DEPRECATED diff path "
-                        "(kept for A/B; snapshot mode is recommended).")
+            log.info("[Server] STREAM_MODE=blocks (diff-based cube sync).")
             self._blockpub = BlockPublisher(self._z, cube_m=cfg.CUBE_SIZE,
                                             server_prefix=cfg.SERVER_PREFIX,
                                             crc_quant_m=cfg.CRC_QUANT_M,
