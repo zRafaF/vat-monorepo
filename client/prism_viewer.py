@@ -62,6 +62,10 @@ from block_sync import BlockSync  # noqa: E402
 from snapshot_sync import SnapshotSync  # noqa: E402
 from vat_cloudbuffer import IncrementalCloud  # noqa: E402
 from urdf_robot import URDFRobot  # noqa: E402
+try:
+    from surfel import SurfelWorker  # noqa: E402  (oriented-square surfel builder)
+except Exception:
+    SurfelWorker = None
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -118,6 +122,14 @@ CUBE_SIZE     = float(os.environ.get("CUBE_SIZE", "1.0"))   # block-sync cube ed
 # ground — without this the model sits half a wheel into the floor. Defaults to
 # WHEEL_RADIUS; set ROBOT_GROUND_CLEARANCE_M to override (0 restores the old look).
 GROUND_CLEARANCE_M = float(os.environ.get("ROBOT_GROUND_CLEARANCE_M") or WHEEL_RADIUS)
+# Surfels: render the cloud as surface-normal-oriented, unlit SQUARE quads (built off the
+# render thread by surfel.SurfelWorker) instead of camera-facing point splats, so flat
+# surfaces read as a tiled surface. Normals are derived on the client (no transmitted
+# normals → no extra uplink). PCD_SURFEL=0 falls back to the plain point cloud.
+# PCD_SURFEL_SIZE_M is BOTH the neighbour-grid pitch for the normal fit (match the
+# server's STREAM_VOXEL_M) and the square edge length, so squares tile edge-to-edge.
+PCD_SURFEL = os.environ.get("PCD_SURFEL", "1") == "1"
+PCD_SURFEL_SIZE_M = float(os.environ.get("PCD_SURFEL_SIZE_M", "0.08"))
 def _find_urdf() -> str:
     """Locate the robot URDF for the mesh avatar. Override with GO2_URDF; otherwise
     auto-detect a .urdf under client/b2w_description (no env var needed)."""
@@ -386,6 +398,11 @@ class PRISMViewer:
         self._cloud_framed = False
         self._cloud_n = 0
         self._pt_size = PT_SIZE
+        # Surfel renderer (oriented square quads, built off-thread). None → plain points.
+        self._surfel_worker = (SurfelWorker(PCD_SURFEL_SIZE_M)
+                               if (PCD_SURFEL and SurfelWorker is not None) else None)
+        self._surfel_mesh = None
+        self._surfel_warned = False
         # latest merged cloud (pre-display-filter) kept so the ceiling clip can be
         # re-applied instantly on a keypress without waiting for the next submap
         self._cloud_xyz_raw = None
@@ -538,6 +555,14 @@ class PRISMViewer:
             self._cloud_vis.antialias = 1          # soft disc edge, no hard black ring
         except Exception:
             pass
+        # Surfel mesh (oriented square quads): unlit (shading=None) and two-sided
+        # (cull_face=False → the arbitrary normal SIGN doesn't hide any square). Points
+        # are hidden while surfels are on; hidden until the worker delivers a build.
+        if self._surfel_worker is not None:
+            self._surfel_mesh = scene.visuals.Mesh(parent=view.scene, shading=None)
+            self._surfel_mesh.set_gl_state(depth_test=True, cull_face=False)
+            self._surfel_mesh.visible = False
+            self._cloud_vis.visible = False
         self._robot_vis = scene.visuals.Line(parent=view.scene, connect="segments",
                                               width=2.0, antialias=True)
         self._legs_vis = scene.visuals.Line(parent=view.scene, connect="segments",
@@ -664,6 +689,11 @@ class PRISMViewer:
             pass
         finally:
             try:
+                if self._surfel_worker is not None:
+                    self._surfel_worker.stop()
+            except Exception:
+                pass
+            try:
                 self._mcanvas.close()
             except Exception:
                 pass
@@ -702,7 +732,11 @@ class PRISMViewer:
         filter and the optional ceiling clip. Safe to call from the tick or a key."""
         xyz, rgb = self._cloud_xyz_raw, self._cloud_rgb_raw
         if xyz is None or rgb is None or xyz.shape[0] == 0 or xyz.shape[0] != rgb.shape[0]:
-            self._cloud_vis.set_data(np.zeros((0, 3), np.float32))
+            if self._surfel_worker is not None:
+                self._surfel_worker.submit(np.zeros((0, 3), np.float32),
+                                           np.zeros((0, 4), np.float32))
+            else:
+                self._cloud_vis.set_data(np.zeros((0, 3), np.float32))
             self._cloud_n = 0
             return
         keep = np.isfinite(xyz).all(axis=1) & (np.abs(xyz).max(axis=1) <= CLOUD_MAX_M)
@@ -711,10 +745,15 @@ class PRISMViewer:
         x, c = xyz[keep], rgb[keep]
         rgba = np.ones((x.shape[0], 4), np.float32)
         rgba[:, :3] = c.astype(np.float32) / 255.0
-        # edge_color == face_color (width 0) gives a clean, connected Open3D-style
-        # point look instead of black-ringed dots.
-        self._cloud_vis.set_data(x.astype(np.float32), face_color=rgba, edge_color=rgba,
-                                 size=self._pt_size, edge_width=0)
+        if self._surfel_worker is not None:
+            # Build oriented square quads OFF the render thread; the finished mesh is
+            # uploaded in _pump_surfels() on the GL thread when ready.
+            self._surfel_worker.submit(x.astype(np.float32), rgba)
+        else:
+            # edge_color == face_color (width 0) gives a clean, connected Open3D-style
+            # point look instead of black-ringed dots.
+            self._cloud_vis.set_data(x.astype(np.float32), face_color=rgba, edge_color=rgba,
+                                     size=self._pt_size, edge_width=0)
         self._cloud_n = int(x.shape[0])
         if not self._cloud_framed and x.shape[0]:
             self._frame_to(x)
@@ -783,6 +822,10 @@ class PRISMViewer:
         if CLOUD_RENDER_HZ <= 0 or (now - self._last_cloud_t) >= 1.0 / CLOUD_RENDER_HZ:
             self._last_cloud_t = now
             self._update_cloud()
+
+        # Surfels are built off-thread; upload the latest finished mesh here (GL thread).
+        if self._surfel_worker is not None:
+            self._pump_surfels()
 
         # trajectory
         with self._traj_lock:
@@ -904,6 +947,32 @@ class PRISMViewer:
                     log.warning(f"[Viewer] cloud render error (suppressed): {e}")
                     self._cloud_warned = True
             self._tp_cloud.add(int(getattr(self._blocksync, "last_bundle_bytes", 0)))
+
+    def _pump_surfels(self):
+        """Upload the latest off-thread surfel build to the Mesh (GL thread only). On any
+        failure, disable surfels and fall back to the plain point cloud so the view never
+        goes blank."""
+        try:
+            got = self._surfel_worker.take_ready()
+            if got is None:
+                return
+            verts, faces, cols = got
+            if verts.shape[0] == 0 or faces.shape[0] == 0:
+                if self._surfel_mesh is not None:
+                    self._surfel_mesh.visible = False
+                return
+            self._surfel_mesh.set_data(vertices=verts, faces=faces,
+                                       vertex_colors=cols.astype(np.float32))
+            self._surfel_mesh.visible = True
+        except Exception as e:
+            if not self._surfel_warned:
+                log.warning(f"[Viewer] surfel render failed → falling back to points: {e}")
+                self._surfel_warned = True
+            self._surfel_worker = None
+            if self._surfel_mesh is not None:
+                self._surfel_mesh.visible = False
+            self._cloud_vis.visible = True
+            self._render_cloud()
 
     def _update_metrics(self):
         """Render the separate telemetry window: per-path latency + throughput +
