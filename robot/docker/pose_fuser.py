@@ -90,6 +90,7 @@ class PoseFuser:
             fallback_body_height=float(os.environ.get("FALLBACK_BODY_HEIGHT", "0.30")))
         self._est, backend_note = make_estimator(att_gain=ATT_GAIN,
                                                  pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
+        self._backend_note = backend_note
         log.info(f"[Fuser] estimator backend: {backend_note}")
         self._lock = threading.Lock()
         self._last_pub_ns = time.time_ns()
@@ -198,13 +199,20 @@ class PoseFuser:
             except Exception as e:
                 log.warning(f"[Fuser] publish error: {e}")
             if time.time() - last_log > 10:
-                pos, _, vel = self._est.state()
+                st = self._est.state()          # 3-tuple (NumPy) or 4-tuple (gtsam: +accel)
+                pos, vel = st[0], st[2]
                 _, _, body_vx, valid = self._low.get_odom()
                 stale = getattr(self._est, "n_stale", 0)
-                log.info(f"[Fuser] seq={self._seq} odom_valid={valid} "
+                # |vel| is the PUBLISHED world speed the client extrapolates from. If the
+                # robot is visibly moving but |vel|~0, dead-reckoning has no motion (wheel
+                # odom is forward-only and reads ~0 when walking/strafing/turning) -> the
+                # avatar freezes between VGGT corrections. That is the signal to add a
+                # velocity source that works off the wheels (e.g. leg/contact odometry).
+                log.info(f"[Fuser] seq={self._seq} odom_valid={valid} backend={self._backend_note} "
                          f"vggt={self._est.have_vggt} corrections={self._corrections} "
                          f"corr_lag={self._last_corr_lag_s:.2f}s stale_dropped={stale} "
-                         f"body_vx={body_vx:+.2f}m/s pos={np.round(pos, 2)}")
+                         f"body_vx={body_vx:+.2f}m/s |vel|={float(np.linalg.norm(vel)):.2f}m/s "
+                         f"pos={np.round(pos, 2)}")
                 last_log = time.time()
             time.sleep(max(0.0, period - (time.time() - t0)))
 
