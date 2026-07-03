@@ -213,6 +213,15 @@ test_poses: sync-client
 	@echo ">> Reminder: router + robot container + 'make mapping' running."
 	$(CLIENT_RUN) ../tools/view_poses.py
 
+# Data-source probe -- which robot topics/fields actually carry usable data?
+# Text-only: discovers every bridged topic, decodes it, reports nonzero/changing
+# fields + a pose-critical verdict (wheel dq, IMU, velocity, odom). DRIVE the dog
+# during the capture window.  PROBE_S=25 / PROBE_ALL=1 to widen it.
+probe_robot: sync-client
+	@echo ">> Reminder: router + robot container (dynamic_bridge.py) running."
+	@echo ">> DRIVE / MOVE the dog during the $${PROBE_S:-15}s capture window."
+	$(CLIENT_RUN) ../tools/probe_robot_data.py
+
 # ── Docs ─────────────────────────────────────────────────────────────────────
 docs: sync-docs
 	uv run mkdocs build

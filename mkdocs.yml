@@ -94,6 +94,7 @@ nav:
   - Architecture: architecture.md
   - PRISM Streaming POC: streaming_poc.md
   - Bring-up Runbook: bringup.md
+  - Robot Data Sources: robot_data_sources.md
   - Setup:
       - setup/index.md
       - Robot: setup/robot.md

@@ -45,10 +45,27 @@ from gtsam import (Pose3, Rot3, NavState, imuBias,
                    CombinedImuFactor, PriorFactorPose3, PriorFactorVector,
                    PriorFactorConstantBias, NonlinearFactorGraph, Values)
 from gtsam.symbol_shorthand import X, V, B
+# The fixed-lag smoother and its key->timestamp map live in gtsam_unstable in current
+# builds (older builds exposed them on the top-level gtsam module). Import defensively:
+# if neither is present the ImportError propagates and the make_estimator factory falls
+# back to the NumPy estimator, so the pose path still runs.
+try:
+    from gtsam_unstable import BatchFixedLagSmoother, FixedLagSmootherKeyTimestampMap
+except Exception:                                  # pragma: no cover
+    from gtsam import BatchFixedLagSmoother, FixedLagSmootherKeyTimestampMap
 
 from kinematics import Transform
 
 _G = 9.81
+
+
+def _ts_map(pairs):
+    """Build a FixedLagSmootherKeyTimestampMap from (key, seconds) pairs. The smoother's
+    update() requires this native map type - a plain Python dict is NOT accepted."""
+    m = FixedLagSmootherKeyTimestampMap()
+    for k, t in pairs:
+        m.insert((k, float(t)))
+    return m
 
 
 def _rot3_from_xyzw(q) -> Rot3:
@@ -77,8 +94,13 @@ class GTSAMImuEstimator:
         self._odom_sigma = float(os.environ.get("ODOM_VEL_SIGMA", "0.10"))   # m/s
         self._vggt_pos_sigma = float(os.environ.get("VGGT_POS_SIGMA", "0.10"))
         self._vggt_rot_sigma = float(os.environ.get("VGGT_ROT_SIGMA", "0.05"))
-        self._kf_dt = float(os.environ.get("KF_DT_S", "0.1"))     # keyframe cadence
-        lag = float(os.environ.get("POSE_LAG_S", "4.0"))          # fixed-lag window
+        self._kf_dt = float(os.environ.get("KF_DT_S", "0.2"))     # keyframe cadence
+        lag = float(os.environ.get("POSE_LAG_S", "6.0"))          # fixed-lag window
+        # Fixed-lag window in ns. A keyframe older than this has been marginalised out of
+        # the smoother, so a (delayed) VGGT fix must land on a keyframe newer than this -
+        # lag MUST exceed the worst-case VGGT correction latency. Node count = POSE_LAG_S /
+        # KF_DT_S (~30 keyframes here; small so the batch solve stays under the 30 Hz budget).
+        self._lag_ns = int(lag * 1e9)
 
         p = PreintegrationCombinedParams.MakeSharedU(_G)          # z-up world gravity
         I3 = np.eye(3)
@@ -92,7 +114,7 @@ class GTSAMImuEstimator:
 
         self._bias = imuBias.ConstantBias()
         self._pim = PreintegratedCombinedMeasurements(p, self._bias)
-        self._smoother = gtsam.BatchFixedLagSmoother(lag)
+        self._smoother = BatchFixedLagSmoother(lag)
 
         # keyframe state (latest OPTIMISED) + the live forward-predicted nav
         self._i = -1
@@ -165,13 +187,18 @@ class GTSAMImuEstimator:
         g.add(PriorFactorVector(V(0), np.zeros(3), gtsam.noiseModel.Isotropic.Sigma(3, 0.2)))
         g.add(PriorFactorConstantBias(B(0), self._bias,
               gtsam.noiseModel.Isotropic.Sigma(6, 0.1)))
-        self._smoother.update(g, vals, {X(0): 0.0, V(0): 0.0, B(0): 0.0})
+        t0 = t_ns * 1e-9                     # ABSOLUTE seconds (fixed origin -> monotonic)
+        self._smoother.update(g, vals, _ts_map([(X(0), t0), (V(0), t0), (B(0), t0)]))
         self._kf_hist.append((t_ns, 0))
         self._inited = True
 
     def _close_keyframe(self, body_vx, body_vy, t_ns):
         i, j = self._i, self._i + 1
-        tj = (t_ns - self._kf_hist[0][0]) * 1e-9 if self._kf_hist else 0.0
+        # ABSOLUTE seconds with a FIXED origin keeps the fixed-lag timestamps monotonic even
+        # after old keyframes are trimmed from _kf_hist. A moving origin (time since the
+        # oldest kept keyframe) shifts every stamp on each trim and desyncs the lag window,
+        # so the smoother would then marginalise the wrong nodes.
+        tj = t_ns * 1e-9
         pred = self._pim.predict(self._kf_nav, self._kf_bias)
         g, vals = NonlinearFactorGraph(), Values()
         vals.insert(X(j), pred.pose())
@@ -184,7 +211,7 @@ class GTSAMImuEstimator:
         g.add(PriorFactorVector(V(j), v_world,
               gtsam.noiseModel.Isotropic.Sigma(3, self._odom_sigma)))
         try:
-            self._smoother.update(g, vals, {X(j): tj, V(j): tj, B(j): tj})
+            self._smoother.update(g, vals, _ts_map([(X(j), tj), (V(j), tj), (B(j), tj)]))
             self._refresh_from_estimate(j)
         except Exception:
             # keep the predicted nav; a transient solve failure must not stop output
@@ -224,7 +251,7 @@ class GTSAMImuEstimator:
               gtsam.noiseModel.Diagonal.Sigmas(np.array(
                   [self._vggt_rot_sigma] * 3 + [self._vggt_pos_sigma] * 3))))
         try:
-            self._smoother.update(g, Values(), {})
+            self._smoother.update(g, Values(), _ts_map([]))
             self._refresh_from_estimate(self._i)   # re-read the latest after the fuse
             self.have_vggt = True
         except Exception:
@@ -233,6 +260,8 @@ class GTSAMImuEstimator:
     def _nearest_kf(self, t_ns):
         best, bestd = None, None
         for ns, idx in self._kf_hist:
+            if self._last_t_ns - ns > self._lag_ns:
+                continue                    # marginalised out of the fixed lag -> unusable
             d = abs(ns - t_ns)
             if bestd is None or d < bestd:
                 best, bestd = idx, d

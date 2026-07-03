@@ -43,11 +43,12 @@ import zenoh
 import vat_protocol as proto
 from vat_protocol import PoseState, FIX_CORRECTED, FIX_DEADRECKON
 from kinematics import build_robot_model, LowStateTracker, RobotStateTracker, Transform
-# NumPy wheel+IMU estimator (the proven default). The GTSAM IMU-preintegration backend
-# (estimator.make_estimator / gtsam_estimator.py) stays in the tree as experimental —
-# it was reverted here because its fixed-lag solve stalls the 50 Hz loop on the Jetson
-# (high pose latency). Re-wire it via make_estimator once tuned with the replay harness.
-from estimator import WheelInertialEstimator
+# The estimator backend is chosen by POSE_BACKEND via the make_estimator factory:
+#   * gtsam -> IMU-preintegration fixed-lag smoother that FUSES the accelerometer +
+#     gyro + wheel-odometry velocity + the delayed VGGT correction (the default);
+#   * graph / blend -> the pure-NumPy wheel+IMU estimator, used automatically as a
+#     fallback if the gtsam wheel isn't in the image so the pose path never stops.
+from estimator import make_estimator
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -87,9 +88,9 @@ class PoseFuser:
         self._body = RobotStateTracker(
             z, ROBOT_NAME,
             fallback_body_height=float(os.environ.get("FALLBACK_BODY_HEIGHT", "0.30")))
-        self._est = WheelInertialEstimator(att_gain=ATT_GAIN,
-                                           pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
-        log.info(f"[Fuser] estimator backend: {self._est.backend_note}")
+        self._est, backend_note = make_estimator(att_gain=ATT_GAIN,
+                                                 pos_gain=POS_GAIN, rot_gain=ROT_GAIN)
+        log.info(f"[Fuser] estimator backend: {backend_note}")
         self._lock = threading.Lock()
         self._last_pub_ns = time.time_ns()
         self._corrections = 0
@@ -141,24 +142,33 @@ class PoseFuser:
 
     def _publish_once(self):
         now = time.time_ns()
-        imu_quat, gyro, body_vx, valid = self._low.get_odom()
+        # Richer odometry for the fusion backend: IMU attitude + gyro + ACCELEROMETER
+        # (drives the IMU preintegration) + contact-selected wheel speed + wheel-diff
+        # yaw rate. The NumPy backends ignore accel/body_wz, so this is safe for all.
+        imu_quat, gyro, accel, body_vx, body_wz, n_contact, valid = self._low.get_imu_odom()
         body = self._body.get()
+        world_acc = np.zeros(3, dtype=np.float64)
         with self._lock:
             dt = (now - self._last_pub_ns) * 1e-9
             self._last_pub_ns = now
-            self._est.predict(imu_quat, gyro, body_vx, valid, dt, now_ns=now)
+            self._est.predict(imu_quat, gyro, body_vx, valid, dt,
+                              now_ns=now, accel=accel, body_wz=body_wz)
             self._seq += 1
-            pos, quat, world_vel = self._est.state()
+            st = self._est.state()
+            # gtsam backend returns (pos, quat, world_vel, world_accel); the NumPy
+            # backends return the 3-tuple (no accel) -- support both.
+            pos, quat, world_vel = st[0], st[1], st[2]
+            if len(st) >= 4:
+                world_acc = np.asarray(st[3], dtype=np.float64)
             # Vertical comes from body height (map floor = Z 0), so the avatar
             # rises/lowers with the dog's stance instead of staying pinned.
             pos[2] = body.body_height
             corrected = (now - self._est.last_correction_ns) < FIX_HOLD_S * 1e9
             fix = FIX_CORRECTED if (self._est.have_vggt and corrected) else FIX_DEADRECKON
 
-        # linear_acceleration left at its zero default → the client extrapolator degrades
-        # to constant-velocity (exactly the previous behaviour) while keeping the new
-        # low-latency adaptive render delay. Populate it again if a backend that estimates
-        # world accel is re-enabled.
+        # World-frame linear_acceleration from the IMU-fusion backend lets the client
+        # extrapolate at constant ACCELERATION between samples (was constant-velocity when
+        # left zero). Zero for the NumPy backends -> identical to prior behaviour.
         pose = PoseState(
             timestamp_ns=now,
             seq=self._seq,
@@ -166,6 +176,7 @@ class PoseFuser:
             quaternion=quat.astype(np.float32),
             linear_velocity=world_vel.astype(np.float32),
             angular_velocity=np.asarray(gyro, dtype=np.float32),
+            linear_acceleration=world_acc.astype(np.float32),
             fix_quality=fix,
         )
         try:

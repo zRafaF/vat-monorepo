@@ -88,7 +88,7 @@ class WheelInertialEstimator:
 
     def __init__(self, att_gain: float = 0.08,
                  pos_gain: float = 0.5, rot_gain: float = 0.5,
-                 history_s: float = 15.0):
+                 history_s: float = 15.0, backend: str | None = None):
         # raw odometry-integrated pose, in its own drifting frame
         self._odom_pos = np.zeros(3, dtype=np.float64)
         self._odom_quat = quat_identity()           # xyzw
@@ -110,7 +110,11 @@ class WheelInertialEstimator:
         # fits the recent VGGT fixes against the odometry chain → converges in one
         # solve, less jitter, drift-corrected); "blend" = the legacy single-anchor
         # complementary blend. POSE_BACKEND=blend to fall back.
-        self._backend = os.environ.get("POSE_BACKEND", "graph").strip().lower()
+        self._backend = (backend or os.environ.get("POSE_BACKEND", "graph")).strip().lower()
+        # POSE_BACKEND=gtsam only reaches the NumPy estimator as a FALLBACK (gtsam wheel
+        # absent); 'graph' is the best NumPy option, so coerce anything but 'blend' to it.
+        if self._backend != "blend":
+            self._backend = "graph"
         if self._backend == "graph" and not _HAVE_POSE_GRAPH:
             self._backend = "blend"          # module missing → safe fallback
         self._graph = (SlidingWindowPoseGraph(
