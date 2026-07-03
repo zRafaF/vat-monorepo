@@ -285,20 +285,27 @@ class WheelInertialEstimator:
 
 def make_estimator(att_gain: float = 0.08, pos_gain: float = 0.5,
                    rot_gain: float = 0.5):
-    """Backend factory (POSE_BACKEND): 'gtsam' → GTSAM IMU-preintegration smoother
-    (best quality; needs the gtsam wheel); 'graph'/'blend' → the NumPy
-    WheelInertialEstimator. If GTSAM import/construction fails we fall back to the NumPy
-    estimator so the pose path never stops. Returns (estimator, note)."""
-    backend = os.environ.get("POSE_BACKEND", "graph").strip().lower()
-    if backend == "gtsam":
+    """Backend factory (POSE_BACKEND):
+      'eskf'  -> ESKFEstimator: pure-NumPy wheel + IMU error-state KF with a delayed
+                 VGGT re-anchor (DEFAULT). Velocity is a filtered state, so the pose
+                 stays smooth between corrections (fixes the freeze) and it always runs
+                 (no native deps -- unlike the removed gtsam backend that never loaded
+                 on the Jetson).
+      'graph' -> WheelInertialEstimator sliding-window pose graph (legacy).
+      'blend' -> WheelInertialEstimator single-anchor complementary blend (legacy).
+    All pure NumPy, so the pose path never stops. Returns (estimator, note)."""
+    backend = os.environ.get("POSE_BACKEND", "eskf").strip().lower()
+    if backend in ("eskf", "kf", ""):
         try:
-            from gtsam_estimator import GTSAMImuEstimator
-            est = GTSAMImuEstimator(pos_gain=pos_gain, rot_gain=rot_gain)
+            from eskf_estimator import ESKFEstimator
+            est = ESKFEstimator(att_gain=att_gain, pos_gain=pos_gain, rot_gain=rot_gain)
             return est, est.backend_note
         except Exception as e:
-            print(f"[Estimator] GTSAM backend unavailable ({e}); "
+            print(f"[Estimator] ESKF backend unavailable ({e}); "
                   f"falling back to WheelInertialEstimator")
-    est = WheelInertialEstimator(att_gain=att_gain, pos_gain=pos_gain, rot_gain=rot_gain)
+        backend = "graph"
+    est = WheelInertialEstimator(att_gain=att_gain, pos_gain=pos_gain, rot_gain=rot_gain,
+                                 backend=backend if backend in ("graph", "blend") else "graph")
     return est, est.backend_note
 
 

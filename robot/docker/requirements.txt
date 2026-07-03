@@ -2,7 +2,5 @@ eclipse-zenoh==1.9.0
 numpy>=1.24
 opencv-python-headless>=4.9
 rosbags>=0.10
-# NOTE: gtsam (POSE_BACKEND=gtsam) is installed in a SEPARATE, non-fatal Dockerfile
 # step — only a pre-release wheel (4.3a0) exists for aarch64/cp310, and pinning it here
 # would hard-fail the whole build. Kept out of this file so the container always builds;
-# if gtsam is absent the fuser auto-falls back to the NumPy estimator.
