@@ -130,6 +130,7 @@ class GTSAMImuEstimator:
 
         self.have_vggt = False
         self.last_correction_ns = 0
+        self.n_stale = 0   # VGGT fixes dropped for being older than the fixed lag
         self.backend_note = f"gtsam (CombinedImuFactor, lag={lag}s, kf_dt={self._kf_dt}s)"
 
     # ── high-rate prediction ────────────────────────────────────────────────
@@ -243,6 +244,15 @@ class GTSAMImuEstimator:
         self.last_correction_ns = now_ns if now_ns is not None else self._last_t_ns
         idx = self._nearest_kf(int(capture_ts_ns) if capture_ts_ns is not None else self._last_t_ns)
         if idx is None:
+            # The fix is older than the fixed-lag window (its keyframe was already
+            # marginalised) -> it cannot be fused. Count + log it instead of silently
+            # dropping, so a chronic mismatch between VGGT latency and POSE_LAG_S is
+            # visible (raise POSE_LAG_S). have_vggt stays as-is (no anchor this round).
+            self.n_stale = getattr(self, "n_stale", 0) + 1
+            lag_s = (self._last_t_ns - int(capture_ts_ns)) * 1e-9 if capture_ts_ns else -1.0
+            if self.n_stale == 1 or self.n_stale % 20 == 0:
+                print(f"[GTSAM] VGGT fix {lag_s:.2f}s old exceeds POSE_LAG_S="
+                      f"{self._lag_ns * 1e-9:.1f}s -> dropped (n={self.n_stale}); raise POSE_LAG_S")
             return
         R = _rot3_from_xyzw(base_world.rotation)
         t = np.asarray(base_world.translation, dtype=np.float64).reshape(3)

@@ -93,7 +93,8 @@ class PoseFuser:
         log.info(f"[Fuser] estimator backend: {backend_note}")
         self._lock = threading.Lock()
         self._last_pub_ns = time.time_ns()
-        self._corrections = 0
+        self._corrections = 0          # fixes handed to the estimator (received)
+        self._last_corr_lag_s = float("nan")   # capture -> apply latency of the last fix
         self._seq = 0
 
         self._pub = z.declare_publisher(
@@ -121,6 +122,9 @@ class PoseFuser:
         cam_world = Transform.from_xyz_quat(c.position, c.quaternion)
         base_world = self._model.base_from_camera_world(cam_world)
         now = time.time_ns()
+        # capture -> apply latency of THIS fix (the real VGGT correction lag: how old the
+        # keyframe this fix describes is by the time we fold it in). Surfaced in the 10 s log.
+        self._last_corr_lag_s = (now - c.timestamp_ns) * 1e-9
         # c.timestamp_ns is the keyframe CAPTURE time (robot clock) — the fix is
         # stale by (now - capture). Hand both to the estimator so it re-anchors at
         # the right point in its history instead of teleporting the live pose.
@@ -196,8 +200,10 @@ class PoseFuser:
             if time.time() - last_log > 10:
                 pos, _, vel = self._est.state()
                 _, _, body_vx, valid = self._low.get_odom()
+                stale = getattr(self._est, "n_stale", 0)
                 log.info(f"[Fuser] seq={self._seq} odom_valid={valid} "
                          f"vggt={self._est.have_vggt} corrections={self._corrections} "
+                         f"corr_lag={self._last_corr_lag_s:.2f}s stale_dropped={stale} "
                          f"body_vx={body_vx:+.2f}m/s pos={np.round(pos, 2)}")
                 last_log = time.time()
             time.sleep(max(0.0, period - (time.time() - t0)))
