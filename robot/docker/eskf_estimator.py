@@ -70,8 +70,8 @@ class ESKFEstimator:
     """Wheel + IMU error-state KF with a delayed VGGT re-anchor. Interface matches
     ``WheelInertialEstimator``: ``predict`` (high rate) / ``correct`` (VGGT) / ``state``."""
 
-    def __init__(self, att_gain: float = 0.08, pos_gain: float = 0.7,
-                 rot_gain: float = 0.7, history_s: float = 15.0, **_ignored):
+    def __init__(self, att_gain: float = 0.08, pos_gain: float = 1.0,
+                 rot_gain: float = 1.0, history_s: float = 15.0, **_ignored):
         # --- filtered odometry state (odom frame) ---
         self._p = np.zeros(3, dtype=np.float64)
         self._v = np.zeros(3, dtype=np.float64)
@@ -83,6 +83,12 @@ class ESKFEstimator:
         # --- world <- odom correction (from VGGT), applied in state() ---
         self._corr_R = quat_identity()
         self._corr_p = np.zeros(3, dtype=np.float64)
+        # Target the live correction SLEWS toward. correct() sets this to the FULL
+        # VGGT-derived anchor (no "half-way" blend); predict() eases the live
+        # correction toward it over ~CORRECTION_SLEW_TAU seconds, so the pose
+        # converges ALL THE WAY to VGGT without a single-frame teleport.
+        self._corr_R_target = quat_identity()
+        self._corr_p_target = np.zeros(3, dtype=np.float64)
 
         # --- time-indexed odometry history for delayed VGGT matching ---
         self._history: deque = deque()            # (t_ns, p, q)
@@ -97,6 +103,11 @@ class ESKFEstimator:
         self._vert_sigma = float(os.environ.get("ESKF_VERT_SIGMA", "0.10"))  # m/s vertical
         self._pos_gain = pos_gain
         self._rot_gain = rot_gain
+        # Correction slew time-constant (s). >0: ease the live world<-odom anchor
+        # toward the target over ~tau seconds (smooth + full convergence). 0: adopt
+        # the full correction instantly (can visibly jump when a fix is stale/large,
+        # so keep >0 unless the correction latency is already tiny).
+        self._slew_tau = float(os.environ.get("CORRECTION_SLEW_TAU", "0.3"))
         self._zupt_vx = float(os.environ.get("ESKF_ZUPT_VX", "0.03"))       # m/s
         self._zupt_gyro = float(os.environ.get("ESKF_ZUPT_GYRO", "0.05"))   # rad/s
         self._bias_beta = float(os.environ.get("ESKF_BIAS_BETA", "0.01"))   # bias EMA rate
@@ -180,6 +191,20 @@ class ESKFEstimator:
                 (self._last_t_ns - self._history[0][0]) > self._history_ns:
             self._history.popleft()
 
+        # --- ease the live world<-odom correction toward the VGGT target ---
+        # Converge FULLY to the anchor (target holds the fix in full) but spread over
+        # ~slew_tau seconds so a correction glides in over a few frames instead of
+        # teleporting. alpha is the per-tick fraction for this dt (exact at tau→dt).
+        if self.have_vggt:
+            a = 1.0 if self._slew_tau <= 0.0 else min(1.0, dt / self._slew_tau)
+            if a >= 1.0:
+                self._corr_p = self._corr_p_target.copy()
+                self._corr_R = self._corr_R_target.copy()
+            else:
+                self._corr_p = self._corr_p + a * (self._corr_p_target - self._corr_p)
+                self._corr_R = quat_normalize(
+                    quat_slerp(self._corr_R, self._corr_R_target, a))
+
     def _odom_at(self, t_ns: int):
         """Interpolate the odometry (p, q) at a past time from the history buffer."""
         h = self._history
@@ -217,14 +242,24 @@ class ESKFEstimator:
         p_corr_new = p_v - quat_rotate(R_corr_new, op)
 
         if not self.have_vggt:
+            # First fix: snap live AND target so state() reflects it immediately.
             self._corr_R = R_corr_new
-            self._corr_p = p_corr_new
+            self._corr_R_target = R_corr_new.copy()
+            self._corr_p = p_corr_new.copy()
+            self._corr_p_target = p_corr_new.copy()
             self.have_vggt = True
         else:
-            self._corr_p = (1.0 - self._pos_gain) * self._corr_p \
+            # Move the TARGET to the fresh anchor. pos_gain/rot_gain default to 1.0
+            # (adopt the fix in full → converge ALL the way, not half-way); lower
+            # them only if you want extra low-pass smoothing of VGGT noise at the
+            # target level. predict() then slews the live correction to this target.
+            self._corr_p_target = (1.0 - self._pos_gain) * self._corr_p_target \
                 + self._pos_gain * p_corr_new
-            self._corr_R = quat_normalize(
-                quat_slerp(self._corr_R, R_corr_new, self._rot_gain))
+            self._corr_R_target = quat_normalize(
+                quat_slerp(self._corr_R_target, R_corr_new, self._rot_gain))
+            if self._slew_tau <= 0.0:
+                self._corr_p = self._corr_p_target.copy()
+                self._corr_R = self._corr_R_target.copy()
 
     # -- accessor -------------------------------------------------------------
     def state(self):

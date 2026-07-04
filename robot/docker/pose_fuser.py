@@ -61,13 +61,14 @@ ROBOT_NAME    = os.environ.get("ROBOT_NAME",    "go2")
 ZENOH_CONNECT = os.environ.get("ZENOH_CONNECT", "tcp/127.0.0.1:7447")
 PUBLISH_HZ    = float(os.environ.get("PUBLISH_HZ",          "50.0"))
 ATT_GAIN      = float(os.environ.get("ATTITUDE_GAIN",       "0.08"))
-# Correction blend gains: fraction of each VGGT correction folded into the anchor.
-# 0.7 converges the avatar in ~2 corrections (vs ~5 at 0.5), so the "green pose
-# takes a while to reach the right spot" is much shorter. The server-side deadband
-# already suppresses still-scene jitter, so a higher gain is safe. (The real fix for
-# convergence + drift is a pose-graph backend — see docs/streaming_poc.md.)
-POS_GAIN      = float(os.environ.get("CORRECTION_POS_GAIN", "0.7"))
-ROT_GAIN      = float(os.environ.get("CORRECTION_ROT_GAIN", "0.7"))
+# Correction gains: fraction of each VGGT anchor folded into the correction TARGET.
+# 1.0 = converge the avatar ALL the way to VGGT (no residual "half-way" offset). The
+# ESKF no longer steps the *live* pose by this fraction — it slews smoothly to the
+# target over CORRECTION_SLEW_TAU seconds — so full gain is smooth, not a teleport.
+# The server-side deadband/outlier gate already suppresses still-scene jitter. Lower
+# these below 1.0 only to add extra low-pass smoothing of VGGT noise at the target.
+POS_GAIN      = float(os.environ.get("CORRECTION_POS_GAIN", "1.0"))
+ROT_GAIN      = float(os.environ.get("CORRECTION_ROT_GAIN", "1.0"))
 FIX_HOLD_S    = float(os.environ.get("FIX_HOLD_S",          "1.0"))
 
 _KEYS = proto.keys(ROBOT_NAME)
