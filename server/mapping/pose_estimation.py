@@ -101,11 +101,16 @@ class PoseCorrectionGate:
     """
 
     def __init__(self, max_speed: float, jump_margin: float,
-                 deadband_m: float, deadband_deg: float):
+                 deadband_m: float, deadband_deg: float,
+                 monotonic: bool = False):
         self.max_speed = max_speed
         self.jump_margin = jump_margin
         self.deadband_m = deadband_m
         self.deadband_deg = deadband_deg
+        # When True, suppress any correction whose keyframe time is older/equal to the
+        # newest already published (see CORRECTION_MONOTONIC) — keeps the robot always
+        # re-anchoring forward in time, never to a staler batch-tiled window.
+        self.monotonic = monotonic
         self.reset()
 
     def reset(self):
@@ -116,6 +121,7 @@ class PoseCorrectionGate:
         self.n_published = 0
         self.n_suppressed = 0
         self.n_rejected = 0
+        self.n_stale = 0
 
     def evaluate(self, pos, quat, cam_ts_s: Optional[float],
                  scale_committed: bool):
@@ -127,6 +133,14 @@ class PoseCorrectionGate:
         self.last_reason = "published"
         if not scale_committed:
             self.last_reason = "warmup (scale not committed)"
+            return None
+        # Monotonic guard: drop corrections that would re-anchor to a keyframe no newer
+        # than the last one published (backward-in-time fixes from a reset batch's early
+        # tiled window). Only meaningful when we have keyframe timestamps on both.
+        if (self.monotonic and cam_ts_s is not None and self._ts is not None
+                and cam_ts_s <= self._ts):
+            self.n_stale += 1
+            self.last_reason = f"stale ts ({cam_ts_s:.2f}s <= last {self._ts:.2f}s)"
             return None
         pos = np.asarray(pos, dtype=np.float64)
         quat = np.asarray(quat, dtype=np.float64)

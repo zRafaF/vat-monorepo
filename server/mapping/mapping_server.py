@@ -71,7 +71,8 @@ class MappingServer:
         self._last_frame_robot_ns = 0
         self._corr_gate = PoseCorrectionGate(
             cfg.CORRECTION_MAX_SPEED, cfg.CORRECTION_JUMP_MARGIN,
-            cfg.CORRECTION_DEADBAND_M, cfg.CORRECTION_DEADBAND_DEG)
+            cfg.CORRECTION_DEADBAND_M, cfg.CORRECTION_DEADBAND_DEG,
+            monotonic=cfg.CORRECTION_MONOTONIC)
 
         log.info(f"[Server] Connecting to Zenoh at {cfg.ZENOH_ROUTER}...")
         conf = zenoh.Config()
@@ -398,7 +399,7 @@ class MappingServer:
                 log.info(f"[Server] ▣ batch: {n_sub} submap(s) in {time.time()-t0:.2f}s "
                          f"→ v{version}, {last_pts} surface pts | corr published "
                          f"{self._corr_gate.n_published} suppressed {self._corr_gate.n_suppressed} "
-                         f"rejected {self._corr_gate.n_rejected}")
+                         f"rejected {self._corr_gate.n_rejected} stale {self._corr_gate.n_stale}")
         except Exception:
             log.error(f"[Server] PRISM run failed:\n{traceback.format_exc()}")
         finally:

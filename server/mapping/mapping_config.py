@@ -208,6 +208,12 @@ CORRECTION_MAX_SPEED    = float(os.environ.get("CORRECTION_MAX_SPEED", "2.5"))
 CORRECTION_JUMP_MARGIN  = float(os.environ.get("CORRECTION_JUMP_MARGIN", "0.75"))
 CORRECTION_DEADBAND_M   = float(os.environ.get("CORRECTION_DEADBAND_M", "0.06"))
 CORRECTION_DEADBAND_DEG = float(os.environ.get("CORRECTION_DEADBAND_DEG", "3.0"))
+# Monotonic guard: never publish a correction whose keyframe capture time is OLDER
+# than (or equal to) the newest already published. A reset batch tiles the rebuilt
+# span oldest-window-first, so across a batch boundary its first submap can carry a
+# keyframe a frame or two behind the previous batch's last correction — this drops
+# those backward re-anchors so the robot only ever moves to a fresher pose. 1 = on.
+CORRECTION_MONOTONIC    = os.environ.get("CORRECTION_MONOTONIC", "1") == "1"
 
 
 # ── Navigation ESDF (world-frame collision field) ────────────────────────────
