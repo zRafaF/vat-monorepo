@@ -185,9 +185,12 @@ def open_capture() -> cv2.VideoCapture:
 class ThetaCapture(threading.Thread):
     """Reads frames from the Theta and pushes them into the decimator."""
 
-    def __init__(self, decimator: "FrameDecimator"):
+    def __init__(self, decimator: "FrameDecimator", periscope=None):
         super().__init__(daemon=True)
         self._decimator = decimator
+        # Optional remote-periscope service: fed the SAME live full-res frame (no
+        # second capture, no fps-capped archive). submit_frame is non-blocking.
+        self._periscope = periscope
         self._stop = threading.Event()
         self._frames = 0
 
@@ -242,7 +245,10 @@ class ThetaCapture(threading.Thread):
                             break
                         continue
                     self._frames += 1
-                    self._decimator.push(time.time_ns(), frame)
+                    ts_ns = time.time_ns()
+                    self._decimator.push(ts_ns, frame)
+                    if self._periscope is not None:
+                        self._periscope.submit_frame(frame, ts_ns)
             except Exception as e:
                 log.warning(f"[Capture] error: {e}")
             finally:
@@ -545,7 +551,19 @@ def main():
             archive = None
     decimator = FrameDecimator(z, state, model, archive=archive, leg_tracker=leg_tracker)
 
-    capture = ThetaCapture(decimator)
+    # Remote periscope (optional): shares this process's live full-res frame. Its
+    # own Zenoh session isolates its QoS from the mapping stream. A failure here
+    # must never take down the camera, so it is fully guarded.
+    periscope = None
+    try:
+        from periscope import config as psc_cfg, PeriscopeService
+        if psc_cfg.ENABLE:
+            periscope = PeriscopeService()
+    except Exception as e:
+        log.warning(f"[periscope] disabled (init failed): {e}")
+        periscope = None
+
+    capture = ThetaCapture(decimator, periscope=periscope)
     capture.start()
 
     z.declare_subscriber(KEY_THROTTLE_FPS, _on_throttle_fps)
@@ -560,6 +578,8 @@ def main():
         pass
     finally:
         capture.stop()
+        if periscope is not None:
+            periscope.close()
         if archive is not None:
             archive.close()
         z.close()

@@ -465,6 +465,23 @@ class PRISMViewer:
         self._z_fast.declare_subscriber(_KEYS["pose"], self._on_pose)
         self._body_tracker = RobotStateTracker(self._z_fast, ROBOT_NAME)
         self._leg_tracker = LowStateTracker(self._z_fast, ROBOT_NAME)
+        # Remote periscope (optional): shares the low-latency session; publishes the
+        # aim and decodes the returned video slice. Guarded so the viewer runs even
+        # if the periscope module / a codec is unavailable.
+        self._periscope = None
+        self._peri_panel_on = True
+        try:
+            from periscope_view import PeriscopeClient
+            self._periscope = PeriscopeClient(
+                self._z_fast, ROBOT_NAME,
+                min_fov=float(os.environ.get("PERISCOPE_MIN_FOV", "20")),
+                max_fov=float(os.environ.get("PERISCOPE_MAX_FOV", "130")),
+                default_fov=float(os.environ.get("PERISCOPE_DEFAULT_FOV", "90")),
+                default_tier=int(os.environ.get("PERISCOPE_RES", "480")),
+                default_aspect=os.environ.get("PERISCOPE_ASPECT", "1:1"))
+        except Exception as _e:
+            log.warning(f"[Viewer] periscope disabled: {_e}")
+            self._periscope = None
         # Incremental render buffer: update only the cubes that changed each submap
         # instead of re-merging + re-uploading the whole cloud (the render "stalls").
         # VIEWER_INCREMENTAL=0 forces the simple whole-cloud merge path.
@@ -588,6 +605,24 @@ class PRISMViewer:
         scene.visuals.XYZAxis(parent=view.scene)
         self._view = view
 
+        # ── remote periscope gizmos: two camera-anchored frustums + a video panel ──
+        # requested (amber) leads the operator's aim; actual (cyan) is where the
+        # currently-displayed frame was really rendered (lags on a pan). A low-res
+        # texture is dropped on the panel; full-res lives in the side panel image.
+        self._peri_req_vis = self._peri_act_vis = self._peri_panel = None
+        if self._periscope is not None:
+            self._peri_req_vis = scene.visuals.Line(parent=view.scene, connect="segments",
+                                                    color=(1.0, 0.80, 0.20, 0.9), width=1.5)
+            self._peri_act_vis = scene.visuals.Line(parent=view.scene, connect="segments",
+                                                    color=(0.30, 0.85, 1.0, 0.9), width=1.5)
+            self._peri_act_vis.visible = False
+            try:
+                self._peri_panel = scene.visuals.Image(parent=canvas.scene, method="auto")
+                self._peri_panel.visible = False
+            except Exception as _e:
+                log.warning(f"[Viewer] periscope panel unavailable ({_e})")
+                self._peri_panel = None
+
         # latency HUD — fixed top-left overlay in canvas pixel coords (y-down)
         self._hud = scene.visuals.Text("", color=(0.8, 1.0, 0.85, 1.0), bold=False,
                                        font_size=9, anchor_x="left", anchor_y="top",
@@ -678,6 +713,22 @@ class PRISMViewer:
             elif k == "]":                      # raise the ceiling
                 base = self._ceiling_z if self._ceiling_z is not None else CEILING_START
                 self._set_ceiling(base + CEILING_STEP)
+            # ── periscope aim (j/l yaw, i/k pitch, o/p zoom, g recenter, y aspect,
+            #    v toggle panel, b force keyframe) ──
+            elif self._periscope is not None and k in ("j", "l", "i", "k", "o", "p",
+                                                       "g", "y", "v", "b"):
+                p = self._periscope
+                if k == "j":   p.nudge(-5.0, 0.0)
+                elif k == "l": p.nudge(+5.0, 0.0)
+                elif k == "i": p.nudge(0.0, +5.0)
+                elif k == "k": p.nudge(0.0, -5.0)
+                elif k == "o": p.zoom(0.8)          # zoom in  (narrower FOV)
+                elif k == "p": p.zoom(1.25)         # zoom out (wider FOV)
+                elif k == "g": p.yaw = 0.0; p.pitch = 0.0; p.publish()
+                elif k == "y": p.cycle_aspect(); log.info(f"[periscope] aspect {p.aspect}")
+                elif k == "v":
+                    self._peri_panel_on = not self._peri_panel_on
+                elif k == "b": p.request_keyframe()
 
         self._timer = app.Timer(interval=1.0 / max(RENDER_HZ, 1.0),
                                 connect=self._on_tick, start=True)
@@ -838,6 +889,13 @@ class PRISMViewer:
         pred = self._predictor.step(dt)
         if pred is not None:
             self._draw_robot(pred)
+            if self._periscope is not None:
+                try:
+                    self._draw_periscope(pred)
+                except Exception as e:
+                    if not getattr(self, "_peri_warned", False):
+                        log.warning(f"[Viewer] periscope draw error (suppressed): {e}")
+                        self._peri_warned = True
 
         # 3rd-person follow: ease the orbit pivot toward the robot (jump-proof).
         if self._follow:
@@ -859,6 +917,42 @@ class PRISMViewer:
                 if not getattr(self, "_metrics_warned", False):
                     log.warning(f"[Viewer] metrics update error (suppressed): {e}")
                     self._metrics_warned = True
+
+    def _draw_periscope(self, pred):
+        """Update the two camera-anchored frustum gizmos (requested amber / actual
+        cyan) and the video panel, using the SAME displayed pose as the avatar."""
+        p = self._periscope
+        if p is None or self._peri_req_vis is None:
+            return
+        pos, quat, fix, age = pred
+        R = quat_to_R(quat)
+        if self._yaw_offset_deg:
+            Y = _yaw_R(self._yaw_offset_deg)
+            R, pos = Y @ R, Y @ pos
+        cam_pos = pos + R @ STICK                    # anchor at the CAMERA, not base
+        far = 3.0
+        self._peri_req_vis.set_data(pos=p.frustum_world(
+            cam_pos, R, p.yaw, p.pitch, p.hfov, p.req_vfov(), far))
+        act = p.latest_actual()
+        if act is not None and not p.stale():
+            self._peri_act_vis.set_data(pos=p.frustum_world(
+                cam_pos, R, act["yaw"], act["pitch"], act["hfov"], act["vfov"], far))
+            self._peri_act_vis.visible = True
+        else:
+            self._peri_act_vis.visible = False
+        if self._peri_panel is not None:
+            img = p.latest_image()
+            if img is not None and self._peri_panel_on and not p.stale():
+                self._peri_panel.set_data(np.ascontiguousarray(img))
+                cw, ch = self._canvas.size
+                disp_w = 320.0
+                sc = disp_w / float(img.shape[1])
+                self._peri_panel.transform = scene.transforms.STTransform(
+                    translate=(cw - disp_w - 12, ch - img.shape[0] * sc - 12),
+                    scale=(sc, sc))
+                self._peri_panel.visible = True
+            else:
+                self._peri_panel.visible = False
 
     def _draw_robot(self, pred):
         """Draw the robot at the predicted pose. Uses the URDF mesh when in mesh mode

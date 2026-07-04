@@ -92,6 +92,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Architecture: architecture.md
+  - Remote Periscope: periscope.md
   - PRISM Streaming POC: streaming_poc.md
   - Bring-up Runbook: bringup.md
   - Robot Data Sources: robot_data_sources.md

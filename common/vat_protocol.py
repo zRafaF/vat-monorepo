@@ -62,9 +62,16 @@ MAGIC_TRAJ  = 0x54524A00  # "TRJ\x00"
 MAGIC_POSE  = 0x504F5345  # "POSE"
 MAGIC_PCOR  = 0x50434F52  # "PCOR"
 MAGIC_CMDV  = 0x434D4456  # "CMDV"
+MAGIC_VREQ  = 0x56524551  # "VREQ" — periscope view request (client → robot)
+MAGIC_PSCF  = 0x50534346  # "PSCF" — periscope encoded frame (robot → client)
 
 # cmd_vel flag bits (bitmask in the CmdVel.flags byte)
 CMDV_FLAG_ESTOP = 0x01   # latched emergency stop — robot enters Damp, ignores motion
+
+# Periscope video codec ids (in the PeriscopeFrame header)
+PSCOPE_CODEC_MJPEG = 0   # per-frame JPEG (fallback; every frame is a keyframe)
+PSCOPE_CODEC_H264  = 1   # H.264 / AVC (Annex-B NAL units)
+PSCOPE_CODEC_HEVC  = 2   # H.265 / HEVC (Annex-B NAL units)
 
 # Fix-quality enum for pose messages
 FIX_DEADRECKON = 0   # propagating on odometry only
@@ -109,6 +116,12 @@ def keys(robot_name: str = "go2", server_prefix: str = "server/prism") -> dict:
         "cfg_window_size":  f"{robot_name}/rt/prism/config/window_size",
         # teleoperation (client/server → robot, DOWN): velocity commands + e-stop
         "cmd_vel":         f"{robot_name}/teleop/cmd_vel",
+        # remote periscope: aim request DOWN (client → robot, robot subscribes over
+        # its outbound link), encoded video slice UP (robot → client), and a
+        # force-keyframe request DOWN for resync after a dropped frame / new viewer.
+        "periscope_request":  f"{robot_name}/prism/periscope/request",
+        "periscope_frame":    f"{robot_name}/prism/periscope/frame",
+        "periscope_keyframe": f"{robot_name}/prism/periscope/keyframe",
         # liveliness tokens
         "live_server":     f"{server_prefix}/liveliness",
         "live_pose":       f"{robot_name}/prism/pose/liveliness",
@@ -507,6 +520,115 @@ def unpack_cmd_vel(buf: bytes) -> CmdVel:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Periscope view request   {robot}/prism/periscope/request   (client → robot)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+#   magic i | ts_ns q | seq I | yaw f | pitch f | hfov f | res_tier H |
+#   aspect_w B | aspect_h B
+#   → fixed 28 bytes. yaw/pitch/hfov in DEGREES; res_tier is the short-side px
+#     (360/480/720); aspect as a small integer ratio (e.g. 1:1, 16:9).
+#
+_VREQ_FMT = "!iqIfffHBB"
+_VREQ_SIZE = struct.calcsize(_VREQ_FMT)
+
+
+@dataclass
+class ViewRequest:
+    yaw_deg: float = 0.0
+    pitch_deg: float = 0.0
+    hfov_deg: float = 90.0
+    res_tier: int = 480
+    aspect_w: int = 1
+    aspect_h: int = 1
+    seq: int = 0
+    timestamp_ns: int = 0
+
+    @property
+    def aspect(self) -> str:
+        return f"{self.aspect_w}:{self.aspect_h}"
+
+
+def pack_view_request(v: ViewRequest) -> bytes:
+    return struct.pack(_VREQ_FMT, MAGIC_VREQ, int(v.timestamp_ns),
+                       int(v.seq) & 0xFFFFFFFF, float(v.yaw_deg), float(v.pitch_deg),
+                       float(v.hfov_deg), int(v.res_tier) & 0xFFFF,
+                       int(v.aspect_w) & 0xFF, int(v.aspect_h) & 0xFF)
+
+
+def unpack_view_request(buf: bytes) -> ViewRequest:
+    if len(buf) < _VREQ_SIZE:
+        raise ProtocolError("view_request buffer too short")
+    vals = struct.unpack_from(_VREQ_FMT, buf, 0)
+    if vals[0] != MAGIC_VREQ:
+        raise ProtocolError(f"bad view_request magic 0x{vals[0] & 0xFFFFFFFF:08X}")
+    return ViewRequest(timestamp_ns=vals[1], seq=vals[2], yaw_deg=vals[3],
+                       pitch_deg=vals[4], hfov_deg=vals[5], res_tier=vals[6],
+                       aspect_w=vals[7], aspect_h=vals[8])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Periscope frame   {robot}/prism/periscope/frame   (robot → client)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+#   magic i | seq I | ts_ns q (capture) | codec B (PSCOPE_CODEC_*) |
+#   is_keyframe B | width H | height H | native_w H |
+#   yaw f | pitch f | hfov f | vfov f | aspect_w B | aspect_h B | optical B
+#   ++ encoded byte payload
+#
+# The header echoes the ACTUAL rendered view (yaw/pitch/hfov/vfov/aspect) so the
+# client can draw the "actual" frustum and know whether it is upscaling (optical
+# flag + native_w vs width). ``optical=0`` ⇒ source-limited: width == native_w and
+# the client scales up to its display.
+#
+_PSF_FMT = "!iIqBBHHHffffBBB"
+_PSF_SIZE = struct.calcsize(_PSF_FMT)
+
+
+@dataclass
+class PeriscopeFrame:
+    seq: int = 0
+    timestamp_ns: int = 0
+    codec: int = PSCOPE_CODEC_MJPEG
+    is_keyframe: bool = True
+    width: int = 0
+    height: int = 0
+    native_w: int = 0
+    yaw_deg: float = 0.0
+    pitch_deg: float = 0.0
+    hfov_deg: float = 90.0
+    vfov_deg: float = 90.0
+    aspect_w: int = 1
+    aspect_h: int = 1
+    optical: bool = True
+    payload: bytes = b""
+
+
+def pack_periscope_frame(f: PeriscopeFrame) -> bytes:
+    hdr = struct.pack(_PSF_FMT, MAGIC_PSCF, int(f.seq) & 0xFFFFFFFF,
+                      int(f.timestamp_ns), int(f.codec) & 0xFF,
+                      1 if f.is_keyframe else 0, int(f.width) & 0xFFFF,
+                      int(f.height) & 0xFFFF, int(f.native_w) & 0xFFFF,
+                      float(f.yaw_deg), float(f.pitch_deg), float(f.hfov_deg),
+                      float(f.vfov_deg), int(f.aspect_w) & 0xFF,
+                      int(f.aspect_h) & 0xFF, 1 if f.optical else 0)
+    return hdr + bytes(f.payload)
+
+
+def unpack_periscope_frame(buf: bytes) -> PeriscopeFrame:
+    if len(buf) < _PSF_SIZE:
+        raise ProtocolError("periscope frame buffer too short")
+    v = struct.unpack_from(_PSF_FMT, buf, 0)
+    if v[0] != MAGIC_PSCF:
+        raise ProtocolError(f"bad periscope frame magic 0x{v[0] & 0xFFFFFFFF:08X}")
+    return PeriscopeFrame(seq=v[1], timestamp_ns=v[2], codec=v[3],
+                          is_keyframe=bool(v[4]), width=v[5], height=v[6],
+                          native_w=v[7], yaw_deg=v[8], pitch_deg=v[9],
+                          hfov_deg=v[10], vfov_deg=v[11], aspect_w=v[12],
+                          aspect_h=v[13], optical=bool(v[14]),
+                          payload=buf[_PSF_SIZE:])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Quaternion helpers   (Hamilton, xyzw order) — used by fuser and predictor
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -602,6 +724,8 @@ ENC_POSE  = "application/vat.pose"
 ENC_PCOR  = "application/vat.pose_correction"
 ENC_TRAJ  = "application/vat.trajectory"
 ENC_CMDV  = "application/vat.cmd_vel"
+ENC_VREQ  = "application/vat.view_request"
+ENC_PSCF  = "application/vat.periscope_frame"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -671,6 +795,23 @@ def _selftest() -> None:
     assert e.seq == 11 and e.estop and abs(e.vx - 0.25) < 1e-6 \
         and abs(e.vy + 0.1) < 1e-6 and abs(e.vyaw - 0.4) < 1e-6
     assert not CmdVel(vx=0.1).estop
+
+    # periscope view_request round-trip
+    vr = ViewRequest(yaw_deg=-33.5, pitch_deg=12.0, hfov_deg=75.0, res_tier=720,
+                     aspect_w=16, aspect_h=9, seq=5, timestamp_ns=88)
+    vr2 = unpack_view_request(pack_view_request(vr))
+    assert vr2.seq == 5 and vr2.res_tier == 720 and vr2.aspect == "16:9"
+    assert abs(vr2.yaw_deg + 33.5) < 1e-4 and abs(vr2.hfov_deg - 75.0) < 1e-4
+
+    # periscope frame round-trip (header echo + opaque payload)
+    pf = PeriscopeFrame(seq=9, timestamp_ns=123, codec=PSCOPE_CODEC_HEVC,
+                        is_keyframe=True, width=480, height=480, native_w=320,
+                        yaw_deg=10.0, pitch_deg=-5.0, hfov_deg=30.0, vfov_deg=30.0,
+                        aspect_w=1, aspect_h=1, optical=False, payload=b"\x00\x01NALU")
+    pf2 = unpack_periscope_frame(pack_periscope_frame(pf))
+    assert pf2.seq == 9 and pf2.codec == PSCOPE_CODEC_HEVC and pf2.is_keyframe
+    assert pf2.width == 480 and pf2.native_w == 320 and not pf2.optical
+    assert pf2.payload == b"\x00\x01NALU" and abs(pf2.hfov_deg - 30.0) < 1e-4
 
     # quaternion math
     qx = quat_from_rotvec([np.pi / 2, 0, 0])           # 90° about +x

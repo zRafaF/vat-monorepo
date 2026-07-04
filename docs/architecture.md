@@ -32,7 +32,7 @@ The client provides the operator with an intuitive, lag-free teleoperation inter
 ### User Experience (UX)
 
 * **Third-Person "Toy Box" View:** First-person VR teleoperation typically induces severe motion sickness due to latency and robot bouncing. We use a "God-Mode" perspective. The PRISM map is represented as a point cloud, and we apply a plane slice on the ceiling so the user views the environment top-down.
-* **The "Beacon" (Virtual Monitor):** To compensate for the lack of texture detail in point clouds, the user can steer a virtual "beacon" or raycast. This projects a real-time, high-definition video stream (via WebRTC) onto a virtual screen at the point of interest for detailed inspections.
+* **The "Beacon" (Virtual Monitor) / Periscope:** To compensate for the lack of texture detail in point clouds, the user steers a directable video slice — the **[Remote Periscope](periscope.md)** — cut from the robot's 360° camera. Rather than streaming the whole panorama, only the pointed-at slice is transmitted (cropped from the 4K frame), so zoom trades FOV for detail and the bandwidth stays low. A camera-anchored 3D wireframe frustum aims it, and the HD feed is shown both textured in-scene and in a full-resolution side panel. See [Remote Periscope](periscope.md) for the projection/zoom math, transport, and configuration.
 * **1-Frame RGBD Mesh:** To provide instantaneous collision awareness, the client renders the raw RGBD frame from the robot as a local mesh attached to the front of the 3D robot avatar. This single-frame display is updated at high frequency and acts as a "headlight," allowing the user to react to fast-moving dynamic obstacles before they are integrated into the global PRISM map.
 
 ### Robot Avatar & Client-Side Prediction
