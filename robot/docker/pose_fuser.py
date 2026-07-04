@@ -98,11 +98,20 @@ class PoseFuser:
         self._last_corr_lag_s = float("nan")   # capture -> apply latency of the last fix
         self._seq = 0
 
-        self._pub = z.declare_publisher(
-            _KEYS["pose"],
+        # express=True: flush each (tiny) pose sample immediately instead of
+        # letting it wait up to the transport's adaptive-batching window
+        # (transport/link/tx/queue/batching.time_limit, 1 ms by default) behind
+        # bulk frame data. This is the latency lever for the pose "chug" during
+        # camera bursts. Fall back gracefully if the installed zenoh binding
+        # predates the `express` kwarg.
+        _pose_qos = dict(
             congestion_control=zenoh.CongestionControl.DROP,   # realtime
             priority=zenoh.Priority.DATA_HIGH,
         )
+        try:
+            self._pub = z.declare_publisher(_KEYS["pose"], express=True, **_pose_qos)
+        except TypeError:
+            self._pub = z.declare_publisher(_KEYS["pose"], **_pose_qos)
         try:
             self._live = z.liveliness().declare_token(_KEYS["live_pose"])
         except Exception:

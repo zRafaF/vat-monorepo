@@ -69,6 +69,16 @@ log = logging.getLogger("theta-camera")
 
 ROBOT_NAME      = os.environ.get("ROBOT_NAME",      "go2")
 ZENOH_CONNECT   = os.environ.get("ZENOH_CONNECT",   "tcp/127.0.0.1:7447")
+# Cap the TCP send buffer (bytes) on THIS process's uplink to the router. The
+# bulk frame stream is the only thing that can bloat the kernel socket buffer;
+# a large buffer lets a burst of frame bytes queue up ahead of the realtime pose
+# packets (which ride a separate session/link but share the physical uplink and
+# the bottleneck queue) → the pose "chug". Bounding so_sndbuf limits how many
+# frame bytes can sit un-preemptable in flight, trading a little frame throughput
+# for lower pose latency under load. Empty/0 = leave the OS default (off).
+# ~256 KiB ≈ a couple of frames; lower toward 131072 for more aggressive latency,
+# raise if frame throughput on a fast link suffers. Tuned in vat.env.
+FRAME_SO_SNDBUF = os.environ.get("FRAME_SO_SNDBUF", "").strip()
 JPEG_QUALITY    = int(os.environ.get("JPEG_QUALITY", "85"))
 # Transmit codec for the live frame: "webp" (≈25-35% smaller than JPEG at equal quality
 # → less robot-uplink bandwidth, which is what starves the pose stream) or "jpeg". The
@@ -482,7 +492,14 @@ def _on_window_size(sample):
 
 def _open_session() -> zenoh.Session:
     conf = zenoh.Config()
-    conf.insert_json5("connect/endpoints", f'["{ZENOH_CONNECT}"]')
+    # Optionally bound the send buffer on the frame uplink (see FRAME_SO_SNDBUF).
+    # so_sndbuf is a per-endpoint locator option honoured for TCP/TLS links.
+    endpoint = ZENOH_CONNECT
+    if FRAME_SO_SNDBUF and FRAME_SO_SNDBUF != "0":
+        sep = ";" if "#" in endpoint else "#"
+        endpoint = f"{endpoint}{sep}so_sndbuf={FRAME_SO_SNDBUF}"
+        log.info(f"[camera] uplink send buffer capped: so_sndbuf={FRAME_SO_SNDBUF}")
+    conf.insert_json5("connect/endpoints", f'["{endpoint}"]')
     conf.insert_json5("mode", '"peer"')
     while True:
         try:
