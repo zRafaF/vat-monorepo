@@ -84,6 +84,13 @@ class PeriscopeClient:
         self._actual = None                   # latest actual view meta (dict)
         self._last_frame_t = 0.0
         self._decode_warned = False
+        # diagnostics + keepalive
+        self._n_recv = 0                      # PeriscopeFrame messages received
+        self._n_dec = 0                       # frames successfully decoded
+        self._last_bytes = 0
+        self._last_codec = None
+        self._decode_err = None
+        self._last_pub_t = 0.0
 
         self._pub = self._z.declare_publisher(self._K["periscope_request"])
         self._pub_kf = self._z.declare_publisher(self._K["periscope_keyframe"])
@@ -133,6 +140,29 @@ class PeriscopeClient:
             self._pub.put(proto.pack_view_request(v))
         except Exception as e:
             log.debug(f"[periscope] view request publish failed: {e}")
+        self._last_pub_t = time.time()
+
+    def keepalive(self, interval_s: float = 1.0):
+        """Re-send the current view periodically so the robot keeps streaming (its
+        viewer-timeout stops encoding when no request has arrived recently). Call
+        this every render tick; it self-throttles to ``interval_s``."""
+        if self.enabled and (time.time() - self._last_pub_t) >= interval_s:
+            self.publish()
+
+    def status_text(self) -> str:
+        """One-line human status for the viewer overlay."""
+        if not self.enabled:
+            return "periscope: off (v)"
+        if self._n_recv == 0:
+            return "periscope: no frames yet (is the robot service up? try 'b')"
+        if self._n_dec == 0:
+            hint = self._decode_err or "install PyAV for H.26x"
+            return f"periscope: {self._n_recv} rx but 0 decoded ({hint})"
+        a = self.latest_actual() or {}
+        opt = "optical" if a.get("optical") else "digital"
+        return (f"periscope: {a.get('width','?')}x{a.get('height','?')} {opt} "
+                f"fov{a.get('hfov',0):.0f} codec{self._last_codec} "
+                f"{self._last_bytes//1024}KB rx{self._n_recv}")
 
     # -- incoming frames (Zenoh callback thread) ------------------------------
     def _on_frame(self, sample):
@@ -140,9 +170,13 @@ class PeriscopeClient:
             f = proto.unpack_periscope_frame(bytes(sample.payload))
         except proto.ProtocolError:
             return
+        self._n_recv += 1
+        self._last_bytes = len(f.payload)
+        self._last_codec = f.codec
         try:
             rgb = self._decoder.decode(f.codec, f.payload)
         except Exception as e:
+            self._decode_err = str(e)[:60]
             if not self._decode_warned:
                 log.warning(f"[periscope] decode unavailable for codec {f.codec} "
                             f"({e}); install PyAV for H.26x. MJPEG works without it.")
@@ -150,6 +184,7 @@ class PeriscopeClient:
             return
         if rgb is None:
             return
+        self._n_dec += 1
         with self._lock:
             self._img = rgb
             self._actual = dict(yaw=f.yaw_deg, pitch=f.pitch_deg, hfov=f.hfov_deg,

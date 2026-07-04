@@ -338,7 +338,6 @@ Key env vars for the server:
 # from the repo root (config from vat.env) — runs in client/.venv
 make viewer            # VisPy POC viewer (native OpenGL)
 # or directly:  cd client && uv run python prism_viewer.py --snapshot
-make viewer-rerun      # legacy Rerun viewer (debug/compare)
 ```
 
 The POC viewer is **VisPy** (native-OpenGL GPU point scatter; the earlier Rerun

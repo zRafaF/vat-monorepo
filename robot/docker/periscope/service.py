@@ -49,6 +49,8 @@ class PeriscopeService:
         self._enc = None
         self._enc_dims = None              # (w, h) the current encoder was built for
         self._last_idr = 0.0
+        self._pub_count = 0                # frames published (for the stats log)
+        self._last_stat_t = 0.0
         self._stop = threading.Event()
 
         self._z = self._open_session()
@@ -152,7 +154,15 @@ class PeriscopeService:
                 aspect, tier, last_req = self._aspect, self._tier, self._last_req_t
             fps = self._target_fps(now, last_req)
             period = 1.0 / max(1.0, fps)
-            if frame is None or not self._viewer_active(now, last_req):
+            active = self._viewer_active(now, last_req)
+            if now - self._last_stat_t >= 10.0:      # heartbeat every 10 s
+                self._last_stat_t = now
+                enc = type(self._enc).__name__ if self._enc else "none"
+                age = (now - last_req) if last_req > 0 else -1.0
+                log.info(f"[periscope] published={self._pub_count} viewer_active={active} "
+                         f"last_req_age={age:.1f}s fps={fps:.0f} enc={enc} "
+                         f"dims={self._enc_dims} frame={'yes' if frame is not None else 'NONE'}")
+            if frame is None or not active:
                 time.sleep(min(0.2, max(period, 0.05)))
                 continue
             try:
@@ -201,6 +211,7 @@ class PeriscopeService:
                 self._pub.put(buf, encoding=proto.ENC_PSCF)
             except TypeError:
                 self._pub.put(buf)
+            self._pub_count += 1
 
     def close(self):
         self._stop.set()

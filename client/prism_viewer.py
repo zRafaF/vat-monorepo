@@ -58,12 +58,12 @@ from vat_telemetry import ThroughputMeter, ClockOffsetEstimator  # noqa: E402
 import zenoh  # noqa: E402
 from kinematics import RobotStateTracker, LowStateTracker, LEG_ORDER, WHEEL_RADIUS  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))         # client/ (block_sync)
-from block_sync import BlockSync  # noqa: E402
-from snapshot_sync import SnapshotSync  # noqa: E402
+from vat_client.block_sync import BlockSync  # noqa: E402
+from vat_client.snapshot_sync import SnapshotSync  # noqa: E402
 from vat_cloudbuffer import IncrementalCloud  # noqa: E402
-from urdf_robot import URDFRobot  # noqa: E402
+from vat_client.urdf_robot import URDFRobot  # noqa: E402
 try:
-    from surfel import SurfelWorker  # noqa: E402  (oriented-square surfel builder)
+    from vat_client.surfel import SurfelWorker  # noqa: E402  (oriented-square surfel builder)
 except Exception:
     SurfelWorker = None
 
@@ -471,7 +471,7 @@ class PRISMViewer:
         self._periscope = None
         self._peri_panel_on = True
         try:
-            from periscope_view import PeriscopeClient
+            from vat_client.periscope_view import PeriscopeClient
             self._periscope = PeriscopeClient(
                 self._z_fast, ROBOT_NAME,
                 min_fov=float(os.environ.get("PERISCOPE_MIN_FOV", "20")),
@@ -628,7 +628,24 @@ class PRISMViewer:
                                        font_size=9, anchor_x="left", anchor_y="top",
                                        parent=canvas.scene)
         # pushed well below the OS title bar so it isn't occluded
-        self._hud.transform = scene.transforms.STTransform(translate=(12, 40))
+        self._hud.transform = scene.transforms.STTransform(translate=(12, 72))
+
+        # periscope status + controls cheat-sheet — single-line Text visuals (a
+        # multi-line Text overlaps on this VisPy/glfw build, see the telemetry note
+        # above), anchored bottom-left so they never collide with the top HUD.
+        self._peri_hud = scene.visuals.Text("", color=(0.55, 0.85, 1.0, 0.95),
+                                            font_size=8, anchor_x="left",
+                                            anchor_y="bottom", parent=canvas.scene)
+        self._peri_hud.transform = scene.transforms.STTransform(
+            translate=(12, canvas.size[1] - 30))
+        _controls = ("periscope: j/l yaw  i/k pitch  o/p zoom  g center  y aspect  "
+                     "v panel  b keyframe    |    view: t follow  f frame  r reset  "
+                     "c/[/] ceiling  n/m ptsize  1 resync")
+        self._controls_hud = scene.visuals.Text(_controls, color=(0.5, 0.55, 0.66, 0.9),
+                                                font_size=8, anchor_x="left",
+                                                anchor_y="bottom", parent=canvas.scene)
+        self._controls_hud.transform = scene.transforms.STTransform(
+            translate=(12, canvas.size[1] - 12))
 
         # ── separate TELEMETRY window (latency / throughput / drops / pose) ──
         # One Text visual PER LINE, stacked vertically. A single multi-line Text
@@ -884,6 +901,16 @@ class PRISMViewer:
         if traj is not None and traj.shape[0] >= 2:
             t = traj @ _yaw_R(self._yaw_offset_deg).T if self._yaw_offset_deg else traj
             self._traj_vis.set_data(pos=t.astype(np.float32))
+
+        # periscope: keep the robot streaming (viewer-timeout guard) + refresh status,
+        # independent of whether a pose has arrived yet.
+        if self._periscope is not None:
+            try:
+                self._periscope.keepalive()
+                if getattr(self, "_peri_hud", None) is not None:
+                    self._peri_hud.text = self._periscope.status_text()
+            except Exception:
+                pass
 
         # robot at the predicted pose — URDF mesh or wireframe skeleton
         pred = self._predictor.step(dt)
