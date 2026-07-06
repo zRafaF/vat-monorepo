@@ -106,8 +106,8 @@ PERI_HELD_MAX_S     = float(os.environ.get("PERISCOPE_HELD_MAX_S", "10.0"))    #
 RGBD_ENABLE       = (os.environ.get("RGBD_ENABLE", "1").strip().lower() in ("1","true","yes","on"))
 RGBD_OFFSET       = np.array([float(os.environ.get("RGBD_OFFSET_X", "0.30")),
                               float(os.environ.get("RGBD_OFFSET_Y", "0.0")),
-                              float(os.environ.get("RGBD_OFFSET_Z", "0.0"))], dtype=float)
-RGBD_PITCH_DEG    = float(os.environ.get("RGBD_PITCH_DEG", "15"))    # downward tilt (deg)
+                              float(os.environ.get("RGBD_OFFSET_Z", "0.10"))], dtype=float)
+RGBD_PITCH_DEG    = float(os.environ.get("RGBD_PITCH_DEG", "30"))    # downward tilt (deg)
 RGBD_PANEL_M      = float(os.environ.get("RGBD_PANEL_M", "1.0"))     # panel distance (m)
 RGBD_FRUSTUM_M    = float(os.environ.get("RGBD_FRUSTUM_M", "1.2"))   # frustum length (m)
 RGBD_DEFAULT_KIND = os.environ.get("RGBD_DEFAULT_KIND", "depth").strip().lower()
@@ -115,6 +115,8 @@ RGBD_FPS          = int(os.environ.get("RGBD_FPS", "20"))
 RGBD_MAX_RANGE_M  = float(os.environ.get("RGBD_MAX_RANGE_M", "4.0"))
 RGBD_FLIP_X       = float(os.environ.get("RGBD_FLIP_X", "1"))
 RGBD_FLIP_Y       = float(os.environ.get("RGBD_FLIP_Y", "1"))
+RGBD_POINT_SIZE   = float(os.environ.get("RGBD_POINT_SIZE", "4"))   # voxel point px
+RGBD_STRIDE       = int(os.environ.get("RGBD_STRIDE", "2"))         # depth pixel decimation
 STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))
 SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
@@ -675,11 +677,14 @@ class PRISMViewer:
                 self._peri_panel = None
 
         # ── RGBD D435i gizmos: a forward frustum + a live frame panel inside it ──
-        self._rgbd_frustum = self._rgbd_panel = None
+        self._rgbd_frustum = self._rgbd_panel = self._rgbd_cloud = None
         if self._rgbd is not None:
             self._rgbd_frustum = scene.visuals.Line(parent=view.scene, connect="segments",
                                                     color=(1.0, 0.55, 0.2, 0.9), width=1.5)
             self._rgbd_frustum.visible = False
+            self._rgbd_cloud = scene.visuals.Markers(parent=view.scene)
+            self._rgbd_cloud.set_gl_state(depth_test=True)
+            self._rgbd_cloud.visible = False
             try:
                 self._rgbd_panel = scene.visuals.Image(parent=view.scene, method="auto")
                 self._rgbd_panel.set_gl_state(depth_test=False, cull_face=False)
@@ -1010,6 +1015,7 @@ class PRISMViewer:
         # robot at the predicted pose — URDF mesh or wireframe skeleton
         pred = self._predictor.step(dt)
         if pred is not None:
+            self._last_pred = pred
             self._draw_robot(pred)
             if self._periscope is not None:
                 try:
@@ -1018,13 +1024,19 @@ class PRISMViewer:
                     if not getattr(self, "_peri_warned", False):
                         log.warning(f"[Viewer] periscope draw error (suppressed): {e}")
                         self._peri_warned = True
-            if self._rgbd is not None:
-                try:
-                    self._draw_rgbd(pred)
-                except Exception as e:
-                    if not getattr(self, "_rgbd_warned", False):
-                        log.warning(f"[Viewer] rgbd draw error (suppressed): {e}")
-                        self._rgbd_warned = True
+        # RGBD voxels refresh EVERY tick from the latest depth frame, DECOUPLED from the
+        # pose predictor (they were freezing at one frame whenever step() returned None).
+        # Use the last known pose; fall back to identity so it still streams standalone.
+        if self._rgbd is not None:
+            rp = pred if pred is not None else getattr(self, "_last_pred", None)
+            if rp is None:
+                rp = (np.zeros(3, np.float32), np.array([0.0, 0.0, 0.0, 1.0], np.float32), 0, 0.0)
+            try:
+                self._draw_rgbd(rp)
+            except Exception as e:
+                if not getattr(self, "_rgbd_warned", False):
+                    log.warning(f"[Viewer] rgbd draw error (suppressed): {e}")
+                    self._rgbd_warned = True
 
         # 3rd-person follow: ease the orbit pivot toward the robot (jump-proof).
         if self._follow:
@@ -1146,6 +1158,8 @@ class PRISMViewer:
             self._rgbd_frustum.visible = False
             if self._rgbd_panel is not None:
                 self._rgbd_panel.visible = False
+            if self._rgbd_cloud is not None:
+                self._rgbd_cloud.visible = False
             return
         m = r.latest_meta() or {}
         hfov = float(m.get("hfov", 87.0)); vfov = float(m.get("vfov", 58.0))
@@ -1172,8 +1186,21 @@ class PRISMViewer:
         segs = np.array([a,c1, a,c2, a,c3, a,c4, c1,c2, c2,c3, c3,c4, c4,c1], dtype=np.float32)
         self._rgbd_frustum.set_data(pos=segs)
         self._rgbd_frustum.visible = True
-        # live frame panel filling the frustum at RGBD_PANEL_M
-        if self._rgbd_panel is not None:
+        depth8, dm = r.latest_depth()
+        if depth8 is not None and self._rgbd_cloud is not None:
+            # DEPTH -> 3D voxels deprojected into the WORLD (single frame, no accumulation)
+            pts, cols = self._rgbd_deproject(depth8, img, m, cam_pos, right, up, fwd)
+            if pts is not None and len(pts):
+                self._rgbd_cloud.set_data(pts, face_color=cols, edge_width=0, size=RGBD_POINT_SIZE)
+                self._rgbd_cloud.visible = True
+            else:
+                self._rgbd_cloud.visible = False
+            if self._rgbd_panel is not None:
+                self._rgbd_panel.visible = False
+        elif self._rgbd_panel is not None:
+            # COLOR -> flat "what is it" panel filling the frustum at RGBD_PANEL_M
+            if self._rgbd_cloud is not None:
+                self._rgbd_cloud.visible = False
             d = RGBD_PANEL_M
             Wm = 2.0*d*np.tan(np.radians(hfov)/2.0); Hm = 2.0*d*np.tan(np.radians(vfov)/2.0)
             Cc = cam_pos + fwd * d
@@ -1187,6 +1214,39 @@ class PRISMViewer:
             self._rgbd_panel.set_data(np.ascontiguousarray(img))
             self._rgbd_panel.transform = scene.transforms.MatrixTransform(M)
             self._rgbd_panel.visible = True
+
+    def _rgbd_deproject(self, depth8, colimg, m, cam_pos, right, up, fwd):
+        """Deproject the 8-bit depth frame to world-space voxel points (no accumulation).
+        Depth is scaled over [0,max_range]; intrinsics come from the sensor FOV (centered
+        principal point). Optical axes map to the D435i basis: +x=right, +y=down=-up,
+        +z=fwd. Colors come from the colorized depth (near=warm). Range-limited already."""
+        H, W = depth8.shape
+        st = max(1, RGBD_STRIDE)
+        d = depth8[::st, ::st]
+        col = colimg[::st, ::st]
+        valid = d > 0
+        if not valid.any():
+            return None, None
+        max_r = float(m.get("max_range_mm", 4000)) / 1000.0
+        hfov = np.radians(float(m.get("hfov", 87.0))); vfov = np.radians(float(m.get("vfov", 58.0)))
+        fx = (W / 2.0) / np.tan(hfov / 2.0); fy = (H / 2.0) / np.tan(vfov / 2.0)
+        cx = W / 2.0; cy = H / 2.0
+        hs, ws = d.shape
+        us = (np.arange(ws) * st).astype(np.float32)[None, :].repeat(hs, 0)
+        vs = (np.arange(hs) * st).astype(np.float32)[:, None].repeat(ws, 1)
+        z = d.astype(np.float32) * (max_r / 254.0)          # metric depth (approx)
+        valid = valid & (z <= max_r + 0.05)                 # enforce range clip on the client too
+        if not valid.any():
+            return None, None
+        x = (us - cx) / fx * z
+        y = (vs - cy) / fy * z
+        P = (cam_pos[None, None, :] + x[..., None] * right
+             + y[..., None] * (-up) + z[..., None] * fwd)
+        pts = P[valid].astype(np.float32)
+        cols = np.empty((pts.shape[0], 4), np.float32)
+        cols[:, :3] = col[valid].astype(np.float32) / 255.0
+        cols[:, 3] = 1.0
+        return pts, cols
 
     def _draw_robot(self, pred):
         """Draw the robot at the predicted pose. Uses the URDF mesh when in mesh mode

@@ -49,7 +49,8 @@ class RgbdClient:
         self._seq = 0
 
         self._lock = threading.Lock()
-        self._img = None                 # latest decoded RGB uint8 (H,W,3)
+        self._img = None                 # latest decoded RGB uint8 (H,W,3) (depth colorized / color)
+        self._depth8 = None              # latest raw 8-bit depth (H,W) for 3D deprojection; None for color
         self._meta = None                # dict: kind,hfov,vfov,width,height,max_range_mm,min_depth_mm
         self._last_frame_t = 0.0
         self._last_pub_t = 0.0
@@ -108,16 +109,19 @@ class RgbdClient:
             self.publish()
 
     # -- incoming frames (Zenoh callback thread) ------------------------------
-    def _decode(self, f) -> "np.ndarray | None":
+    def _decode(self, f):
+        """Return (rgb, depth8): rgb is the display image (colorized depth / color);
+        depth8 is the raw 8-bit depth (near..far over max_range) for 3D deprojection,
+        or None for the color stream."""
         import cv2
         arr = np.frombuffer(f.payload, np.uint8)
         if f.kind == proto.RGBD_KIND_COLOR:
             bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            return None if bgr is None else bgr[:, :, ::-1].copy()   # BGR->RGB
+            return (None, None) if bgr is None else (bgr[:, :, ::-1].copy(), None)
         # depth: single-channel 8-bit, 0 = invalid, 1..255 = near..far over max_range
         d = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
         if d is None:
-            return None
+            return None, None
         if d.ndim == 3:
             d = d[:, :, 0]
         d = d.astype(np.uint8)
@@ -127,7 +131,7 @@ class RgbdClient:
         except Exception:
             cm = cv2.applyColorMap(inv, cv2.COLORMAP_JET)
         cm[d == 0] = 0                                    # invalid -> black
-        return cm[:, :, ::-1].copy()                     # BGR->RGB
+        return cm[:, :, ::-1].copy(), d                  # (RGB, raw depth8)
 
     def _on_frame(self, sample):
         try:
@@ -137,7 +141,7 @@ class RgbdClient:
         self._n_recv += 1
         self._last_bytes = len(f.payload)
         try:
-            rgb = self._decode(f)
+            rgb, depth8 = self._decode(f)
         except Exception as e:
             self._decode_err = str(e)[:60]
             if not self._decode_warned:
@@ -155,6 +159,7 @@ class RgbdClient:
                 self._fps = (len(self._recv_t) - 1) / span
         with self._lock:
             self._img = rgb
+            self._depth8 = depth8
             self._meta = dict(kind=f.kind, hfov=f.hfov_deg, vfov=f.vfov_deg,
                               width=f.width, height=f.height,
                               max_range_mm=f.max_range_mm, min_depth_mm=f.min_depth_mm)
@@ -168,6 +173,13 @@ class RgbdClient:
     def latest_meta(self):
         with self._lock:
             return None if self._meta is None else dict(self._meta)
+
+    def latest_depth(self):
+        """(raw 8-bit depth (H,W), meta) for 3D deprojection; (None, None) for color."""
+        with self._lock:
+            if self._depth8 is None or self._meta is None:
+                return None, None
+            return self._depth8, dict(self._meta)
 
     def fps(self) -> float:
         if not self._recv_t or (time.monotonic() - self._recv_t[-1]) > 1.0:
