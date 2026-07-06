@@ -42,10 +42,20 @@ ROBOT_NAME    = os.environ.get("ROBOT_NAME", "go2")
 ZENOH_CONNECT = os.environ.get("ZENOH_CONNECT", "tcp/127.0.0.1:7447")
 SO_SNDBUF     = os.environ.get("RGBD_SO_SNDBUF", "262144").strip()
 
-DEPTH_TOPIC   = os.environ.get("RGBD_DEPTH_TOPIC", "/camera/camera/depth/image_rect_raw")
-COLOR_TOPIC   = os.environ.get("RGBD_COLOR_TOPIC", "/camera/camera/color/image_raw")
-DEPTH_INFO    = os.environ.get("RGBD_DEPTH_INFO_TOPIC", "/camera/camera/depth/camera_info")
-COLOR_INFO    = os.environ.get("RGBD_COLOR_INFO_TOPIC", "/camera/camera/color/camera_info")
+# Topics are comma-separated LISTS so the relay is namespace-agnostic: realsense2_camera
+# publishes under /camera/camera/... OR /camera/... depending on launch args, so we
+# subscribe to both and use whichever actually delivers frames.
+def _tlist(env, default):
+    return [t.strip() for t in os.environ.get(env, default).split(",") if t.strip()]
+
+DEPTH_TOPICS  = _tlist("RGBD_DEPTH_TOPIC",
+                       "/camera/camera/depth/image_rect_raw,/camera/depth/image_rect_raw")
+COLOR_TOPICS  = _tlist("RGBD_COLOR_TOPIC",
+                       "/camera/camera/color/image_raw,/camera/color/image_raw")
+DEPTH_INFOS   = _tlist("RGBD_DEPTH_INFO_TOPIC",
+                       "/camera/camera/depth/camera_info,/camera/depth/camera_info")
+COLOR_INFOS   = _tlist("RGBD_COLOR_INFO_TOPIC",
+                       "/camera/camera/color/camera_info,/camera/color/camera_info")
 
 SEND_WIDTH    = int(os.environ.get("RGBD_SEND_WIDTH", "424"))     # downscale long side; 0=native
 JPEG_QUALITY  = int(os.environ.get("RGBD_JPEG_QUALITY", "70"))
@@ -87,7 +97,7 @@ class RgbdRelay:
         K = proto.keys(ROBOT_NAME)
         self._z.declare_subscriber(K["rgbd_request"], self._on_request)
         log.info(f"[rgbd] relay: req<-'{K['rgbd_request']}' frame->'{K['rgbd_frame']}' "
-                 f"depth='{DEPTH_TOPIC}' color='{COLOR_TOPIC}'")
+                 f"depth={DEPTH_TOPICS} color={COLOR_TOPICS}")
 
     # -- Zenoh ---------------------------------------------------------------
     def _open_session(self):
@@ -291,11 +301,16 @@ def main():
             super().__init__("vat_rgbd_relay")
             self._dfov = (0.0, 0.0)
             self._cfov = (0.0, 0.0)
-            self.create_subscription(Image, DEPTH_TOPIC, self._depth_cb, qos_profile_sensor_data)
-            self.create_subscription(Image, COLOR_TOPIC, self._color_cb, qos_profile_sensor_data)
-            self.create_subscription(CameraInfo, DEPTH_INFO, self._dinfo_cb, qos_profile_sensor_data)
-            self.create_subscription(CameraInfo, COLOR_INFO, self._cinfo_cb, qos_profile_sensor_data)
-            self.get_logger().info("vat_rgbd_relay subscribed to realsense topics")
+            self._seen = set()
+            for t in DEPTH_TOPICS:
+                self.create_subscription(Image, t, self._mk_depth_cb(t), qos_profile_sensor_data)
+            for t in COLOR_TOPICS:
+                self.create_subscription(Image, t, self._mk_color_cb(t), qos_profile_sensor_data)
+            for t in DEPTH_INFOS:
+                self.create_subscription(CameraInfo, t, self._dinfo_cb, qos_profile_sensor_data)
+            for t in COLOR_INFOS:
+                self.create_subscription(CameraInfo, t, self._cinfo_cb, qos_profile_sensor_data)
+            self.get_logger().info(f"vat_rgbd_relay subscribed: depth={DEPTH_TOPICS} color={COLOR_TOPICS}")
 
         def _dinfo_cb(self, m):
             self._dfov = _fov_from_info(m.width, m.height, m.k[0], m.k[4])
@@ -303,15 +318,25 @@ def main():
         def _cinfo_cb(self, m):
             self._cfov = _fov_from_info(m.width, m.height, m.k[0], m.k[4])
 
-        def _depth_cb(self, m):
-            arr, enc = _decode_image(m)
-            if arr is not None and arr.dtype == np.uint16:
-                relay.on_depth(arr, *self._dfov)
+        def _mk_depth_cb(self, topic):
+            def cb(m):
+                arr, enc = _decode_image(m)
+                if arr is not None and arr.dtype == np.uint16:
+                    if ("d", topic) not in self._seen:
+                        self._seen.add(("d", topic))
+                        self.get_logger().info(f"depth frames arriving on {topic} ({enc})")
+                    relay.on_depth(arr, *self._dfov)
+            return cb
 
-        def _color_cb(self, m):
-            arr, enc = _decode_image(m)
-            if arr is not None and arr.ndim == 3:
-                relay.on_color(np.ascontiguousarray(arr), *self._cfov)
+        def _mk_color_cb(self, topic):
+            def cb(m):
+                arr, enc = _decode_image(m)
+                if arr is not None and arr.ndim == 3:
+                    if ("c", topic) not in self._seen:
+                        self._seen.add(("c", topic))
+                        self.get_logger().info(f"color frames arriving on {topic} ({enc})")
+                    relay.on_color(np.ascontiguousarray(arr), *self._cfov)
+            return cb
 
     rclpy.init()
     node = Sub()
