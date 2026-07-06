@@ -87,6 +87,14 @@ RENDER_HZ     = float(os.environ.get("RENDER_HZ", "60.0"))
 # in telemetry). Coalescing it to a lower rate keeps the pose stream smooth; block deltas
 # accumulate losslessly in the store between uploads. 0 = every tick (old behaviour).
 CLOUD_RENDER_HZ = float(os.environ.get("CLOUD_RENDER_HZ", "10.0"))
+# ── Periscope hold-to-aim (progressive: slow tap, ramps up while held) ────────
+PERI_PAN_BASE   = float(os.environ.get("PERISCOPE_PAN_BASE_DPS", "25"))    # deg/s at tap
+PERI_PAN_MAX    = float(os.environ.get("PERISCOPE_PAN_MAX_DPS", "160"))    # deg/s ceiling
+PERI_PAN_ACCEL  = float(os.environ.get("PERISCOPE_PAN_ACCEL_DPS2", "90"))  # +deg/s per s held
+PERI_ZOOM_BASE  = float(os.environ.get("PERISCOPE_ZOOM_BASE", "0.6"))      # 1/s at tap
+PERI_ZOOM_MAX   = float(os.environ.get("PERISCOPE_ZOOM_MAX", "2.4"))       # 1/s ceiling
+PERI_ZOOM_ACCEL = float(os.environ.get("PERISCOPE_ZOOM_ACCEL", "1.6"))     # +1/s per s held
+PERI_TX_HZ      = float(os.environ.get("PERISCOPE_TX_HZ", "30"))           # max uplink req rate
 STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))
 SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
@@ -470,6 +478,9 @@ class PRISMViewer:
         # if the periscope module / a codec is unavailable.
         self._periscope = None
         self._peri_panel_on = True
+        # camera-frame length (m) of the drawn aim frustum (was a fixed 3.0 = huge).
+        self._peri_frustum_m = float(os.environ.get("PERISCOPE_FRUSTUM_M", "1.25"))
+        self._peri_held = {}          # key -> seconds held (hold-to-pan progressive)
         try:
             from vat_client.periscope_view import PeriscopeClient
             self._periscope = PeriscopeClient(
@@ -638,7 +649,7 @@ class PRISMViewer:
                                             anchor_y="bottom", parent=canvas.scene)
         self._peri_hud.transform = scene.transforms.STTransform(
             translate=(12, canvas.size[1] - 30))
-        _controls = ("periscope: j/l yaw  i/k pitch  o/p zoom  g center  y aspect  "
+        _controls = ("periscope(hold): j/l yaw  i/k pitch  o/p zoom  g center  y aspect  "
                      "v panel  b keyframe    |    view: t follow  f frame  r reset  "
                      "c/[/] ceiling  n/m ptsize  1 resync")
         self._controls_hud = scene.visuals.Text(_controls, color=(0.5, 0.55, 0.66, 0.9),
@@ -732,20 +743,25 @@ class PRISMViewer:
                 self._set_ceiling(base + CEILING_STEP)
             # ── periscope aim (j/l yaw, i/k pitch, o/p zoom, g recenter, y aspect,
             #    v toggle panel, b force keyframe) ──
-            elif self._periscope is not None and k in ("j", "l", "i", "k", "o", "p",
-                                                       "g", "y", "v", "b"):
+            elif self._periscope is not None and k in ("j", "l", "i", "k", "o", "p"):
+                # hold-to-pan/zoom: mark key down; _on_tick integrates a speed that
+                # starts slow and ramps the longer it is held (cleared in _on_key_up).
+                self._peri_held.setdefault(k, 0.0)
+            elif self._periscope is not None and k in ("g", "y", "v", "b"):
                 p = self._periscope
-                if k == "j":   p.nudge(-5.0, 0.0)
-                elif k == "l": p.nudge(+5.0, 0.0)
-                elif k == "i": p.nudge(0.0, +5.0)
-                elif k == "k": p.nudge(0.0, -5.0)
-                elif k == "o": p.zoom(0.8)          # zoom in  (narrower FOV)
-                elif k == "p": p.zoom(1.25)         # zoom out (wider FOV)
-                elif k == "g": p.yaw = 0.0; p.pitch = 0.0; p.publish()
+                if k == "g": p.yaw = 0.0; p.pitch = 0.0; p.publish()
                 elif k == "y": p.cycle_aspect(); log.info(f"[periscope] aspect {p.aspect}")
-                elif k == "v":
-                    self._peri_panel_on = not self._peri_panel_on
+                elif k == "v": self._peri_panel_on = not self._peri_panel_on
                 elif k == "b": p.request_keyframe()
+
+        @canvas.events.key_release.connect
+        def _on_key_up(ev):
+            if self._periscope is None or not self._peri_held:
+                return
+            k = (ev.text or "").lower()
+            if not k:                       # release often has empty text; use key name
+                k = (getattr(getattr(ev, "key", None), "name", "") or "").lower()
+            self._peri_held.pop(k, None)
 
         self._timer = app.Timer(interval=1.0 / max(RENDER_HZ, 1.0),
                                 connect=self._on_tick, start=True)
@@ -906,6 +922,7 @@ class PRISMViewer:
         # independent of whether a pose has arrived yet.
         if self._periscope is not None:
             try:
+                self._peri_apply_held(dt)
                 self._periscope.keepalive()
                 if getattr(self, "_peri_hud", None) is not None:
                     self._peri_hud.text = self._periscope.status_text()
@@ -945,6 +962,33 @@ class PRISMViewer:
                     log.warning(f"[Viewer] metrics update error (suppressed): {e}")
                     self._metrics_warned = True
 
+    def _peri_apply_held(self, dt):
+        """Integrate held periscope keys into a progressive pan/zoom: speed starts at
+        PERI_PAN_BASE and ramps with hold time up to PERI_PAN_MAX (deg/s). The local
+        aim (and frustum) update every tick; the uplink is throttled to PERI_TX_HZ."""
+        p = self._periscope
+        if p is None or not self._peri_held:
+            return
+        dyaw = dpitch = 0.0
+        zoom_rate = 0.0
+        for k in list(self._peri_held):
+            self._peri_held[k] += dt
+            h = self._peri_held[k]
+            v = min(PERI_PAN_MAX, PERI_PAN_BASE + PERI_PAN_ACCEL * h)   # deg/s
+            step = v * dt
+            if   k == "j": dyaw -= step
+            elif k == "l": dyaw += step
+            elif k == "i": dpitch += step
+            elif k == "k": dpitch -= step
+            elif k in ("o", "p"):
+                zr = min(PERI_ZOOM_MAX, PERI_ZOOM_BASE + PERI_ZOOM_ACCEL * h)
+                zoom_rate += (-zr if k == "o" else zr)   # o = in (narrower), p = out
+        tx = 1.0 / max(PERI_TX_HZ, 1.0)
+        if dyaw or dpitch:
+            p.apply_aim(dyaw, dpitch, min_interval_s=tx)
+        if zoom_rate:
+            p.apply_zoom(float(np.exp(zoom_rate * dt)), min_interval_s=tx)
+
     def _draw_periscope(self, pred):
         """Update the two camera-anchored frustum gizmos (requested amber / actual
         cyan) and the video panel, using the SAME displayed pose as the avatar."""
@@ -957,16 +1001,31 @@ class PRISMViewer:
             Y = _yaw_R(self._yaw_offset_deg)
             R, pos = Y @ R, Y @ pos
         cam_pos = pos + R @ STICK                    # anchor at the CAMERA, not base
-        far = 3.0
-        self._peri_req_vis.set_data(pos=p.frustum_world(
-            cam_pos, R, p.yaw, p.pitch, p.hfov, p.req_vfov(), far))
+        far = self._peri_frustum_m
         act = p.latest_actual()
-        if act is not None and not p.stale():
+        live = not p.stale()
+        # actual (cyan) = the view the robot is really rendering/sending: the truthful
+        # coverage box, and the primary gizmo.
+        if act is not None and live:
             self._peri_act_vis.set_data(pos=p.frustum_world(
                 cam_pos, R, act["yaw"], act["pitch"], act["hfov"], act["vfov"], far))
             self._peri_act_vis.visible = True
         else:
             self._peri_act_vis.visible = False
+        # requested (amber) = operator aim. Show it only while it meaningfully LEADS
+        # the actual (an in-flight slew) or when no live actual exists, so a settled
+        # view is one clean box instead of two nested ones (the robot renders a wider
+        # overscan slice, so in steady state the actual already encloses the request).
+        leading = (act is None or not live
+                   or abs(((p.yaw - act["yaw"] + 180.0) % 360.0) - 180.0) > 2.0
+                   or abs(p.pitch - act["pitch"]) > 2.0
+                   or abs(p.hfov - act["hfov"]) > 3.0)
+        if leading:
+            self._peri_req_vis.set_data(pos=p.frustum_world(
+                cam_pos, R, p.yaw, p.pitch, p.hfov, p.req_vfov(), far))
+            self._peri_req_vis.visible = True
+        else:
+            self._peri_req_vis.visible = False
         if self._peri_panel is not None:
             img = p.latest_image()
             if img is not None and self._peri_panel_on and not p.stale():

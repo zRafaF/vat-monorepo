@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 
 import numpy as np
 
@@ -91,6 +92,18 @@ class PeriscopeClient:
         self._last_codec = None
         self._decode_err = None
         self._last_pub_t = 0.0
+        # feed telemetry: decode fps (sliding window of local recv times) + a
+        # capture->display latency estimate (robot clock -> local via a minimum
+        # filter, same method the pose HUD uses; reports transit above baseline).
+        self._recv_t = deque(maxlen=90)
+        self._fps = 0.0
+        # aim round-trip latency: time from an aim change (publish) until a frame whose
+        # ACTUAL yaw/pitch matches arrives — a fully-observable glass-to-glass proxy,
+        # measured entirely on the local clock (no robot clock sync needed).
+        self._aim_latency_ms = 0.0
+        self._last_aim = None          # (yaw,pitch) last published
+        self._pending_aim = None       # (yaw,pitch) awaiting confirmation from a frame
+        self._aim_change_t = 0.0
 
         self._pub = self._z.declare_publisher(self._K["periscope_request"])
         self._pub_kf = self._z.declare_publisher(self._K["periscope_keyframe"])
@@ -111,6 +124,26 @@ class PeriscopeClient:
                                          self._min_fov, self._max_fov)
         self.publish()
 
+    def apply_aim(self, dyaw: float, dpitch: float, min_interval_s: float = 0.0):
+        """Continuous pan for hold-to-move: update the aim by (dyaw,dpitch) degrees
+        and publish at most once per ``min_interval_s`` (the frustum still tracks the
+        live local aim every frame; only the uplink is throttled)."""
+        if dyaw or dpitch:
+            self.yaw, self.pitch, self.hfov = psc.clamp_view(
+                self.yaw + dyaw, self.pitch + dpitch, self.hfov,
+                self._min_fov, self._max_fov)
+        self._throttled_publish(min_interval_s)
+
+    def apply_zoom(self, factor: float, min_interval_s: float = 0.0):
+        """Continuous zoom for hold-to-zoom (factor<1 in, >1 out), throttled uplink."""
+        _, _, self.hfov = psc.clamp_view(self.yaw, self.pitch, self.hfov * factor,
+                                         self._min_fov, self._max_fov)
+        self._throttled_publish(min_interval_s)
+
+    def _throttled_publish(self, min_interval_s: float):
+        if (time.time() - self._last_pub_t) >= min_interval_s:
+            self.publish()
+
     def set_tier(self, tier: int):
         self.tier = int(tier)
         self.publish()
@@ -130,6 +163,11 @@ class PeriscopeClient:
     def publish(self):
         aw, ah = psc.parse_aspect(self.aspect)
         self._seq += 1
+        aim = (round(self.yaw, 1), round(self.pitch, 1))
+        if aim != self._last_aim:
+            self._last_aim = aim
+            self._pending_aim = aim
+            self._aim_change_t = time.monotonic()
         v = proto.ViewRequest(yaw_deg=self.yaw, pitch_deg=self.pitch,
                               hfov_deg=self.hfov, res_tier=self.tier,
                               aspect_w=int(round(aw)), aspect_h=int(round(ah)),
@@ -149,6 +187,16 @@ class PeriscopeClient:
         if self.enabled and (time.time() - self._last_pub_t) >= interval_s:
             self.publish()
 
+    def fps(self) -> float:
+        """Decoded frames/sec over the recent window; 0 if the feed has stalled."""
+        if not self._recv_t or (time.monotonic() - self._recv_t[-1]) > 1.0:
+            return 0.0
+        return self._fps
+
+    def latency_ms(self) -> float:
+        """Aim round-trip latency (ms): change aim -> frame with matching aim arrives."""
+        return self._aim_latency_ms
+
     def status_text(self) -> str:
         """One-line human status for the viewer overlay."""
         if not self.enabled:
@@ -161,8 +209,8 @@ class PeriscopeClient:
         a = self.latest_actual() or {}
         opt = "optical" if a.get("optical") else "digital"
         return (f"periscope: {a.get('width','?')}x{a.get('height','?')} {opt} "
-                f"fov{a.get('hfov',0):.0f} codec{self._last_codec} "
-                f"{self._last_bytes//1024}KB rx{self._n_recv}")
+                f"fov{a.get('hfov',0):.0f}  {self.fps():.0f}fps  lat~{self.latency_ms():.0f}ms  "
+                f"codec{self._last_codec} {self._last_bytes//1024}KB rx{self._n_recv}")
 
     # -- incoming frames (Zenoh callback thread) ------------------------------
     def _on_frame(self, sample):
@@ -185,6 +233,17 @@ class PeriscopeClient:
         if rgb is None:
             return
         self._n_dec += 1
+        tnow = time.monotonic()
+        self._recv_t.append(tnow)
+        if len(self._recv_t) >= 2:
+            span = self._recv_t[-1] - self._recv_t[0]
+            if span > 1e-6:
+                self._fps = (len(self._recv_t) - 1) / span
+        if self._pending_aim is not None and (
+                abs(((f.yaw_deg - self._pending_aim[0] + 180.0) % 360.0) - 180.0) <= 2.0
+                and abs(f.pitch_deg - self._pending_aim[1]) <= 2.0):
+            self._aim_latency_ms = (time.monotonic() - self._aim_change_t) * 1e3
+            self._pending_aim = None
         with self._lock:
             self._img = rgb
             self._actual = dict(yaw=f.yaw_deg, pitch=f.pitch_deg, hfov=f.hfov_deg,
