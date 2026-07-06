@@ -89,6 +89,8 @@ RUN git clone --depth 1 --branch "${UNITREE_ROS2_REF}" \
 
 # Shared wire protocol (single source of truth — lives in repo /common)
 COPY common/vat_protocol.py     /app/
+# Shared periscope geometry (equirect->rectilinear + zoom math, from /common)
+COPY common/vat_periscope.py    /app/
 # Robot-side processes
 COPY robot/docker/dynamic_bridge.py   /app/
 COPY robot/docker/theta_camera.py     /app/
@@ -99,6 +101,10 @@ COPY robot/docker/estimator.py        /app/
 COPY robot/docker/pose_graph.py       /app/
 COPY robot/docker/eskf_estimator.py    /app/
 COPY robot/docker/teleop_bridge.py    /app/
+# Remote periscope package (runs inside theta_camera; without this the camera
+# process logs '[periscope] disabled (init failed): No module named periscope'
+# and never publishes a single video frame).
+COPY robot/docker/periscope/          /app/periscope/
 COPY robot/docker/start.sh            /app/
 RUN chmod +x /app/start.sh
 
@@ -124,6 +130,10 @@ ENV ROBOT_NAME="go2" \
     STICK_OFFSET_Z="0.55" \
     FALLBACK_BODY_HEIGHT="0.30" \
     THETA_MODE="2K" \
-    THETA_DEVICE="/dev/video10"
+    THETA_DEVICE="/dev/video10" \
+    PERISCOPE_ENABLE="1" \
+    PERISCOPE_CODEC="mjpeg" \
+    PERISCOPE_RES="480" \
+    PERISCOPE_FPS="15"
 
 ENTRYPOINT ["/bin/bash", "/app/start.sh"]
