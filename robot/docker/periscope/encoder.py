@@ -1,8 +1,8 @@
 """
-VAT — Remote Periscope: video encoder abstraction.
+VAT - Remote Periscope: video encoder abstraction.
 
-Tries hardware/efficient video first (PyAV → NVENC HEVC → NVENC H.264 →
-software libx265/libx264) and falls back to **per-frame MJPEG** (cv2.imencode) if
+Tries hardware/efficient video first (PyAV -> NVENC HEVC -> NVENC H.264 ->
+software libx265/libx264) and falls back to per-frame MJPEG (cv2.imencode) if
 PyAV is unavailable. The MJPEG path means the whole periscope pipeline works
 end-to-end with no extra dependency (every frame is a keyframe); the H.26x paths
 kick in automatically when PyAV + a suitable encoder are present.
@@ -84,7 +84,7 @@ class PyAVEncoder:
 
     def encode(self, bgr: np.ndarray) -> List[Tuple[bytes, bool]]:
         av = self._av
-        rgb = bgr[:, :, ::-1]                        # cv2 BGR → RGB
+        rgb = bgr[:, :, ::-1]                        # cv2 BGR -> RGB
         frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(rgb), format="rgb24")
         frame = frame.reformat(format="yuv420p")
         if self._force_kf:
@@ -109,7 +109,7 @@ class PyAVEncoder:
             pass
 
 
-# Preference → ordered list of (libav encoder name, PSCOPE codec id) to try.
+# Preference -> ordered list of (libav encoder name, PSCOPE codec id) to try.
 _PREF = {
     "h265": [("hevc_nvenc", proto.PSCOPE_CODEC_HEVC), ("libx265", proto.PSCOPE_CODEC_HEVC),
              ("h264_nvenc", proto.PSCOPE_CODEC_H264), ("libx264", proto.PSCOPE_CODEC_H264)],
@@ -119,6 +119,28 @@ _PREF = {
 }
 
 
+def _validate_encoder(name: str, width: int, height: int, fps: float,
+                      bitrate: int, gop: int) -> None:
+    """Force the codec to actually open by encoding one throwaway frame.
+
+    PyAV opens the underlying libav codec LAZILY on the first encode() call, NOT
+    in CodecContext.create -- so merely constructing a PyAVEncoder does not prove
+    the encoder can run. On a host where e.g. hevc_nvenc is registered but cannot
+    be opened (no GPU / no driver / no /dev/nvidia in the container / NVENC session
+    limit hit), construction succeeds and every real encode() then raises. Without
+    this trial-open the fallback ladder (nvenc -> libx26x -> mjpeg) is defeated:
+    make_encoder returns a dead encoder and the service publishes zero frames
+    (the aim frustum shows, but the video never does).
+
+    Raises if the encoder cannot actually be opened; returns cleanly otherwise.
+    """
+    probe = PyAVEncoder(name, 0, width, height, fps, bitrate, gop)
+    try:
+        probe.encode(np.zeros((int(height), int(width), 3), np.uint8))  # forces open
+    finally:
+        probe.close()
+
+
 def make_encoder(pref: str, width: int, height: int, fps: float,
                  bitrate: int, gop: int, jpeg_quality: int = 80):
     """Return the best available encoder for ``pref`` (h265|h264|hevc|mjpeg),
@@ -126,11 +148,14 @@ def make_encoder(pref: str, width: int, height: int, fps: float,
     pref = (pref or "h265").lower()
     for name, cid in _PREF.get(pref, []):
         try:
+            _validate_encoder(name, width, height, fps, bitrate, gop)
             enc = PyAVEncoder(name, cid, width, height, fps, bitrate, gop)
             log.info(f"[periscope] encoder: {name} ({width}x{height}@{fps:.0f})")
             return enc
         except Exception as e:
-            log.debug(f"[periscope] encoder {name} unavailable: {e}")
+            # WARNING (not debug): a silently-skipped hardware encoder is exactly
+            # what makes "frustum but no video" hard to diagnose.
+            log.warning(f"[periscope] encoder {name} unavailable, trying next: {e}")
     log.warning("[periscope] no H.26x encoder available (install PyAV + NVENC "
-                "for HEVC/H.264) — falling back to per-frame MJPEG")
+                "for HEVC/H.264) - falling back to per-frame MJPEG")
     return MJPEGEncoder(jpeg_quality)

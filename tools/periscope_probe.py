@@ -27,8 +27,9 @@ import time
 
 import zenoh
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "common"))
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_REPO, "common"))
+sys.path.insert(0, os.path.join(_REPO, "client"))       # for vat_client._Decoder
 import vat_protocol as proto  # noqa: E402
 
 ROUTER = os.environ.get("ZENOH_ROUTER", os.environ.get("ZENOH_CONNECT",
@@ -46,8 +47,26 @@ def main():
     ap.add_argument("--tier", type=int, default=480)
     ap.add_argument("--aspect", default="1:1")
     ap.add_argument("--secs", type=float, default=0.0, help="stop after N s (0=forever)")
+    ap.add_argument("--decode", action="store_true",
+                    help="also DECODE each frame with the viewer's exact decoder "
+                         "(vat_client._Decoder) — proves the client machine can decode "
+                         "this codec, separating 'robot not publishing' from 'client "
+                         "can't decode' from a viewer-only display bug.")
+    ap.add_argument("--save", default="",
+                    help="with --decode: write the newest decoded frame to this path "
+                         "(e.g. /tmp/peri.png) so you can eyeball the raw stream.")
     args = ap.parse_args()
     aw, ah = (args.aspect.split(":") + ["1"])[:2]
+
+    decoder = None
+    if args.decode:
+        try:
+            from vat_client.periscope_view import _Decoder
+            decoder = _Decoder()
+        except Exception as e:
+            print(f"  [--decode] cannot load decoder: {e}\n"
+                  f"  (H.26x needs PyAV: `pip install av`; MJPEG needs opencv-python)")
+            decoder = None
 
     K = proto.keys(ROBOT_NAME)
     print(f"Periscope probe -> router={ROUTER} robot={ROBOT_NAME}")
@@ -59,7 +78,7 @@ def main():
     z = zenoh.open(conf)
 
     state = {"n": 0, "bytes": 0, "t0": time.time(), "last": time.time(),
-             "codecs": set(), "kf": 0}
+             "codecs": set(), "kf": 0, "dec": 0, "dec_err": None, "saved": False}
 
     def on_frame(sample):
         try:
@@ -72,12 +91,30 @@ def main():
         state["codecs"].add(_CODEC.get(f.codec, f.codec))
         state["kf"] += 1 if f.is_keyframe else 0
         state["last"] = time.time()
+        if decoder is not None:
+            try:
+                rgb = decoder.decode(f.codec, f.payload)
+            except Exception as e:
+                state["dec_err"] = str(e)[:80]
+                rgb = None
+            if rgb is not None:
+                state["dec"] += 1
+                if args.save and not state["saved"]:
+                    try:
+                        import cv2
+                        cv2.imwrite(args.save, rgb[:, :, ::-1])   # RGB->BGR
+                        print(f"  [--save] wrote decoded frame -> {args.save} "
+                              f"({rgb.shape[1]}x{rgb.shape[0]})")
+                        state["saved"] = True
+                    except Exception as e:
+                        print(f"  [--save] failed: {e}")
         if state["n"] <= 5 or state["n"] % 15 == 0:
+            dec = f"  dec={state['dec']}" if decoder is not None else ""
             print(f"  #{state['n']:<4} {_CODEC.get(f.codec, f.codec):5} "
                   f"{f.width}x{f.height} {'opt' if f.optical else 'dig'} "
                   f"kf={int(f.is_keyframe)} fov={f.hfov_deg:.0f} "
                   f"native_w={f.native_w} {len(f.payload)/1024:.1f}KB "
-                  f"yaw={f.yaw_deg:.0f} pitch={f.pitch_deg:.0f}")
+                  f"yaw={f.yaw_deg:.0f} pitch={f.pitch_deg:.0f}{dec}")
 
     z.declare_subscriber(K["periscope_frame"], on_frame)
     pub = z.declare_publisher(K["periscope_request"])
@@ -104,9 +141,15 @@ def main():
                 print(f"  [{dt:5.0f}s] NO FRAMES yet - is the robot periscope up? "
                       f"(check robot [periscope] log; PERISCOPE_ENABLE=1)")
             else:
+                dec = ""
+                if decoder is not None:
+                    dec = f"  decoded={state['dec']}"
+                    if state["dec"] == 0:
+                        dec += (f" (0 DECODED — client can't decode {state['codecs']}; "
+                                f"err={state['dec_err']})")
                 print(f"  --- {dt:5.0f}s: {state['n']} frames  {fps:.1f} fps  "
                       f"{kbps:.0f} KB/s  codecs={state['codecs']} kf={state['kf']}  "
-                      f"last {age:.1f}s ago ---")
+                      f"last {age:.1f}s ago{dec} ---")
             if args.secs and dt >= args.secs:
                 break
     except KeyboardInterrupt:

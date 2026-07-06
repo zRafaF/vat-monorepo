@@ -21,7 +21,7 @@ CLIENT_RUN ?= cd client && uv run python
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-uvc-kill theta-stream robot-docker viewer record-frames \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
-        teleop fetch_frame fetch_pcd \
+        teleop fetch_frame fetch_pcd periscope-probe \
         docs docs-serve clean
 
 # ── Help / runbook ───────────────────────────────────────────────────────────
@@ -51,6 +51,7 @@ help:
 	@echo "                                (cloud + robot + legs; keys: arrows orbit, WASD pan,"
 	@echo "                                 N/M point size, C/[/] ceiling clip, 1 re-fetch)"
 	@echo "  make record-frames   [CLIENT] save 360° frames to disk (offline analysis)"
+	@echo "  make periscope-probe [CLIENT] headless periscope stream check (ARGS=\"--decode --save f.png\")"
 	@echo ""
 	@echo "Staged pre-POC tests (run in this order — see 'make steps'):"
 	@echo "  make test_link           0  transport alive (router + bridge + rates)"
@@ -215,6 +216,18 @@ probe_robot: sync-client
 	@echo ">> Reminder: router + robot container (dynamic_bridge.py) running."
 	@echo ">> DRIVE / MOVE the dog during the $${PROBE_S:-15}s capture window."
 	$(CLIENT_RUN) ../tools/probe_robot_data.py
+
+# [CLIENT] Remote periscope stream probe -- isolates the video pipeline from the
+# VisPy viewer: publishes a ViewRequest (+keepalive), subscribes to the encoded
+# frames, and reports codec/size/rate. Add --decode to decode with the viewer's
+# exact decoder and --save to dump a frame to disk -- this cleanly separates
+# "robot not publishing" from "client can't decode" from a viewer-only display bug.
+# Deps are uv-controlled: this runs in client/.venv, and 'uv sync' installs PyAV
+# (av, in client/pyproject.toml) so H.265/H.264 decode works (cv2 covers MJPEG).
+#   make periscope-probe ARGS="--decode --save /tmp/peri.png --yaw 30 --fov 60"
+periscope-probe: sync-client
+	@echo ">> Reminder: router + robot container (periscope service, PERISCOPE_ENABLE=1) running."
+	$(CLIENT_RUN) ../tools/periscope_probe.py $(ARGS)
 
 # ── Docs ─────────────────────────────────────────────────────────────────────
 docs: sync-docs

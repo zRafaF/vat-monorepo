@@ -1,5 +1,5 @@
 """
-VAT — Remote Periscope service (robot side).
+VAT - Remote Periscope service (robot side).
 
 Runs inside the camera process and is fed the live full-resolution equirectangular
 frame via :meth:`submit_frame` (no second capture, no fps-capped archive). A worker
@@ -58,8 +58,8 @@ class PeriscopeService:
         K = proto.keys(cfg.ROBOT_NAME)
         self._z.declare_subscriber(K["periscope_request"], self._on_request)
         self._z.declare_subscriber(K["periscope_keyframe"], self._on_keyframe)
-        log.info(f"[periscope] request←'{K['periscope_request']}'  "
-                 f"frame→'{K['periscope_frame']}'  codec_pref={cfg.CODEC} "
+        log.info(f"[periscope] request<-'{K['periscope_request']}'  "
+                 f"frame->'{K['periscope_frame']}'  codec_pref={cfg.CODEC} "
                  f"tier={cfg.RES_TIER} aspect={cfg.ASPECT} "
                  f"fov[{cfg.MIN_FOV:.0f},{cfg.MAX_FOV:.0f}] dyn_fps={cfg.FPS_DYNAMIC}")
 
@@ -80,7 +80,7 @@ class PeriscopeService:
             try:
                 return zenoh.open(conf)
             except Exception as e:
-                log.warning(f"[periscope] Zenoh connect failed: {e} — retry in 5s")
+                log.warning(f"[periscope] Zenoh connect failed: {e} - retry in 5s")
                 time.sleep(5)
 
     def _declare_frame_pub(self):
@@ -168,7 +168,19 @@ class PeriscopeService:
             try:
                 self._render_encode_publish(frame, ts, yaw, pitch, hfov, aspect, tier)
             except Exception:
-                log.exception("[periscope] frame pipeline error")
+                log.exception("[periscope] frame pipeline error - dropping encoder to "
+                              "force a rebuild (will fall back per make_encoder)")
+                # A dead encoder (e.g. a hardware codec that opened once then failed,
+                # or a size change that broke it) would otherwise raise on EVERY frame
+                # and publish nothing. Drop it so the next iteration rebuilds via
+                # make_encoder, which validates + falls back to a codec that works.
+                try:
+                    if self._enc is not None:
+                        self._enc.close()
+                except Exception:
+                    pass
+                self._enc = None
+                self._enc_dims = None
                 time.sleep(0.1)
             # simple rate limit (encode time is already spent)
             time.sleep(period)
