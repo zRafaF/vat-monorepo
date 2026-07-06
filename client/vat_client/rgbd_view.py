@@ -64,7 +64,8 @@ class RgbdClient:
         self._decode_warned = False
 
         self._pub = self._z.declare_publisher(self._K["rgbd_request"])
-        self._z.declare_subscriber(self._K["rgbd_frame"], self._on_frame)
+        self._sub = self._z.declare_subscriber(self._K["rgbd_frame"], self._on_frame)
+        self._last_log_t = 0.0
         self.publish()
         log.info(f"[rgbd] client on '{self._K['rgbd_frame']}' "
                  f"req->'{self._K['rgbd_request']}' kind={_KIND_NAME.get(self.kind)}")
@@ -103,10 +104,18 @@ class RgbdClient:
             log.debug(f"[rgbd] request publish failed: {e}")
         self._last_pub_t = time.time()
 
-    def keepalive(self, interval_s: float = 1.0):
-        """Re-send the current request so the robot keeps streaming (viewer-timeout)."""
-        if self.enabled and (time.time() - self._last_pub_t) >= interval_s:
+    def keepalive(self, interval_s: float = 0.5):
+        """Re-send the current request so the robot keeps streaming (viewer-timeout).
+        Also emits a periodic diagnostic so we can see if the stream keeps flowing."""
+        now = time.time()
+        if self.enabled and (now - self._last_pub_t) >= interval_s:
             self.publish()
+        if now - self._last_log_t >= 3.0:
+            self._last_log_t = now
+            age = (now - self._last_frame_t) if self._last_frame_t else -1.0
+            log.info(f"[rgbd] rx={self._n_recv} dec={self._n_dec} fps={self.fps():.1f} "
+                     f"last_frame={age:.1f}s kind={self.kind} enabled={self.enabled} "
+                     f"stale={self.stale()}")
 
     # -- incoming frames (Zenoh callback thread) ------------------------------
     def _decode(self, f):
