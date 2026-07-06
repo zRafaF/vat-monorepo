@@ -21,7 +21,7 @@ CLIENT_RUN ?= cd client && uv run python
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-uvc-kill theta-stream robot-docker viewer record-frames \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
-        teleop fetch_frame fetch_pcd periscope-probe rgbd-probe rgbd-camera \
+        teleop fetch_frame fetch_pcd periscope-probe rgbd-probe rgbd-camera rgbd-relay \
         docs docs-serve clean
 
 # ── Help / runbook ───────────────────────────────────────────────────────────
@@ -54,6 +54,7 @@ help:
 	@echo "  make periscope-probe [CLIENT] headless periscope stream check (ARGS=\"--decode --save f.png\")"
 	@echo "  make rgbd-probe      [CLIENT] headless D435i panel stream check (ARGS=\"--kind depth --decode\")"
 	@echo "  make rgbd-camera     [ROBOT]  launch realsense2_camera (depth+color) to DDS"
+	@echo "  make rgbd-relay      [ROBOT]  run the RGBD relay on the host (same ROS env as the camera)"
 	@echo ""
 	@echo "Staged pre-POC tests (run in this order — see 'make steps'):"
 	@echo "  make test_link           0  transport alive (router + bridge + rates)"
@@ -241,9 +242,21 @@ rgbd-probe: sync-client
 # [ROBOT/HOST] Launch the RealSense D435i driver (ROS2) so it publishes depth+color
 # to DDS for the relay. Run this where the camera is plugged in (host, or a container
 # with realsense2_camera). Needs ros-humble-realsense2-camera installed.
+# [ROBOT/HOST] Run the RGBD relay ON THE HOST, in the SAME ROS2 env as the camera
+# (source ROS2 first, and `pip install eclipse-zenoh opencv-python-headless`). Use this
+# when the in-container relay cannot discover the host realsense node over DDS (RMW /
+# interface mismatch) -- running side-by-side makes discovery automatic. Set
+# RGBD_ENABLE=0 for the container (rebuild) so only one relay publishes.
+rgbd-relay:
+	@echo ">> host RGBD relay -> router $(ZENOH_CONNECT) (needs ROS2 sourced + eclipse-zenoh + opencv)"
+	PYTHONPATH="$(CURDIR)/common:$$PYTHONPATH" ZENOH_CONNECT="$(ZENOH_CONNECT)" ROBOT_NAME="$(ROBOT_NAME)" \
+	  python3 robot/docker/rgbd_relay.py
+
 rgbd-camera:
 	@echo ">> launching realsense2_camera (depth+color, no pointcloud) ..."
-	ros2 launch realsense2_camera rs_launch.py enable_color:=true enable_depth:=true pointcloud.enable:=false
+	@echo ">> RMW=$${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp} DOMAIN=$${ROS_DOMAIN_ID:-0} (MUST match the robot container so the relay can discover it)"
+	RMW_IMPLEMENTATION=$${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp} ROS_DOMAIN_ID=$${ROS_DOMAIN_ID:-0} \
+	  ros2 launch realsense2_camera rs_launch.py enable_color:=true enable_depth:=true pointcloud.enable:=false
 
 # ── Docs ─────────────────────────────────────────────────────────────────────
 docs: sync-docs
