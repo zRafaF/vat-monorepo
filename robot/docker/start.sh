@@ -125,6 +125,16 @@ run_forever bridge python3 /app/dynamic_bridge.py
 run_forever camera python3 /app/theta_camera.py
 run_forever fuser  python3 /app/pose_fuser.py
 run_forever teleop python3 /app/teleop_bridge.py
+# RGBD relay: RealSense depth/color (DDS) -> Zenoh single frames for the client panel.
+run_forever rgbd   python3 /app/rgbd_relay.py
+# If realsense2_camera is installed IN this image (WITH_REALSENSE=1), launch it too.
+# Otherwise run it on the host: ros2 launch realsense2_camera rs_launch.py (see makefile).
+if ros2 pkg prefix realsense2_camera >/dev/null 2>&1; then
+    run_forever realsense ros2 launch realsense2_camera rs_launch.py \
+        enable_color:=true enable_depth:=true pointcloud.enable:=false
+else
+    echo "[start] realsense2_camera not in image — run it on the host if RGBD has no frames."
+fi
 
 echo "[start] supervising ${#PIDS[@]} processes (bridge, theta_camera, fuser, teleop)"
 wait

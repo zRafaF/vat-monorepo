@@ -46,7 +46,9 @@ if [ "${ARCHIVE_ENABLE:-true}" = "true" ]; then
 fi
 
 echo "[run] building ${IMAGE} (context=${REPO_ROOT})"
-docker build -f robot/docker/Dockerfile -t "${IMAGE}" .
+docker build -f robot/docker/Dockerfile \
+    --build-arg WITH_REALSENSE="${WITH_REALSENSE:-0}" \
+    -t "${IMAGE}" .
 
 echo "[run] (re)starting container ${NAME} → ${ZENOH_CONNECT}"
 docker rm -f "${NAME}" 2>/dev/null || true
@@ -96,6 +98,18 @@ docker run -d --name "${NAME}" --restart unless-stopped \
     -e PERISCOPE_IDR_INTERVAL_S="${PERISCOPE_IDR_INTERVAL_S:-2.0}" \
     -e PERISCOPE_VIEWER_TIMEOUT_S="${PERISCOPE_VIEWER_TIMEOUT_S:-5.0}" \
     -e PERISCOPE_SO_SNDBUF="${PERISCOPE_SO_SNDBUF:-262144}" \
+    -e RGBD_ENABLE="${RGBD_ENABLE:-1}" \
+    -e RGBD_DEFAULT_KIND="${RGBD_DEFAULT_KIND:-depth}" \
+    -e RGBD_FPS="${RGBD_FPS:-20}" \
+    -e RGBD_MAX_RANGE_M="${RGBD_MAX_RANGE_M:-4.0}" \
+    -e RGBD_SEND_WIDTH="${RGBD_SEND_WIDTH:-424}" \
+    -e RGBD_JPEG_QUALITY="${RGBD_JPEG_QUALITY:-70}" \
+    -e RGBD_VIEWER_TIMEOUT_S="${RGBD_VIEWER_TIMEOUT_S:-5.0}" \
+    -e RGBD_SO_SNDBUF="${RGBD_SO_SNDBUF:-262144}" \
+    -e RGBD_DEPTH_TOPIC="${RGBD_DEPTH_TOPIC:-/camera/camera/depth/image_rect_raw}" \
+    -e RGBD_COLOR_TOPIC="${RGBD_COLOR_TOPIC:-/camera/camera/color/image_raw}" \
+    -e RGBD_DEPTH_INFO_TOPIC="${RGBD_DEPTH_INFO_TOPIC:-/camera/camera/depth/camera_info}" \
+    -e RGBD_COLOR_INFO_TOPIC="${RGBD_COLOR_INFO_TOPIC:-/camera/camera/color/camera_info}" \
     "${IMAGE}"
 
 echo "[run] done.  logs:  docker logs -f ${NAME}"

@@ -64,6 +64,8 @@ MAGIC_PCOR  = 0x50434F52  # "PCOR"
 MAGIC_CMDV  = 0x434D4456  # "CMDV"
 MAGIC_VREQ  = 0x56524551  # "VREQ" — periscope view request (client → robot)
 MAGIC_PSCF  = 0x50534346  # "PSCF" — periscope encoded frame (robot → client)
+MAGIC_RGBR  = 0x52474252  # "RGBR" — RGBD request/config (client → robot)
+MAGIC_RGBF  = 0x52474246  # "RGBF" — RGBD single frame (robot → client)
 
 # cmd_vel flag bits (bitmask in the CmdVel.flags byte)
 CMDV_FLAG_ESTOP = 0x01   # latched emergency stop — robot enters Damp, ignores motion
@@ -72,6 +74,15 @@ CMDV_FLAG_ESTOP = 0x01   # latched emergency stop — robot enters Damp, ignores
 PSCOPE_CODEC_MJPEG = 0   # per-frame JPEG (fallback; every frame is a keyframe)
 PSCOPE_CODEC_H264  = 1   # H.264 / AVC (Annex-B NAL units)
 PSCOPE_CODEC_HEVC  = 2   # H.265 / HEVC (Annex-B NAL units)
+
+# RGBD single-frame "kind" (what the robot is currently sending; the client picks it
+# with an RgbdRequest so we never waste bandwidth sending color when depth is shown).
+RGBD_KIND_OFF   = 0   # nothing streamed
+RGBD_KIND_DEPTH = 1   # single-channel depth, 8-bit over [0,max_range] (client colormaps)
+RGBD_KIND_COLOR = 2   # RGB color image
+# RGBD payload codecs.
+RGBD_CODEC_JPEG = 0   # cv2 JPEG (color, or a pre-colorized depth)
+RGBD_CODEC_PNG  = 1   # cv2 PNG  (lossless; used for 8-bit depth so edges stay crisp)
 
 # Fix-quality enum for pose messages
 FIX_DEADRECKON = 0   # propagating on odometry only
@@ -122,6 +133,11 @@ def keys(robot_name: str = "go2", server_prefix: str = "server/prism") -> dict:
         "periscope_request":  f"{robot_name}/prism/periscope/request",
         "periscope_frame":    f"{robot_name}/prism/periscope/frame",
         "periscope_keyframe": f"{robot_name}/prism/periscope/keyframe",
+        # RGBD (RealSense D435i) single-frame panel: client requests kind/fps/range
+        # DOWN, robot sends ONE latest frame (no accumulation) UP. Shown as a panel in
+        # front of the robot on a D435i frustum — never merged into the map cloud.
+        "rgbd_request":       f"{robot_name}/prism/rgbd/request",
+        "rgbd_frame":         f"{robot_name}/prism/rgbd/frame",
         # liveliness tokens
         "live_server":     f"{server_prefix}/liveliness",
         "live_pose":       f"{robot_name}/prism/pose/liveliness",
@@ -629,6 +645,95 @@ def unpack_periscope_frame(buf: bytes) -> PeriscopeFrame:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# RGBD request   {robot}/prism/rgbd/request   (client → robot)
+# ═════════════════════════════════════════════════════════════════════════════
+#   magic i | seq I | kind B | fps B | max_range_mm H | flags B
+#     kind = RGBD_KIND_*  (OFF stops the stream; DEPTH/COLOR pick the active image)
+#     flags bit0 = range_gate (only send when something is within max_range)
+_RGBR_FMT = "!iIBBHB"
+_RGBR_SIZE = struct.calcsize(_RGBR_FMT)
+
+RGBD_FLAG_RANGE_GATE = 0x01
+
+
+@dataclass
+class RgbdRequest:
+    kind: int = RGBD_KIND_DEPTH
+    fps: int = 20
+    max_range_mm: int = 4000        # depth clip / range gate distance (mm)
+    flags: int = 0
+    seq: int = 0
+
+    @property
+    def range_gate(self) -> bool:
+        return bool(self.flags & RGBD_FLAG_RANGE_GATE)
+
+
+def pack_rgbd_request(r: RgbdRequest) -> bytes:
+    return struct.pack(_RGBR_FMT, MAGIC_RGBR, int(r.seq) & 0xFFFFFFFF,
+                       int(r.kind) & 0xFF, int(r.fps) & 0xFF,
+                       int(r.max_range_mm) & 0xFFFF, int(r.flags) & 0xFF)
+
+
+def unpack_rgbd_request(buf: bytes) -> RgbdRequest:
+    if len(buf) < _RGBR_SIZE:
+        raise ProtocolError("rgbd_request buffer too short")
+    v = struct.unpack_from(_RGBR_FMT, buf, 0)
+    if v[0] != MAGIC_RGBR:
+        raise ProtocolError(f"bad rgbd_request magic 0x{v[0] & 0xFFFFFFFF:08X}")
+    return RgbdRequest(seq=v[1], kind=v[2], fps=v[3], max_range_mm=v[4], flags=v[5])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RGBD frame   {robot}/prism/rgbd/frame   (robot → client)
+# ═════════════════════════════════════════════════════════════════════════════
+#   magic i | seq I | ts_ns q (capture) | kind B | codec B (RGBD_CODEC_*) |
+#   width H | height H | hfov_deg f | vfov_deg f | max_range_mm H |
+#   min_depth_mm H (nearest valid depth this frame; 0=n/a) ++ encoded payload
+#
+# hfov/vfov describe the sensor so the client can size the panel + draw the D435i
+# frustum. For DEPTH the payload is an 8-bit image = depth scaled to [0,max_range];
+# the client applies a colormap. For COLOR it is a JPEG RGB image.
+_RGBF_FMT = "!iIqBBHHffHH"
+_RGBF_SIZE = struct.calcsize(_RGBF_FMT)
+
+
+@dataclass
+class RgbdFrame:
+    seq: int = 0
+    timestamp_ns: int = 0
+    kind: int = RGBD_KIND_DEPTH
+    codec: int = RGBD_CODEC_PNG
+    width: int = 0
+    height: int = 0
+    hfov_deg: float = 87.0
+    vfov_deg: float = 58.0
+    max_range_mm: int = 4000
+    min_depth_mm: int = 0
+    payload: bytes = b""
+
+
+def pack_rgbd_frame(f: "RgbdFrame") -> bytes:
+    hdr = struct.pack(_RGBF_FMT, MAGIC_RGBF, int(f.seq) & 0xFFFFFFFF,
+                      int(f.timestamp_ns), int(f.kind) & 0xFF, int(f.codec) & 0xFF,
+                      int(f.width) & 0xFFFF, int(f.height) & 0xFFFF,
+                      float(f.hfov_deg), float(f.vfov_deg),
+                      int(f.max_range_mm) & 0xFFFF, int(f.min_depth_mm) & 0xFFFF)
+    return hdr + bytes(f.payload)
+
+
+def unpack_rgbd_frame(buf: bytes) -> "RgbdFrame":
+    if len(buf) < _RGBF_SIZE:
+        raise ProtocolError("rgbd frame buffer too short")
+    v = struct.unpack_from(_RGBF_FMT, buf, 0)
+    if v[0] != MAGIC_RGBF:
+        raise ProtocolError(f"bad rgbd frame magic 0x{v[0] & 0xFFFFFFFF:08X}")
+    return RgbdFrame(seq=v[1], timestamp_ns=v[2], kind=v[3], codec=v[4],
+                     width=v[5], height=v[6], hfov_deg=v[7], vfov_deg=v[8],
+                     max_range_mm=v[9], min_depth_mm=v[10], payload=buf[_RGBF_SIZE:])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Quaternion helpers   (Hamilton, xyzw order) — used by fuser and predictor
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -726,6 +831,8 @@ ENC_TRAJ  = "application/vat.trajectory"
 ENC_CMDV  = "application/vat.cmd_vel"
 ENC_VREQ  = "application/vat.view_request"
 ENC_PSCF  = "application/vat.periscope_frame"
+ENC_RGBR  = "application/vat.rgbd_request"
+ENC_RGBF  = "application/vat.rgbd_frame"
 
 
 # ═════════════════════════════════════════════════════════════════════════════

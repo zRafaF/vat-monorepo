@@ -101,6 +101,7 @@ COPY robot/docker/estimator.py        /app/
 COPY robot/docker/pose_graph.py       /app/
 COPY robot/docker/eskf_estimator.py    /app/
 COPY robot/docker/teleop_bridge.py    /app/
+COPY robot/docker/rgbd_relay.py       /app/
 # Remote periscope package (runs inside theta_camera; without this the camera
 # process logs '[periscope] disabled (init failed): No module named periscope'
 # and never publishes a single video frame).
@@ -135,5 +136,16 @@ ENV ROBOT_NAME="go2" \
     PERISCOPE_CODEC="mjpeg" \
     PERISCOPE_RES="480" \
     PERISCOPE_FPS="15"
+
+# ── Optional: RealSense driver (D435i) inside the container ───────────────────
+# Off by default because librealsense2 on Jetson/aarch64 is fragile; when off, run
+# realsense2_camera on the host (or another container) and the relay consumes it over
+# DDS. Enable with:  WITH_REALSENSE=1 sudo make robot-docker
+ARG WITH_REALSENSE=0
+RUN if [ "$WITH_REALSENSE" = "1" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends \
+        ros-humble-realsense2-camera ros-humble-realsense2-description \
+      && rm -rf /var/lib/apt/lists/* ; \
+    else echo '[build] WITH_REALSENSE=0 — realsense2_camera NOT installed in image (run it on the host)'; fi
 
 ENTRYPOINT ["/bin/bash", "/app/start.sh"]

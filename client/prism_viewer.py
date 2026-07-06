@@ -87,14 +87,34 @@ RENDER_HZ     = float(os.environ.get("RENDER_HZ", "60.0"))
 # in telemetry). Coalescing it to a lower rate keeps the pose stream smooth; block deltas
 # accumulate losslessly in the store between uploads. 0 = every tick (old behaviour).
 CLOUD_RENDER_HZ = float(os.environ.get("CLOUD_RENDER_HZ", "10.0"))
-# ── Periscope hold-to-aim (progressive: slow tap, ramps up while held) ────────
-PERI_PAN_BASE   = float(os.environ.get("PERISCOPE_PAN_BASE_DPS", "25"))    # deg/s at tap
-PERI_PAN_MAX    = float(os.environ.get("PERISCOPE_PAN_MAX_DPS", "160"))    # deg/s ceiling
-PERI_PAN_ACCEL  = float(os.environ.get("PERISCOPE_PAN_ACCEL_DPS2", "90"))  # +deg/s per s held
-PERI_ZOOM_BASE  = float(os.environ.get("PERISCOPE_ZOOM_BASE", "0.6"))      # 1/s at tap
-PERI_ZOOM_MAX   = float(os.environ.get("PERISCOPE_ZOOM_MAX", "2.4"))       # 1/s ceiling
-PERI_ZOOM_ACCEL = float(os.environ.get("PERISCOPE_ZOOM_ACCEL", "1.6"))     # +1/s per s held
-PERI_TX_HZ      = float(os.environ.get("PERISCOPE_TX_HZ", "30"))           # max uplink req rate
+# ── Periscope aim: DISCRETE steps with accelerating auto-repeat while held ────
+# One fixed-size step per "tick" of an auto-repeat whose interval starts at
+# REPEAT_DELAY and shrinks toward REPEAT_MIN the longer the key is held:
+#   tap = 1 step;  hold = "tu ....... tu ..... tu ... tu .. tu tu tututu".
+PERI_STEP_DEG       = float(os.environ.get("PERISCOPE_STEP_DEG", "5"))        # deg per step
+PERI_ZOOM_STEP_IN   = float(os.environ.get("PERISCOPE_ZOOM_STEP_IN", "0.85")) # <1 = narrower
+PERI_ZOOM_STEP_OUT  = float(os.environ.get("PERISCOPE_ZOOM_STEP_OUT", "1.176"))# >1 = wider
+PERI_REPEAT_DELAY   = float(os.environ.get("PERISCOPE_REPEAT_DELAY_S", "0.32"))# gap before repeat
+PERI_REPEAT_MIN     = float(os.environ.get("PERISCOPE_REPEAT_MIN_S", "0.05"))  # fastest gap
+PERI_REPEAT_ACCEL   = float(os.environ.get("PERISCOPE_REPEAT_ACCEL", "4.0"))   # speed-up rate
+PERI_HELD_TIMEOUT   = float(os.environ.get("PERISCOPE_HELD_TIMEOUT_S", "0.2")) # heartbeat gap => released
+PERI_HELD_MAX_S     = float(os.environ.get("PERISCOPE_HELD_MAX_S", "10.0"))    # absolute anti-runaway cap
+# ── RGBD (RealSense D435i) single-frame panel ─────────────────────────────────
+# The latest depth/color frame shown as a panel in front of the robot (no cloud, no
+# accumulation). Extrinsics: D435i pose in the base frame (x fwd, y left, z up) +
+# a downward tilt. Flip signs correct panel mirroring if the mount is handed oddly.
+RGBD_ENABLE       = (os.environ.get("RGBD_ENABLE", "1").strip().lower() in ("1","true","yes","on"))
+RGBD_OFFSET       = np.array([float(os.environ.get("RGBD_OFFSET_X", "0.30")),
+                              float(os.environ.get("RGBD_OFFSET_Y", "0.0")),
+                              float(os.environ.get("RGBD_OFFSET_Z", "0.0"))], dtype=float)
+RGBD_PITCH_DEG    = float(os.environ.get("RGBD_PITCH_DEG", "15"))    # downward tilt (deg)
+RGBD_PANEL_M      = float(os.environ.get("RGBD_PANEL_M", "1.0"))     # panel distance (m)
+RGBD_FRUSTUM_M    = float(os.environ.get("RGBD_FRUSTUM_M", "1.2"))   # frustum length (m)
+RGBD_DEFAULT_KIND = os.environ.get("RGBD_DEFAULT_KIND", "depth").strip().lower()
+RGBD_FPS          = int(os.environ.get("RGBD_FPS", "20"))
+RGBD_MAX_RANGE_M  = float(os.environ.get("RGBD_MAX_RANGE_M", "4.0"))
+RGBD_FLIP_X       = float(os.environ.get("RGBD_FLIP_X", "1"))
+RGBD_FLIP_Y       = float(os.environ.get("RGBD_FLIP_Y", "1"))
 STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))
 SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
@@ -480,7 +500,12 @@ class PRISMViewer:
         self._peri_panel_on = True
         # camera-frame length (m) of the drawn aim frustum (was a fixed 3.0 = huge).
         self._peri_frustum_m = float(os.environ.get("PERISCOPE_FRUSTUM_M", "1.25"))
-        self._peri_held = {}          # key -> seconds held (hold-to-pan progressive)
+        self._peri_held = {}          # key -> {t0,next,seen,reps} while held
+        # frustum direction signs (video is ground truth): L/right => frustum right.
+        # Flip if your robot body frame is handed differently (they are the ONLY knobs
+        # needed if a direction looks mirrored).
+        self._peri_yaw_sign = float(os.environ.get("PERISCOPE_FRUSTUM_YAW_SIGN", "-1"))
+        self._peri_pitch_sign = float(os.environ.get("PERISCOPE_FRUSTUM_PITCH_SIGN", "1"))
         try:
             from vat_client.periscope_view import PeriscopeClient
             self._periscope = PeriscopeClient(
@@ -493,6 +518,21 @@ class PRISMViewer:
         except Exception as _e:
             log.warning(f"[Viewer] periscope disabled: {_e}")
             self._periscope = None
+
+        # RGBD (D435i) single-frame panel client (shares the low-latency session).
+        self._rgbd = None
+        self._rgbd_flip_x, self._rgbd_flip_y = RGBD_FLIP_X, RGBD_FLIP_Y
+        if RGBD_ENABLE:
+            try:
+                from vat_client.rgbd_view import RgbdClient
+                _kmap = {"off": 0, "depth": 1, "color": 2}
+                self._rgbd = RgbdClient(
+                    self._z_fast, ROBOT_NAME,
+                    kind=_kmap.get(RGBD_DEFAULT_KIND, 1),
+                    fps=RGBD_FPS, max_range_m=RGBD_MAX_RANGE_M)
+            except Exception as _e:
+                log.warning(f"[Viewer] rgbd disabled: {_e}")
+                self._rgbd = None
         # Incremental render buffer: update only the cubes that changed each submap
         # instead of re-merging + re-uploading the whole cloud (the render "stalls").
         # VIEWER_INCREMENTAL=0 forces the simple whole-cloud merge path.
@@ -634,6 +674,20 @@ class PRISMViewer:
                 log.warning(f"[Viewer] periscope panel unavailable ({_e})")
                 self._peri_panel = None
 
+        # ── RGBD D435i gizmos: a forward frustum + a live frame panel inside it ──
+        self._rgbd_frustum = self._rgbd_panel = None
+        if self._rgbd is not None:
+            self._rgbd_frustum = scene.visuals.Line(parent=view.scene, connect="segments",
+                                                    color=(1.0, 0.55, 0.2, 0.9), width=1.5)
+            self._rgbd_frustum.visible = False
+            try:
+                self._rgbd_panel = scene.visuals.Image(parent=view.scene, method="auto")
+                self._rgbd_panel.set_gl_state(depth_test=False, cull_face=False)
+                self._rgbd_panel.visible = False
+            except Exception as _e:
+                log.warning(f"[Viewer] rgbd panel unavailable ({_e})")
+                self._rgbd_panel = None
+
         # latency HUD — fixed top-left overlay in canvas pixel coords (y-down)
         self._hud = scene.visuals.Text("", color=(0.8, 1.0, 0.85, 1.0), bold=False,
                                        font_size=9, anchor_x="left", anchor_y="top",
@@ -651,12 +705,17 @@ class PRISMViewer:
             translate=(12, canvas.size[1] - 30))
         _controls = ("periscope(hold): j/l yaw  i/k pitch  o/p zoom  g center  y aspect  "
                      "v panel  b keyframe    |    view: t follow  f frame  r reset  "
-                     "c/[/] ceiling  n/m ptsize  1 resync")
+                     "c/[/] ceiling  n/m ptsize  1 resync    |    rgbd: x depth/color/off  z gate")
         self._controls_hud = scene.visuals.Text(_controls, color=(0.5, 0.55, 0.66, 0.9),
                                                 font_size=8, anchor_x="left",
                                                 anchor_y="bottom", parent=canvas.scene)
         self._controls_hud.transform = scene.transforms.STTransform(
             translate=(12, canvas.size[1] - 12))
+        self._rgbd_hud = scene.visuals.Text("", color=(1.0, 0.7, 0.4, 0.95),
+                                            font_size=8, anchor_x="left",
+                                            anchor_y="bottom", parent=canvas.scene)
+        self._rgbd_hud.transform = scene.transforms.STTransform(
+            translate=(12, canvas.size[1] - 48))
 
         # ── separate TELEMETRY window (latency / throughput / drops / pose) ──
         # One Text visual PER LINE, stacked vertically. A single multi-line Text
@@ -744,24 +803,36 @@ class PRISMViewer:
             # ── periscope aim (j/l yaw, i/k pitch, o/p zoom, g recenter, y aspect,
             #    v toggle panel, b force keyframe) ──
             elif self._periscope is not None and k in ("j", "l", "i", "k", "o", "p"):
-                # hold-to-pan/zoom: mark key down; _on_tick integrates a speed that
-                # starts slow and ramps the longer it is held (cleared in _on_key_up).
-                self._peri_held.setdefault(k, 0.0)
+                # discrete step now (so a tap always moves a full step); holding then
+                # auto-repeats at an accelerating cadence (see _peri_repeat). Ignore
+                # the OS key-repeat re-presses while the key is already down.
+                tnow = time.monotonic()
+                st = self._peri_held.get(k)
+                if st is None:
+                    self._peri_step(k)
+                    self._peri_held[k] = {"t0": tnow, "next": tnow + PERI_REPEAT_DELAY,
+                                          "seen": tnow, "reps": 0}
+                else:                       # OS auto-repeat re-press: heartbeat only
+                    st["seen"] = tnow
+                    st["reps"] += 1
             elif self._periscope is not None and k in ("g", "y", "v", "b"):
                 p = self._periscope
                 if k == "g": p.yaw = 0.0; p.pitch = 0.0; p.publish()
                 elif k == "y": p.cycle_aspect(); log.info(f"[periscope] aspect {p.aspect}")
                 elif k == "v": self._peri_panel_on = not self._peri_panel_on
                 elif k == "b": p.request_keyframe()
+            elif self._rgbd is not None and k in ("x", "z"):
+                if k == "x": log.info(f"[rgbd] {self._rgbd.cycle_kind()}")
+                elif k == "z": log.info(f"[rgbd] range_gate={self._rgbd.toggle_range_gate()}")
 
         @canvas.events.key_release.connect
         def _on_key_up(ev):
-            if self._periscope is None or not self._peri_held:
-                return
-            k = (ev.text or "").lower()
-            if not k:                       # release often has empty text; use key name
-                k = (getattr(getattr(ev, "key", None), "name", "") or "").lower()
-            self._peri_held.pop(k, None)
+            # Any key-up stops periscope aim auto-repeat. The windowing backend drops
+            # key-repeat events (so there is no "still held" heartbeat) and its release
+            # key id is unreliable, so we do NOT try to match a specific key — releasing
+            # anything halts the repeat. You hold one aim key at a time, so this is safe.
+            if self._periscope is not None and self._peri_held:
+                self._peri_held.clear()
 
         self._timer = app.Timer(interval=1.0 / max(RENDER_HZ, 1.0),
                                 connect=self._on_tick, start=True)
@@ -922,10 +993,17 @@ class PRISMViewer:
         # independent of whether a pose has arrived yet.
         if self._periscope is not None:
             try:
-                self._peri_apply_held(dt)
+                self._peri_repeat(now)
                 self._periscope.keepalive()
                 if getattr(self, "_peri_hud", None) is not None:
                     self._peri_hud.text = self._periscope.status_text()
+            except Exception:
+                pass
+        if self._rgbd is not None:
+            try:
+                self._rgbd.keepalive()
+                if getattr(self, "_rgbd_hud", None) is not None:
+                    self._rgbd_hud.text = self._rgbd.status_text()
             except Exception:
                 pass
 
@@ -940,6 +1018,13 @@ class PRISMViewer:
                     if not getattr(self, "_peri_warned", False):
                         log.warning(f"[Viewer] periscope draw error (suppressed): {e}")
                         self._peri_warned = True
+            if self._rgbd is not None:
+                try:
+                    self._draw_rgbd(pred)
+                except Exception as e:
+                    if not getattr(self, "_rgbd_warned", False):
+                        log.warning(f"[Viewer] rgbd draw error (suppressed): {e}")
+                        self._rgbd_warned = True
 
         # 3rd-person follow: ease the orbit pivot toward the robot (jump-proof).
         if self._follow:
@@ -962,32 +1047,39 @@ class PRISMViewer:
                     log.warning(f"[Viewer] metrics update error (suppressed): {e}")
                     self._metrics_warned = True
 
-    def _peri_apply_held(self, dt):
-        """Integrate held periscope keys into a progressive pan/zoom: speed starts at
-        PERI_PAN_BASE and ramps with hold time up to PERI_PAN_MAX (deg/s). The local
-        aim (and frustum) update every tick; the uplink is throttled to PERI_TX_HZ."""
+    def _peri_step(self, k):
+        """Apply ONE discrete aim step for key k (each publishes one view request)."""
         p = self._periscope
-        if p is None or not self._peri_held:
+        if p is None:
             return
-        dyaw = dpitch = 0.0
-        zoom_rate = 0.0
-        for k in list(self._peri_held):
-            self._peri_held[k] += dt
-            h = self._peri_held[k]
-            v = min(PERI_PAN_MAX, PERI_PAN_BASE + PERI_PAN_ACCEL * h)   # deg/s
-            step = v * dt
-            if   k == "j": dyaw -= step
-            elif k == "l": dyaw += step
-            elif k == "i": dpitch += step
-            elif k == "k": dpitch -= step
-            elif k in ("o", "p"):
-                zr = min(PERI_ZOOM_MAX, PERI_ZOOM_BASE + PERI_ZOOM_ACCEL * h)
-                zoom_rate += (-zr if k == "o" else zr)   # o = in (narrower), p = out
-        tx = 1.0 / max(PERI_TX_HZ, 1.0)
-        if dyaw or dpitch:
-            p.apply_aim(dyaw, dpitch, min_interval_s=tx)
-        if zoom_rate:
-            p.apply_zoom(float(np.exp(zoom_rate * dt)), min_interval_s=tx)
+        st = PERI_STEP_DEG
+        if   k == "j": p.nudge(-st, 0.0)
+        elif k == "l": p.nudge(+st, 0.0)
+        elif k == "i": p.nudge(0.0, +st)
+        elif k == "k": p.nudge(0.0, -st)
+        elif k == "o": p.zoom(PERI_ZOOM_STEP_IN)     # zoom in  (narrower FOV)
+        elif k == "p": p.zoom(PERI_ZOOM_STEP_OUT)    # zoom out (wider FOV)
+
+    def _peri_repeat(self, now):
+        """Auto-repeat held aim keys as DISCRETE steps at an accelerating cadence: the
+        interval starts at PERI_REPEAT_DELAY and shrinks toward PERI_REPEAT_MIN the
+        longer a key is held. Stops on key_release, with a heartbeat watchdog + hard
+        cap so a missed release can never spin the view forever."""
+        if not self._peri_held:
+            return
+        for k, st in list(self._peri_held.items()):
+            age = now - st["t0"]
+            # release-missed safety: (a) once OS auto-repeat has been seen, a stopped
+            # heartbeat means the key was released; (b) an absolute cap so a lost
+            # key_release can never pan the view forever.
+            if (st.get("reps", 0) >= 1 and (now - st.get("seen", st["t0"])) > PERI_HELD_TIMEOUT) \
+                    or age > PERI_HELD_MAX_S:
+                del self._peri_held[k]
+                continue
+            if now >= st["next"]:
+                self._peri_step(k)
+                iv = max(PERI_REPEAT_MIN, PERI_REPEAT_DELAY / (1.0 + PERI_REPEAT_ACCEL * age))
+                st["next"] = now + iv
 
     def _draw_periscope(self, pred):
         """Update the two camera-anchored frustum gizmos (requested amber / actual
@@ -1008,7 +1100,8 @@ class PRISMViewer:
         # coverage box, and the primary gizmo.
         if act is not None and live:
             self._peri_act_vis.set_data(pos=p.frustum_world(
-                cam_pos, R, act["yaw"], act["pitch"], act["hfov"], act["vfov"], far))
+                cam_pos, R, self._peri_yaw_sign * act["yaw"],
+                self._peri_pitch_sign * act["pitch"], act["hfov"], act["vfov"], far))
             self._peri_act_vis.visible = True
         else:
             self._peri_act_vis.visible = False
@@ -1022,7 +1115,8 @@ class PRISMViewer:
                    or abs(p.hfov - act["hfov"]) > 3.0)
         if leading:
             self._peri_req_vis.set_data(pos=p.frustum_world(
-                cam_pos, R, p.yaw, p.pitch, p.hfov, p.req_vfov(), far))
+                cam_pos, R, self._peri_yaw_sign * p.yaw,
+                self._peri_pitch_sign * p.pitch, p.hfov, p.req_vfov(), far))
             self._peri_req_vis.visible = True
         else:
             self._peri_req_vis.visible = False
@@ -1039,6 +1133,60 @@ class PRISMViewer:
                 self._peri_panel.visible = True
             else:
                 self._peri_panel.visible = False
+
+    def _draw_rgbd(self, pred):
+        """Show the latest D435i frame as a panel in front of the robot on a forward
+        frustum, anchored to the SAME predicted pose as the avatar (so it tracks the
+        robot and stays glued through delayed VGGT corrections). No cloud, no merge."""
+        r = self._rgbd
+        if r is None or self._rgbd_frustum is None:
+            return
+        img = r.latest_image()
+        if not r.enabled or img is None or r.stale():
+            self._rgbd_frustum.visible = False
+            if self._rgbd_panel is not None:
+                self._rgbd_panel.visible = False
+            return
+        m = r.latest_meta() or {}
+        hfov = float(m.get("hfov", 87.0)); vfov = float(m.get("vfov", 58.0))
+        pos, quat, fix, age = pred
+        R = quat_to_R(quat)
+        if self._yaw_offset_deg:
+            Y = _yaw_R(self._yaw_offset_deg)
+            R, pos = Y @ R, Y @ pos
+        cam_pos = pos + R @ RGBD_OFFSET               # D435i mount in world
+        pd = np.radians(RGBD_PITCH_DEG)
+        f_b = np.array([np.cos(pd), 0.0, -np.sin(pd)])   # forward, tilted down
+        u_b = np.array([np.sin(pd), 0.0, np.cos(pd)])    # up (perp, vertical plane)
+        fwd = R @ f_b; up = R @ u_b
+        right = np.cross(fwd, up)                          # physical right (-y at pitch 0)
+        n = np.linalg.norm(right)
+        right = right / n if n > 1e-6 else (R @ np.array([0.0, -1.0, 0.0]))
+        # forward frustum (apex at the camera)
+        far = RGBD_FRUSTUM_M
+        hw = far * np.tan(np.radians(hfov) / 2.0); hh = far * np.tan(np.radians(vfov) / 2.0)
+        C = cam_pos + fwd * far
+        c1 = C + right*hw + up*hh; c2 = C - right*hw + up*hh
+        c3 = C - right*hw - up*hh; c4 = C + right*hw - up*hh
+        a = cam_pos
+        segs = np.array([a,c1, a,c2, a,c3, a,c4, c1,c2, c2,c3, c3,c4, c4,c1], dtype=np.float32)
+        self._rgbd_frustum.set_data(pos=segs)
+        self._rgbd_frustum.visible = True
+        # live frame panel filling the frustum at RGBD_PANEL_M
+        if self._rgbd_panel is not None:
+            d = RGBD_PANEL_M
+            Wm = 2.0*d*np.tan(np.radians(hfov)/2.0); Hm = 2.0*d*np.tan(np.radians(vfov)/2.0)
+            Cc = cam_pos + fwd * d
+            H, W = img.shape[:2]
+            sx, sy = self._rgbd_flip_x, self._rgbd_flip_y
+            Xax = right * (Wm / max(W, 1)) * sx
+            Yax = -up * (Hm / max(H, 1)) * sy            # image row increases downward
+            origin = Cc - right*(Wm/2.0)*sx + up*(Hm/2.0)*sy   # image (0,0) = top-left
+            M = np.eye(4, dtype=np.float32)
+            M[0, :3] = Xax; M[1, :3] = Yax; M[2, :3] = fwd; M[3, :3] = origin
+            self._rgbd_panel.set_data(np.ascontiguousarray(img))
+            self._rgbd_panel.transform = scene.transforms.MatrixTransform(M)
+            self._rgbd_panel.visible = True
 
     def _draw_robot(self, pred):
         """Draw the robot at the predicted pose. Uses the URDF mesh when in mesh mode

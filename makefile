@@ -21,7 +21,7 @@ CLIENT_RUN ?= cd client && uv run python
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-uvc-kill theta-stream robot-docker viewer record-frames \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
-        teleop fetch_frame fetch_pcd periscope-probe \
+        teleop fetch_frame fetch_pcd periscope-probe rgbd-probe rgbd-camera \
         docs docs-serve clean
 
 # ── Help / runbook ───────────────────────────────────────────────────────────
@@ -52,6 +52,8 @@ help:
 	@echo "                                 N/M point size, C/[/] ceiling clip, 1 re-fetch)"
 	@echo "  make record-frames   [CLIENT] save 360° frames to disk (offline analysis)"
 	@echo "  make periscope-probe [CLIENT] headless periscope stream check (ARGS=\"--decode --save f.png\")"
+	@echo "  make rgbd-probe      [CLIENT] headless D435i panel stream check (ARGS=\"--kind depth --decode\")"
+	@echo "  make rgbd-camera     [ROBOT]  launch realsense2_camera (depth+color) to DDS"
 	@echo ""
 	@echo "Staged pre-POC tests (run in this order — see 'make steps'):"
 	@echo "  make test_link           0  transport alive (router + bridge + rates)"
@@ -228,6 +230,20 @@ probe_robot: sync-client
 periscope-probe: sync-client
 	@echo ">> Reminder: router + robot container (periscope service, PERISCOPE_ENABLE=1) running."
 	$(CLIENT_RUN) ../tools/periscope_probe.py $(ARGS)
+
+# [CLIENT] RGBD (D435i) single-frame stream probe -- isolates the depth/color panel
+# stream from the viewer. Runs in client/.venv (opencv decodes depth PNG / color JPEG).
+#   make rgbd-probe ARGS="--kind depth --decode --save /tmp/rgbd.png"
+rgbd-probe: sync-client
+	@echo ">> Reminder: robot container (rgbd_relay) + realsense2_camera running."
+	$(CLIENT_RUN) ../tools/rgbd_probe.py $(ARGS)
+
+# [ROBOT/HOST] Launch the RealSense D435i driver (ROS2) so it publishes depth+color
+# to DDS for the relay. Run this where the camera is plugged in (host, or a container
+# with realsense2_camera). Needs ros-humble-realsense2-camera installed.
+rgbd-camera:
+	@echo ">> launching realsense2_camera (depth+color, no pointcloud) ..."
+	ros2 launch realsense2_camera rs_launch.py enable_color:=true enable_depth:=true pointcloud.enable:=false
 
 # ── Docs ─────────────────────────────────────────────────────────────────────
 docs: sync-docs
