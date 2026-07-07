@@ -118,6 +118,8 @@ RGBD_FLIP_Y       = float(os.environ.get("RGBD_FLIP_Y", "1"))
 RGBD_POINT_SIZE   = float(os.environ.get("RGBD_POINT_SIZE", "4"))   # voxel point px
 RGBD_STRIDE       = int(os.environ.get("RGBD_STRIDE", "3"))         # depth pixel decimation (coarser=fewer voxels)
 RGBD_RENDER_HZ    = float(os.environ.get("RGBD_RENDER_HZ", "12"))   # cap voxel rebuild rate (protect render loop)
+RGBD_HFOV         = float(os.environ.get("RGBD_HFOV", "87"))        # D435 depth FOV (deg), for the frustum
+RGBD_VFOV         = float(os.environ.get("RGBD_VFOV", "58"))
 STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))
 SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
@@ -1106,6 +1108,8 @@ class PRISMViewer:
         if p is None or self._peri_req_vis is None:
             return
         pos, quat, fix, age = pred
+        if pos is None or quat is None:
+            return
         R = quat_to_R(quat)
         if self._yaw_offset_deg:
             Y = _yaw_R(self._yaw_offset_deg)
@@ -1153,38 +1157,35 @@ class PRISMViewer:
                 self._peri_panel.visible = False
 
     def _draw_rgbd(self, pred):
-        """Show the latest D435i frame as a panel in front of the robot on a forward
-        frustum, anchored to the SAME predicted pose as the avatar (so it tracks the
-        robot and stays glued through delayed VGGT corrections). No cloud, no merge."""
+        """Render the robot-deprojected voxel cloud: transform the camera-optical points
+        by the live pose + D435i mount into the world, plus a forward frustum. No client
+        deprojection, no accumulation (each cloud replaces the last)."""
         r = self._rgbd
         if r is None or self._rgbd_frustum is None:
             return
-        img = r.latest_image()
-        if not r.enabled or img is None or r.stale():
+        pts, cols = r.latest_points()
+        if not r.enabled or pts is None or r.stale():
             self._rgbd_frustum.visible = False
-            if self._rgbd_panel is not None:
-                self._rgbd_panel.visible = False
             if self._rgbd_cloud is not None:
                 self._rgbd_cloud.visible = False
             return
-        m = r.latest_meta() or {}
-        hfov = float(m.get("hfov", 87.0)); vfov = float(m.get("vfov", 58.0))
         pos, quat, fix, age = pred
+        if pos is None or quat is None:
+            return
         R = quat_to_R(quat)
         if self._yaw_offset_deg:
             Y = _yaw_R(self._yaw_offset_deg)
             R, pos = Y @ R, Y @ pos
-        cam_pos = pos + R @ RGBD_OFFSET               # D435i mount in world
+        cam_pos = pos + R @ RGBD_OFFSET
         pd = np.radians(RGBD_PITCH_DEG)
-        f_b = np.array([np.cos(pd), 0.0, -np.sin(pd)])   # forward, tilted down
-        u_b = np.array([np.sin(pd), 0.0, np.cos(pd)])    # up (perp, vertical plane)
-        fwd = R @ f_b; up = R @ u_b
-        right = np.cross(fwd, up)                          # physical right (-y at pitch 0)
+        fwd = R @ np.array([np.cos(pd), 0.0, -np.sin(pd)])
+        up = R @ np.array([np.sin(pd), 0.0, np.cos(pd)])
+        right = np.cross(fwd, up)
         n = np.linalg.norm(right)
         right = right / n if n > 1e-6 else (R @ np.array([0.0, -1.0, 0.0]))
         # forward frustum (apex at the camera)
         far = RGBD_FRUSTUM_M
-        hw = far * np.tan(np.radians(hfov) / 2.0); hh = far * np.tan(np.radians(vfov) / 2.0)
+        hw = far * np.tan(np.radians(RGBD_HFOV) / 2.0); hh = far * np.tan(np.radians(RGBD_VFOV) / 2.0)
         C = cam_pos + fwd * far
         c1 = C + right*hw + up*hh; c2 = C - right*hw + up*hh
         c3 = C - right*hw - up*hh; c4 = C + right*hw - up*hh
@@ -1192,79 +1193,19 @@ class PRISMViewer:
         segs = np.array([a,c1, a,c2, a,c3, a,c4, c1,c2, c2,c3, c3,c4, c4,c1], dtype=np.float32)
         self._rgbd_frustum.set_data(pos=segs)
         self._rgbd_frustum.visible = True
-        # THROTTLE the expensive work (deproject + GPU upload) to RGBD_RENDER_HZ and only
-        # when a genuinely NEW frame arrived, so it can never starve the render loop /
-        # pose predictor (that was the 1.3 s pose-latency + render stalls). The cheap
-        # frustum above still updates every tick.
-        depth8, dm = r.latest_depth()
-        nowm = time.monotonic()
-        fid = r.frame_id()
-        due = (fid != getattr(self, "_rgbd_last_fid", -1)
-               and (nowm - getattr(self, "_rgbd_last_draw", 0.0)) >= 1.0 / max(1.0, RGBD_RENDER_HZ))
-        if depth8 is not None and self._rgbd_cloud is not None:
-            if due:
-                self._rgbd_last_fid = fid; self._rgbd_last_draw = nowm
-                pts, cols = self._rgbd_deproject(depth8, img, m, cam_pos, right, up, fwd)
-                if pts is not None and len(pts):
-                    self._rgbd_cloud.set_data(pts, face_color=cols, edge_width=0, size=RGBD_POINT_SIZE)
-                    self._rgbd_cloud.visible = True
-                else:
-                    self._rgbd_cloud.visible = False
-            if self._rgbd_panel is not None:
-                self._rgbd_panel.visible = False
-        elif self._rgbd_panel is not None:
-            # COLOR -> flat "what is it" panel filling the frustum at RGBD_PANEL_M.
-            # Transform follows the pose every tick; the texture re-uploads only on a new frame.
-            if self._rgbd_cloud is not None:
-                self._rgbd_cloud.visible = False
-            d = RGBD_PANEL_M
-            Wm = 2.0*d*np.tan(np.radians(hfov)/2.0); Hm = 2.0*d*np.tan(np.radians(vfov)/2.0)
-            Cc = cam_pos + fwd * d
-            H, W = img.shape[:2]
-            sx, sy = self._rgbd_flip_x, self._rgbd_flip_y
-            Xax = right * (Wm / max(W, 1)) * sx
-            Yax = -up * (Hm / max(H, 1)) * sy            # image row increases downward
-            origin = Cc - right*(Wm/2.0)*sx + up*(Hm/2.0)*sy   # image (0,0) = top-left
-            M = np.eye(4, dtype=np.float32)
-            M[0, :3] = Xax; M[1, :3] = Yax; M[2, :3] = fwd; M[3, :3] = origin
-            if due:
-                self._rgbd_last_fid = fid; self._rgbd_last_draw = nowm
-                self._rgbd_panel.set_data(np.ascontiguousarray(img))
-            self._rgbd_panel.transform = scene.transforms.MatrixTransform(M)
-            self._rgbd_panel.visible = True
-
-    def _rgbd_deproject(self, depth8, colimg, m, cam_pos, right, up, fwd):
-        """Deproject the 8-bit depth frame to world-space voxel points (no accumulation).
-        Depth is scaled over [0,max_range]; intrinsics come from the sensor FOV (centered
-        principal point). Optical axes map to the D435i basis: +x=right, +y=down=-up,
-        +z=fwd. Colors come from the colorized depth (near=warm). Range-limited already."""
-        H, W = depth8.shape
-        st = max(1, RGBD_STRIDE)
-        d = depth8[::st, ::st]
-        col = colimg[::st, ::st]
-        valid = d > 0
-        if not valid.any():
-            return None, None
-        max_r = float(m.get("max_range_mm", 4000)) / 1000.0
-        hfov = np.radians(float(m.get("hfov", 87.0))); vfov = np.radians(float(m.get("vfov", 58.0)))
-        fx = (W / 2.0) / np.tan(hfov / 2.0); fy = (H / 2.0) / np.tan(vfov / 2.0)
-        cx = W / 2.0; cy = H / 2.0
-        hs, ws = d.shape
-        us = (np.arange(ws) * st).astype(np.float32)[None, :].repeat(hs, 0)
-        vs = (np.arange(hs) * st).astype(np.float32)[:, None].repeat(ws, 1)
-        z = d.astype(np.float32) * (max_r / 254.0)          # metric depth (approx)
-        valid = valid & (z <= max_r + 0.05)                 # enforce range clip on the client too
-        if not valid.any():
-            return None, None
-        x = (us - cx) / fx * z
-        y = (vs - cy) / fy * z
-        P = (cam_pos[None, None, :] + x[..., None] * right
-             + y[..., None] * (-up) + z[..., None] * fwd)
-        pts = P[valid].astype(np.float32)
-        cols = np.empty((pts.shape[0], 4), np.float32)
-        cols[:, :3] = col[valid].astype(np.float32) / 255.0
-        cols[:, 3] = 1.0
-        return pts, cols
+        # optical -> world: world = cam_pos + x*right - y*up + z*fwd (every tick, tracks pose)
+        if self._rgbd_cloud is not None:
+            x = pts[:, 0:1]; y = pts[:, 1:2]; z = pts[:, 2:3]
+            world = (cam_pos[None, :] + x * right[None, :] - y * up[None, :]
+                     + z * fwd[None, :]).astype(np.float32)
+            self._rgbd_cloud.set_data(world, face_color=cols, edge_width=0, size=RGBD_POINT_SIZE)
+            self._rgbd_cloud.visible = True
+            self._rgbd_draws = getattr(self, "_rgbd_draws", 0) + 1
+            self._rgbd_npts = int(world.shape[0])
+            try:
+                self._canvas.update()
+            except Exception:
+                pass
 
     def _draw_robot(self, pred):
         """Draw the robot at the predicted pose. Uses the URDF mesh when in mesh mode
@@ -1436,8 +1377,9 @@ class PRISMViewer:
             f"  render             {self._render_fps:4.0f} fps  stalls {self._render_stalls}",
             "",
             "RGBD (D435i)",
-            ("  " + (f"rx={self._rgbd._n_recv} dec={self._rgbd._n_dec} "
-                     f"fps={self._rgbd.fps():.1f} stale={self._rgbd.stale()} kind={self._rgbd.kind}")
+            ("  " + (f"rx={self._rgbd._n_recv} dec={self._rgbd._n_dec} fps={self._rgbd.fps():.1f} "
+                     f"draws={getattr(self,'_rgbd_draws',0)} pts={getattr(self,'_rgbd_npts',0)} "
+                     f"stale={self._rgbd.stale()} kind={self._rgbd.kind}")
              if self._rgbd is not None else "  off"),
         ]
         for i, t in enumerate(self._mlines):

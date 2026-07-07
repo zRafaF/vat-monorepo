@@ -109,6 +109,9 @@ class PeriscopeClient:
         self._pub_kf = self._z.declare_publisher(self._K["periscope_keyframe"])
         self._z.declare_subscriber(self._K["periscope_frame"], self._on_frame)
         self.publish()                        # tell the robot our initial view
+        self._ka_stop = threading.Event()
+        self._ka_thread = threading.Thread(target=self._ka_loop, name="periscope-keepalive", daemon=True)
+        self._ka_thread.start()
         log.info(f"[periscope] client on '{self._K['periscope_frame']}' "
                  f"req->'{self._K['periscope_request']}'")
 
@@ -180,12 +183,20 @@ class PeriscopeClient:
             log.debug(f"[periscope] view request publish failed: {e}")
         self._last_pub_t = time.time()
 
+    def _ka_loop(self):
+        """Re-send the current view every 0.5 s from a dedicated thread so the robot keeps
+        streaming even when the render loop hitches (that caused the on/off flashing)."""
+        while not self._ka_stop.wait(0.5):
+            if self.enabled:
+                try:
+                    self.publish()
+                except Exception:
+                    pass
+
     def keepalive(self, interval_s: float = 1.0):
-        """Re-send the current view periodically so the robot keeps streaming (its
-        viewer-timeout stops encoding when no request has arrived recently). Call
-        this every render tick; it self-throttles to ``interval_s``."""
-        if self.enabled and (time.time() - self._last_pub_t) >= interval_s:
-            self.publish()
+        """No-op: keepalive publishing now runs on the dedicated _ka_loop thread
+        (kept for call-site compatibility from the render tick)."""
+        return
 
     def fps(self) -> float:
         """Decoded frames/sec over the recent window; 0 if the feed has stalled."""

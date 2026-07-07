@@ -11,6 +11,7 @@ separating "relay/realsense not publishing" from "client can't decode".
 """
 from __future__ import annotations
 import argparse, os, sys, time
+import numpy as np
 import zenoh
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,14 +36,7 @@ def main():
     ap.add_argument("--secs", type=float, default=0.0)
     args = ap.parse_args()
 
-    decoder = None
-    if args.decode:
-        try:
-            from vat_client.rgbd_view import RgbdClient
-            decoder = RgbdClient.__new__(RgbdClient)   # only need _decode()
-        except Exception as e:
-            print(f"  [--decode] cannot load decoder: {e} (need opencv-python)")
-            decoder = None
+    # RGBD is now a pack_pcd point cloud (robot-side deprojection).
 
     K = proto.keys(ROBOT_NAME)
     print(f"RGBD probe -> router={ROUTER} robot={ROBOT_NAME}")
@@ -51,29 +45,24 @@ def main():
     conf.insert_json5("mode", '"client"')
     conf.insert_json5("connect/endpoints", f'["{ROUTER}"]')
     z = zenoh.open(conf)
-    st = {"n": 0, "bytes": 0, "t0": time.time(), "last": time.time(), "dec": 0, "saved": False}
+    st = {"n": 0, "bytes": 0, "t0": time.time(), "last": time.time(), "dec": 0, "saved": False, "pts": 0}
 
     def on_frame(sample):
+        raw = bytes(sample.payload)
         try:
-            f = proto.unpack_rgbd_frame(bytes(sample.payload))
-        except proto.ProtocolError as e:
-            print(f"  [bad frame] {e}"); return
-        st["n"] += 1; st["bytes"] += len(f.payload); st["last"] = time.time()
-        if decoder is not None:
+            ver, xyz, rgb, snap, since = proto.unpack_pcd(raw)
+        except Exception as e:
+            print(f"  [bad cloud] {e}"); return
+        st["n"] += 1; st["bytes"] += len(raw); st["last"] = time.time(); st["pts"] = int(xyz.shape[0])
+        if args.save and not st["saved"] and xyz.shape[0]:
             try:
-                rgb = decoder._decode(f)
+                np.save(args.save, np.hstack([xyz, rgb]).astype("float32")); st["saved"] = True
+                print(f"  [--save] wrote {args.save} ({xyz.shape[0]} points, xyz+rgb)")
             except Exception as e:
-                rgb = None; print(f"  [decode err] {e}")
-            if rgb is not None:
-                st["dec"] += 1
-                if args.save and not st["saved"]:
-                    import cv2
-                    cv2.imwrite(args.save, rgb[:, :, ::-1]); st["saved"] = True
-                    print(f"  [--save] wrote {args.save} ({rgb.shape[1]}x{rgb.shape[0]})")
+                print(f"  [--save] failed: {e}")
         if st["n"] <= 5 or st["n"] % 20 == 0:
-            print(f"  #{st['n']:<4} {_KNAME.get(f.kind, f.kind):5} {f.width}x{f.height} "
-                  f"near={f.min_depth_mm/1000:.2f}m {len(f.payload)/1024:.1f}KB"
-                  + (f" dec={st['dec']}" if decoder is not None else ""))
+            print(f"  #{st['n']:<4} pts={xyz.shape[0]:<6} {len(raw)/1024:.1f}KB "
+                  f"z=[{xyz[:,2].min():.2f},{xyz[:,2].max():.2f}]m")
 
     z.declare_subscriber(K["rgbd_frame"], on_frame)
     pub = z.declare_publisher(K["rgbd_request"])
@@ -92,9 +81,8 @@ def main():
             if st["n"] == 0:
                 print(f"  [{dt:5.0f}s] NO FRAMES yet - relay up? realsense2_camera publishing? (RGBD_ENABLE=1)")
             else:
-                dec = f" decoded={st['dec']}" if decoder is not None else ""
-                print(f"  --- {dt:5.0f}s: {st['n']} frames {fps:.1f} fps {kbps:.0f} KB/s{dec} "
-                      f"last {time.time()-st['last']:.1f}s ago ---")
+                print(f"  --- {dt:5.0f}s: {st['n']} clouds {fps:.1f} fps {kbps:.0f} KB/s "
+                      f"pts={st.get('pts',0)} last {time.time()-st['last']:.1f}s ago ---")
             if args.secs and dt >= args.secs:
                 break
     except KeyboardInterrupt:

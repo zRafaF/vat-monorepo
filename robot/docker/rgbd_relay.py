@@ -1,27 +1,19 @@
 """
-VAT - RGBD (RealSense D435i) relay:  ROS2 (DDS) -> Zenoh single frames.
+VAT - RGBD (RealSense D435i) relay:  ROS2 (DDS) -> Zenoh voxel cloud.
 
-Bridges the realsense2_camera node's depth/color topics to the client as ONE latest
-frame at a time (no cloud, no accumulation), so the operator sees a panel in front of
-the robot showing what the forward camera sees. The client picks the ACTIVE stream via
-an RgbdRequest, so we only ever encode+send what is on screen:
+The robot DEPROJECTS the latest depth frame to 3D points, clips to max_range,
+voxel-downsamples, colorizes by distance (near=warm), and ships a compact
+pack_pcd cloud (zlib + 16-bit quant) to the client. The client just transforms
+the points by the live pose and renders them -- no client-side deprojection.
 
-  * depth : 16-bit depth (mm) -> 8-bit scaled over [0, max_range] (single channel, PNG).
-            Out-of-range / invalid -> 0 (client renders black; colormap does near=warm).
-  * color : RGB -> JPEG.
-
-Client-configurable over Zenoh (RgbdRequest): kind, fps, max_range, range-gate. The
-relay only publishes while a viewer is active (recent request) and can range-gate
-(skip frames when nothing is within max_range) to save uplink.
-
-Runs inside the robot container next to theta_camera/pose_fuser. It subscribes to the
-realsense topics over CycloneDDS (same discovery as the Go2 bridge), so realsense2_camera
-must be running (in this container via start.sh, or on the host).
+Single frame, no accumulation: each publish replaces the previous cloud. Points
+are in the CAMERA-OPTICAL frame (+x right, +y down, +z forward); the client
+applies the D435i mount extrinsics + robot pose. Client-configurable over Zenoh
+(RgbdRequest): kind (on/off), fps, max_range, range-gate.
 """
 
 from __future__ import annotations
 
-import math
 import os
 import threading
 import time
@@ -34,61 +26,55 @@ import zenoh
 import vat_protocol as proto
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
-                    format="%(asctime)s [%(levelname)s] %(message)s",
-                    datefmt="%H:%M:%S")
+                    format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("rgbd")
 
 ROBOT_NAME    = os.environ.get("ROBOT_NAME", "go2")
 ZENOH_CONNECT = os.environ.get("ZENOH_CONNECT", "tcp/127.0.0.1:7447")
 SO_SNDBUF     = os.environ.get("RGBD_SO_SNDBUF", "262144").strip()
 
-# Topics are comma-separated LISTS so the relay is namespace-agnostic: realsense2_camera
-# publishes under /camera/camera/... OR /camera/... depending on launch args, so we
-# subscribe to both and use whichever actually delivers frames.
 def _tlist(env, default):
     return [t.strip() for t in os.environ.get(env, default).split(",") if t.strip()]
 
-DEPTH_TOPICS  = _tlist("RGBD_DEPTH_TOPIC",
-                       "/camera/camera/depth/image_rect_raw,/camera/depth/image_rect_raw")
-COLOR_TOPICS  = _tlist("RGBD_COLOR_TOPIC",
-                       "/camera/camera/color/image_raw,/camera/color/image_raw")
-DEPTH_INFOS   = _tlist("RGBD_DEPTH_INFO_TOPIC",
-                       "/camera/camera/depth/camera_info,/camera/depth/camera_info")
-COLOR_INFOS   = _tlist("RGBD_COLOR_INFO_TOPIC",
-                       "/camera/camera/color/camera_info,/camera/color/camera_info")
+DEPTH_TOPICS = _tlist("RGBD_DEPTH_TOPIC",
+                      "/camera/camera/depth/image_rect_raw,/camera/depth/image_rect_raw")
+DEPTH_INFOS  = _tlist("RGBD_DEPTH_INFO_TOPIC",
+                      "/camera/camera/depth/camera_info,/camera/depth/camera_info")
 
-SEND_WIDTH    = int(os.environ.get("RGBD_SEND_WIDTH", "424"))     # downscale long side; 0=native
-JPEG_QUALITY  = int(os.environ.get("RGBD_JPEG_QUALITY", "70"))
+SEND_WIDTH   = int(os.environ.get("RGBD_SEND_WIDTH", "320"))     # downscale depth before deproject
+VOXEL_M      = float(os.environ.get("RGBD_VOXEL_M", "0.05"))     # voxel downsample size (m)
+MAX_POINTS   = int(os.environ.get("RGBD_MAX_POINTS", "8000"))    # hard cap after downsample
 VIEWER_TIMEOUT_S = float(os.environ.get("RGBD_VIEWER_TIMEOUT_S", "5.0"))
-# Fallback intrinsics (deg) if camera_info hasn't arrived (D435: depth ~87x58, color ~69x42).
-DEF_DEPTH_HFOV = float(os.environ.get("RGBD_DEPTH_HFOV", "87"))
-DEF_DEPTH_VFOV = float(os.environ.get("RGBD_DEPTH_VFOV", "58"))
-DEF_COLOR_HFOV = float(os.environ.get("RGBD_COLOR_HFOV", "69"))
-DEF_COLOR_VFOV = float(os.environ.get("RGBD_COLOR_VFOV", "42"))
+# Fallback intrinsics if camera_info hasn't arrived (D435 depth @ 848x480).
+DEF_FX = float(os.environ.get("RGBD_DEPTH_FX", "425.0"))
+DEF_FY = float(os.environ.get("RGBD_DEPTH_FY", "425.0"))
 
 
-def _fov_from_info(width, height, fx, fy):
-    hf = math.degrees(2 * math.atan(width / (2 * fx))) if fx else 0.0
-    vf = math.degrees(2 * math.atan(height / (2 * fy))) if fy else 0.0
-    return hf, vf
+def _turbo(norm_u8):
+    """norm_u8 (N,) uint8 -> (N,3) uint8 RGB, near=warm (input is 0..255 = near..far)."""
+    inv = (255 - norm_u8).astype(np.uint8).reshape(-1, 1)
+    try:
+        cm = cv2.applyColorMap(inv, cv2.COLORMAP_TURBO)
+    except Exception:
+        cm = cv2.applyColorMap(inv, cv2.COLORMAP_JET)
+    return cm.reshape(-1, 3)[:, ::-1]          # BGR->RGB
 
 
 class RgbdRelay:
     def __init__(self):
         self._lock = threading.Lock()
         self._depth = None          # (H,W) uint16 mm
-        self._color = None          # (H,W,3) rgb uint8
-        self._depth_fov = (DEF_DEPTH_HFOV, DEF_DEPTH_VFOV)
-        self._color_fov = (DEF_COLOR_HFOV, DEF_COLOR_VFOV)
+        self._K = None              # (fx, fy, cx, cy, W, H) at the depth image resolution
+        self._depth_n = 0           # count of depth frames received (liveness)
 
-        # request state (client-configurable over Zenoh)
         self._kind = proto.RGBD_KIND_OFF
-        self._fps = 20
-        self._max_range_mm = 4000
+        self._fps = 10
+        self._max_range_mm = 2000
         self._range_gate = False
         self._last_req_t = 0.0
         self._out_seq = 0
         self._pub_count = 0
+        self._last_pts = 0
         self._last_stat_t = 0.0
         self._stop = threading.Event()
 
@@ -96,10 +82,9 @@ class RgbdRelay:
         self._pub = self._declare_pub()
         K = proto.keys(ROBOT_NAME)
         self._z.declare_subscriber(K["rgbd_request"], self._on_request)
-        log.info(f"[rgbd] relay: req<-'{K['rgbd_request']}' frame->'{K['rgbd_frame']}' "
-                 f"depth={DEPTH_TOPICS} color={COLOR_TOPICS}")
+        log.info(f"[rgbd] relay(cloud): req<-'{K['rgbd_request']}' frame->'{K['rgbd_frame']}' "
+                 f"depth={DEPTH_TOPICS} voxel={VOXEL_M}m")
 
-    # -- Zenoh ---------------------------------------------------------------
     def _open_session(self):
         conf = zenoh.Config()
         endpoint = ZENOH_CONNECT
@@ -112,8 +97,7 @@ class RgbdRelay:
             try:
                 return zenoh.open(conf)
             except Exception as e:
-                log.warning(f"[rgbd] Zenoh connect failed: {e} - retry 5s")
-                time.sleep(5)
+                log.warning(f"[rgbd] Zenoh connect failed: {e} - retry 5s"); time.sleep(5)
 
     def _declare_pub(self):
         key = proto.keys(ROBOT_NAME)["rgbd_frame"]
@@ -133,8 +117,7 @@ class RgbdRelay:
         try:
             r = proto.unpack_rgbd_request(bytes(sample.payload))
         except proto.ProtocolError as e:
-            log.warning(f"[rgbd] bad request: {e}")
-            return
+            log.warning(f"[rgbd] bad request: {e}"); return
         with self._lock:
             self._kind = int(r.kind)
             self._fps = max(1, min(30, int(r.fps)))
@@ -142,53 +125,59 @@ class RgbdRelay:
             self._range_gate = bool(r.range_gate)
             self._last_req_t = time.time()
 
-    # -- ROS2 intake (called from the rclpy thread) --------------------------
-    def on_depth(self, arr_u16, hfov, vfov):
+    # -- ROS2 intake ---------------------------------------------------------
+    def on_depth(self, arr_u16, K):
         with self._lock:
             self._depth = arr_u16
-            if hfov and vfov:
-                self._depth_fov = (hfov, vfov)
+            self._depth_n += 1
+            if K is not None:
+                self._K = K
 
-    def on_color(self, rgb_u8, hfov, vfov):
-        with self._lock:
-            self._color = rgb_u8
-            if hfov and vfov:
-                self._color_fov = (hfov, vfov)
-
-    # -- publish loop --------------------------------------------------------
     def _viewer_active(self, now, last_req):
         if VIEWER_TIMEOUT_S <= 0:
             return last_req > 0.0
         return (now - last_req) < VIEWER_TIMEOUT_S
 
-    @staticmethod
-    def _downscale(img, interp):
-        if SEND_WIDTH and img.shape[1] > SEND_WIDTH:
-            h = int(round(img.shape[0] * SEND_WIDTH / img.shape[1]))
-            return cv2.resize(img, (SEND_WIDTH, h), interpolation=interp)
-        return img
-
-    def _encode_depth(self, depth, max_mm):
-        depth = self._downscale(depth, cv2.INTER_NEAREST)
-        valid = (depth > 0) & (depth <= max_mm)
-        v = np.zeros(depth.shape, np.uint8)
-        if valid.any():
-            scaled = depth.astype(np.float32) * (254.0 / float(max_mm)) + 1.0
-            v[valid] = np.clip(scaled[valid], 1, 255).astype(np.uint8)
-            min_mm = int(depth[valid].min())
+    # -- deproject + voxel + colorize + pack --------------------------------
+    def _make_cloud(self, depth, K, max_mm):
+        """Return (pcd_bytes, n_points, min_depth_mm) or None. Points are in the
+        camera-optical frame (metres); colour encodes distance (near=warm)."""
+        H0, W0 = depth.shape
+        # downscale to SEND_WIDTH (nearest, so depth edges stay crisp) + scale intrinsics
+        if SEND_WIDTH and W0 > SEND_WIDTH:
+            sc = SEND_WIDTH / float(W0)
+            d = cv2.resize(depth, (SEND_WIDTH, int(round(H0 * sc))), interpolation=cv2.INTER_NEAREST)
         else:
-            min_mm = 0
-        ok, buf = cv2.imencode(".png", v)
-        if not ok:
+            sc = 1.0
+            d = depth
+        H, W = d.shape
+        if K is not None:
+            fx, fy, cx, cy = K[0] * sc, K[1] * sc, K[2] * sc, K[3] * sc
+        else:
+            fx = fy = DEF_FX * sc; cx = W / 2.0; cy = H / 2.0
+        valid = (d > 0) & (d <= max_mm)
+        if not valid.any():
             return None
-        return buf.tobytes(), v.shape[1], v.shape[0], min_mm, bool(valid.any())
-
-    def _encode_color(self, rgb):
-        rgb = self._downscale(rgb, cv2.INTER_AREA)
-        ok, buf = cv2.imencode(".jpg", rgb[:, :, ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-        if not ok:
-            return None
-        return buf.tobytes(), rgb.shape[1], rgb.shape[0]
+        vs, us = np.nonzero(valid)                    # rows (y), cols (x)
+        z = d[valid].astype(np.float32) * 0.001       # mm -> m
+        x = (us.astype(np.float32) - cx) / fx * z
+        y = (vs.astype(np.float32) - cy) / fy * z
+        xyz = np.stack([x, y, z], axis=1)             # optical: +x right, +y down, +z fwd
+        # distance colour (near=warm) BEFORE downsample
+        norm = np.clip(z / (max_mm * 0.001) * 255.0, 0, 255).astype(np.uint8)
+        rgb = _turbo(norm)
+        # voxel downsample: keep one point per voxel
+        if VOXEL_M > 0:
+            keys = np.floor(xyz / VOXEL_M).astype(np.int64)
+            _, idx = np.unique(keys, axis=0, return_index=True)
+            xyz = xyz[idx]; rgb = rgb[idx]
+        # hard cap (random subsample if still too many)
+        if MAX_POINTS and xyz.shape[0] > MAX_POINTS:
+            sel = np.random.choice(xyz.shape[0], MAX_POINTS, replace=False)
+            xyz = xyz[sel]; rgb = rgb[sel]
+        min_mm = int(d[valid].min())
+        buf = proto.pack_pcd(0, xyz.astype(np.float32), rgb, is_snapshot=True)
+        return buf, int(xyz.shape[0]), min_mm
 
     def run(self):
         log.info("[rgbd] publish loop started.")
@@ -197,64 +186,30 @@ class RgbdRelay:
             with self._lock:
                 kind, fps, max_mm = self._kind, self._fps, self._max_range_mm
                 gate, last_req = self._range_gate, self._last_req_t
-                depth, color = self._depth, self._color
-                dfov, cfov = self._depth_fov, self._color_fov
+                depth, K, dn = self._depth, self._K, self._depth_n
             period = 1.0 / max(1, fps)
             if now - self._last_stat_t >= 10.0:
                 self._last_stat_t = now
-                log.info(f"[rgbd] published={self._pub_count} kind={kind} fps={fps} "
-                         f"active={self._viewer_active(now, last_req)} "
-                         f"depth={'y' if depth is not None else 'N'} color={'y' if color is not None else 'N'}")
-            if kind == proto.RGBD_KIND_OFF or not self._viewer_active(now, last_req):
-                time.sleep(min(0.2, period))
-                continue
+                log.info(f"[rgbd] published={self._pub_count} pts={self._last_pts} kind={kind} "
+                         f"fps={fps} active={self._viewer_active(now, last_req)} "
+                         f"depth_rx={dn} depth={'y' if depth is not None else 'N'}")
+            if kind == proto.RGBD_KIND_OFF or not self._viewer_active(now, last_req) or depth is None:
+                time.sleep(min(0.2, period)); continue
             try:
-                self._encode_publish(kind, max_mm, gate, depth, color, dfov, cfov)
+                res = self._make_cloud(depth, K, max_mm)
+                if res is not None:
+                    buf, npts, min_mm = res
+                    if not (gate and npts == 0):
+                        self._out_seq += 1
+                        try:
+                            self._pub.put(buf, encoding=proto.ENC_PCD)
+                        except TypeError:
+                            self._pub.put(buf)
+                        self._pub_count += 1
+                        self._last_pts = npts
             except Exception:
-                log.exception("[rgbd] encode/publish error")
-                time.sleep(0.1)
+                log.exception("[rgbd] make_cloud/publish error"); time.sleep(0.1)
             time.sleep(period)
-
-    def _encode_publish(self, kind, max_mm, gate, depth, color, dfov, cfov):
-        min_mm = 0
-        if kind == proto.RGBD_KIND_DEPTH:
-            if depth is None:
-                return
-            enc = self._encode_depth(depth, max_mm)
-            if enc is None:
-                return
-            payload, w, h, min_mm, in_range = enc
-            if gate and not in_range:
-                return                         # nothing within range -> save uplink
-            hfov, vfov = dfov
-            codec = proto.RGBD_CODEC_PNG
-        elif kind == proto.RGBD_KIND_COLOR:
-            if color is None:
-                return
-            # range-gate on color uses the depth min if we have depth
-            if gate and depth is not None:
-                dv = depth[(depth > 0) & (depth <= max_mm)]
-                if dv.size == 0:
-                    return
-                min_mm = int(dv.min())
-            enc = self._encode_color(color)
-            if enc is None:
-                return
-            payload, w, h = enc
-            hfov, vfov = cfov
-            codec = proto.RGBD_CODEC_JPEG
-        else:
-            return
-        self._out_seq += 1
-        f = proto.RgbdFrame(seq=self._out_seq, timestamp_ns=time.time_ns(), kind=kind,
-                            codec=codec, width=w, height=h, hfov_deg=hfov, vfov_deg=vfov,
-                            max_range_mm=max_mm, min_depth_mm=min_mm, payload=payload)
-        buf = proto.pack_rgbd_frame(f)
-        try:
-            self._pub.put(buf, encoding=proto.ENC_RGBF)
-        except TypeError:
-            self._pub.put(buf)
-        self._pub_count += 1
 
     def close(self):
         self._stop.set()
@@ -264,24 +219,12 @@ class RgbdRelay:
             pass
 
 
-# ── ROS2 node: subscribe realsense topics, feed the relay ────────────────────
-def _decode_image(msg):
-    """sensor_msgs/Image -> numpy. Returns (array, encoding_str)."""
-    h, w = msg.height, msg.width
+def _decode_depth(msg):
     enc = msg.encoding
-    data = np.frombuffer(bytes(msg.data), np.uint8)
-    if enc in ("16UC1", "mono16"):
-        return data.view(np.uint16).reshape(h, w), enc
-    if enc in ("rgb8", "bgr8"):
-        img = data.reshape(h, w, 3)
-        return (img if enc == "rgb8" else img[:, :, ::-1].copy()), enc
-    if enc in ("mono8",):
-        return data.reshape(h, w), enc
-    # last resort: assume 3-channel
-    try:
-        return data.reshape(h, w, -1), enc
-    except Exception:
-        return None, enc
+    if enc not in ("16UC1", "mono16"):
+        return None
+    data = np.frombuffer(bytes(msg.data), np.uint8).view(np.uint16)
+    return data.reshape(msg.height, msg.width)
 
 
 def main():
@@ -293,49 +236,32 @@ def main():
         from sensor_msgs.msg import Image, CameraInfo
     except Exception as e:
         log.error(f"[rgbd] rclpy/sensor_msgs unavailable ({e}); is this the ROS2 container? Exiting.")
-        relay.close()
-        return
+        relay.close(); return
 
     class Sub(Node):
         def __init__(self):
             super().__init__("vat_rgbd_relay")
-            self._dfov = (0.0, 0.0)
-            self._cfov = (0.0, 0.0)
+            self._K = None
             self._seen = set()
             for t in DEPTH_TOPICS:
                 self.create_subscription(Image, t, self._mk_depth_cb(t), qos_profile_sensor_data)
-            for t in COLOR_TOPICS:
-                self.create_subscription(Image, t, self._mk_color_cb(t), qos_profile_sensor_data)
             for t in DEPTH_INFOS:
-                self.create_subscription(CameraInfo, t, self._dinfo_cb, qos_profile_sensor_data)
-            for t in COLOR_INFOS:
-                self.create_subscription(CameraInfo, t, self._cinfo_cb, qos_profile_sensor_data)
-            self.get_logger().info(f"vat_rgbd_relay subscribed: depth={DEPTH_TOPICS} color={COLOR_TOPICS}")
+                self.create_subscription(CameraInfo, t, self._info_cb, qos_profile_sensor_data)
+            self.get_logger().info(f"vat_rgbd_relay(cloud) subscribed: depth={DEPTH_TOPICS}")
 
-        def _dinfo_cb(self, m):
-            self._dfov = _fov_from_info(m.width, m.height, m.k[0], m.k[4])
-
-        def _cinfo_cb(self, m):
-            self._cfov = _fov_from_info(m.width, m.height, m.k[0], m.k[4])
+        def _info_cb(self, m):
+            # K = [fx 0 cx; 0 fy cy; 0 0 1]
+            self._K = (float(m.k[0]), float(m.k[4]), float(m.k[2]), float(m.k[5]),
+                       int(m.width), int(m.height))
 
         def _mk_depth_cb(self, topic):
             def cb(m):
-                arr, enc = _decode_image(m)
-                if arr is not None and arr.dtype == np.uint16:
+                arr = _decode_depth(m)
+                if arr is not None:
                     if ("d", topic) not in self._seen:
                         self._seen.add(("d", topic))
-                        self.get_logger().info(f"depth frames arriving on {topic} ({enc})")
-                    relay.on_depth(arr, *self._dfov)
-            return cb
-
-        def _mk_color_cb(self, topic):
-            def cb(m):
-                arr, enc = _decode_image(m)
-                if arr is not None and arr.ndim == 3:
-                    if ("c", topic) not in self._seen:
-                        self._seen.add(("c", topic))
-                        self.get_logger().info(f"color frames arriving on {topic} ({enc})")
-                    relay.on_color(np.ascontiguousarray(arr), *self._cfov)
+                        self.get_logger().info(f"depth frames arriving on {topic} ({m.encoding})")
+                    relay.on_depth(arr, self._K)
             return cb
 
     rclpy.init()
@@ -347,8 +273,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        relay.close()
-        node.destroy_node()
+        relay.close(); node.destroy_node()
         try:
             rclpy.shutdown()
         except Exception:
