@@ -71,7 +71,12 @@ else
     NET_IFACE="lo"
 fi
 export NET_IFACE
-export CYCLONEDDS_URI="${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><Interfaces><NetworkInterface name=\"${NET_IFACE}\"/></Interfaces></General></Domain></CycloneDDS>}"
+# Pinning a single NIC (eth1, the Go2 subnet) DISABLES CycloneDDS loopback, so
+# same-host publishers delivered over 127.0.0.1 (e.g. the RealSense node running on
+# the Jetson host) are NOT received — depth arrives in a startup burst then stops.
+# Add 'lo' so same-host large messages come through reliably. eth1 still carries the
+# Go2 topics. Larger socket buffers help the fragmented depth image (~200KB/frame).
+export CYCLONEDDS_URI="${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><Interfaces><NetworkInterface name=\"${NET_IFACE}\"/><NetworkInterface name=\"lo\" presence_required=\"false\"/></Interfaces></General><Internal><SocketReceiveBufferSize min=\"4 MB\"/></Internal></Domain></CycloneDDS>}"
 
 source /opt/ros/humble/setup.bash
 # Overlay with the unitree_go messages (built in the image) so the bridge can
