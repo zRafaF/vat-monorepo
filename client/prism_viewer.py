@@ -687,7 +687,13 @@ class PRISMViewer:
                                                     color=(1.0, 0.55, 0.2, 0.9), width=1.5)
             self._rgbd_frustum.visible = False
             self._rgbd_cloud = scene.visuals.Markers(parent=view.scene)
-            self._rgbd_cloud.set_gl_state(depth_test=True)
+            # draw ABOVE the VGGT map: no depth-test + high order so obstacles are never
+            # hidden inside/behind the map cloud.
+            self._rgbd_cloud.set_gl_state(depth_test=False, blend=True)
+            try:
+                self._rgbd_cloud.order = 10
+            except Exception:
+                pass
             self._rgbd_cloud.visible = False
             try:
                 self._rgbd_panel = scene.visuals.Image(parent=view.scene, method="auto")
