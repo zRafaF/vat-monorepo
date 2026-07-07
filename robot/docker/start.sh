@@ -71,12 +71,7 @@ else
     NET_IFACE="lo"
 fi
 export NET_IFACE
-# Pinning a single NIC (eth1, the Go2 subnet) DISABLES CycloneDDS loopback, so
-# same-host publishers delivered over 127.0.0.1 (e.g. the RealSense node running on
-# the Jetson host) are NOT received — depth arrives in a startup burst then stops.
-# Add 'lo' so same-host large messages come through reliably. eth1 still carries the
-# Go2 topics. Larger socket buffers help the fragmented depth image (~200KB/frame).
-export CYCLONEDDS_URI="${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><Interfaces><NetworkInterface name=\"${NET_IFACE}\"/><NetworkInterface name=\"lo\" presence_required=\"false\"/></Interfaces></General><Internal><SocketReceiveBufferSize min=\"4 MB\"/></Internal></Domain></CycloneDDS>}"
+export CYCLONEDDS_URI="${CYCLONEDDS_URI:-<CycloneDDS><Domain><General><Interfaces><NetworkInterface name=\"${NET_IFACE}\"/></Interfaces></General></Domain></CycloneDDS>}"
 
 source /opt/ros/humble/setup.bash
 # Overlay with the unitree_go messages (built in the image) so the bridge can
@@ -130,8 +125,17 @@ run_forever bridge python3 /app/dynamic_bridge.py
 run_forever camera python3 /app/theta_camera.py
 run_forever fuser  python3 /app/pose_fuser.py
 run_forever teleop python3 /app/teleop_bridge.py
-# RGBD relay: RealSense depth/color (DDS) -> Zenoh single frames for the client panel.
-run_forever rgbd   python3 /app/rgbd_relay.py
+# RGBD relay: RealSense depth (DDS) -> Zenoh voxel cloud for the client.
+# Only run it IN the container when the RealSense is ALSO in the container
+# (WITH_REALSENSE=1). When the RealSense node runs on the HOST, the container's
+# CycloneDDS (pinned to the Go2 NIC, loopback off) can't reliably receive the large
+# depth image from the host — so run the relay on the host instead ('make rgbd-relay')
+# and set RGBD_RELAY_ENABLE=0 here to avoid a second, stalled relay.
+if [ "${RGBD_RELAY_ENABLE:-1}" != "0" ]; then
+    run_forever rgbd   python3 /app/rgbd_relay.py
+else
+    echo "[start] RGBD_RELAY_ENABLE=0 — in-container RGBD relay disabled (run 'make rgbd-relay' on the host)."
+fi
 # If realsense2_camera is installed IN this image (WITH_REALSENSE=1), launch it too.
 # Otherwise run it on the host: ros2 launch realsense2_camera rs_launch.py (see makefile).
 if ros2 pkg prefix realsense2_camera >/dev/null 2>&1; then

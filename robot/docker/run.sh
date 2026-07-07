@@ -99,6 +99,7 @@ docker run -d --name "${NAME}" --restart unless-stopped \
     -e PERISCOPE_VIEWER_TIMEOUT_S="${PERISCOPE_VIEWER_TIMEOUT_S:-5.0}" \
     -e PERISCOPE_SO_SNDBUF="${PERISCOPE_SO_SNDBUF:-262144}" \
     -e RGBD_ENABLE="${RGBD_ENABLE:-1}" \
+    -e RGBD_RELAY_ENABLE="${RGBD_RELAY_ENABLE:-0}" \
     -e RGBD_DEFAULT_KIND="${RGBD_DEFAULT_KIND:-depth}" \
     -e RGBD_FPS="${RGBD_FPS:-20}" \
     -e RGBD_MAX_RANGE_M="${RGBD_MAX_RANGE_M:-4.0}" \

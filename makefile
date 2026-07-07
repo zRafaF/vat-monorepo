@@ -53,8 +53,8 @@ help:
 	@echo "  make record-frames   [CLIENT] save 360° frames to disk (offline analysis)"
 	@echo "  make periscope-probe [CLIENT] headless periscope stream check (ARGS=\"--decode --save f.png\")"
 	@echo "  make rgbd-probe      [CLIENT] headless D435i panel stream check (ARGS=\"--kind depth --decode\")"
-	@echo "  make rgbd-camera     [ROBOT]  launch realsense2_camera (depth+color) to DDS"
-	@echo "  make rgbd-relay      [ROBOT]  run the RGBD relay on the host (same ROS env as the camera)"
+	@echo "  make rgbd-camera     [ROBOT]  launch RealSense depth node (pinned to the Go2 NIC for the container)"
+	@echo "  make rgbd-relay      [ROBOT]  (fallback) run the RGBD relay on the host instead of the container"
 	@echo ""
 	@echo "Staged pre-POC tests (run in this order — see 'make steps'):"
 	@echo "  make test_link           0  transport alive (router + bridge + rates)"
@@ -255,6 +255,8 @@ rgbd-relay:
 rgbd-camera:
 	@echo ">> launching realsense2_camera (depth+color, no pointcloud) ..."
 	@echo ">> RMW=$${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp} DOMAIN=$${ROS_DOMAIN_ID:-0} (MUST match the robot container so the relay can discover it)"
+	@echo ">> pinning CycloneDDS to $${RGBD_CAM_IFACE:-eth1} (MUST match the container NIC)"
+	CYCLONEDDS_URI="<CycloneDDS><Domain><General><Interfaces><NetworkInterface name='$${RGBD_CAM_IFACE:-eth1}'/></Interfaces></General></Domain></CycloneDDS>" \
 	RMW_IMPLEMENTATION=$${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp} ROS_DOMAIN_ID=$${ROS_DOMAIN_ID:-0} \
 	  ros2 launch realsense2_camera rs_launch.py \
 	    enable_depth:=true enable_color:=false pointcloud.enable:=false \
