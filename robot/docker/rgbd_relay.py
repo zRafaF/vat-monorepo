@@ -75,6 +75,8 @@ class RgbdRelay:
         self._out_seq = 0
         self._pub_count = 0
         self._last_pts = 0
+        self._last_bytes = 0
+        self._last_meanz = 0.0
         self._last_stat_t = 0.0
         self._stop = threading.Event()
 
@@ -166,16 +168,19 @@ class RgbdRelay:
         # distance colour (near=warm) BEFORE downsample
         norm = np.clip(z / (max_mm * 0.001) * 255.0, 0, 255).astype(np.uint8)
         rgb = _turbo(norm)
-        # voxel downsample: keep one point per voxel
+        # voxel downsample: one point per voxel, via a fast 1-D spatial hash
+        # (unique on a 1-D key is ~10x faster than unique(axis=0) on the Jetson).
         if VOXEL_M > 0:
-            keys = np.floor(xyz / VOXEL_M).astype(np.int64)
-            _, idx = np.unique(keys, axis=0, return_index=True)
+            g = np.floor(xyz / VOXEL_M).astype(np.int64)
+            h = (g[:, 0] * 73856093) ^ (g[:, 1] * 19349663) ^ (g[:, 2] * 83492791)
+            _, idx = np.unique(h, return_index=True)
             xyz = xyz[idx]; rgb = rgb[idx]
         # hard cap (random subsample if still too many)
         if MAX_POINTS and xyz.shape[0] > MAX_POINTS:
             sel = np.random.choice(xyz.shape[0], MAX_POINTS, replace=False)
             xyz = xyz[sel]; rgb = rgb[sel]
         min_mm = int(d[valid].min())
+        self._last_meanz = float(z.mean())
         buf = proto.pack_pcd(0, xyz.astype(np.float32), rgb, is_snapshot=True)
         return buf, int(xyz.shape[0]), min_mm
 
@@ -190,7 +195,8 @@ class RgbdRelay:
             period = 1.0 / max(1, fps)
             if now - self._last_stat_t >= 10.0:
                 self._last_stat_t = now
-                log.info(f"[rgbd] published={self._pub_count} pts={self._last_pts} kind={kind} "
+                log.info(f"[rgbd] published={self._pub_count} pts={self._last_pts} "
+                         f"bytes={self._last_bytes} meanz={self._last_meanz:.2f}m kind={kind} "
                          f"fps={fps} active={self._viewer_active(now, last_req)} "
                          f"depth_rx={dn} depth={'y' if depth is not None else 'N'}")
             if kind == proto.RGBD_KIND_OFF or not self._viewer_active(now, last_req) or depth is None:
@@ -207,6 +213,7 @@ class RgbdRelay:
                             self._pub.put(buf)
                         self._pub_count += 1
                         self._last_pts = npts
+                        self._last_bytes = len(buf)
             except Exception:
                 log.exception("[rgbd] make_cloud/publish error"); time.sleep(0.1)
             time.sleep(period)
