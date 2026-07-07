@@ -256,7 +256,9 @@ rgbd-camera:
 	@echo ">> launching realsense2_camera (depth+color, no pointcloud) ..."
 	@echo ">> RMW=$${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp} DOMAIN=$${ROS_DOMAIN_ID:-0} (MUST match the robot container so the relay can discover it)"
 	RMW_IMPLEMENTATION=$${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp} ROS_DOMAIN_ID=$${ROS_DOMAIN_ID:-0} \
-	  ros2 launch realsense2_camera rs_launch.py enable_color:=true enable_depth:=true pointcloud.enable:=false
+	  ros2 launch realsense2_camera rs_launch.py \
+	    enable_depth:=true enable_color:=false pointcloud.enable:=false \
+	    depth_module.profile:=$${RGBD_CAM_PROFILE:-424x240x15}
 
 # ── Docs ─────────────────────────────────────────────────────────────────────
 docs: sync-docs

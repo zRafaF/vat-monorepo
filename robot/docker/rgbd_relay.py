@@ -240,6 +240,8 @@ def main():
         import rclpy
         from rclpy.node import Node
         from rclpy.qos import qos_profile_sensor_data
+        from rclpy.executors import MultiThreadedExecutor
+        from rclpy.callback_groups import ReentrantCallbackGroup
         from sensor_msgs.msg import Image, CameraInfo
     except Exception as e:
         log.error(f"[rgbd] rclpy/sensor_msgs unavailable ({e}); is this the ROS2 container? Exiting.")
@@ -250,10 +252,13 @@ def main():
             super().__init__("vat_rgbd_relay")
             self._K = None
             self._seen = set()
+            self._cbg = ReentrantCallbackGroup()
             for t in DEPTH_TOPICS:
-                self.create_subscription(Image, t, self._mk_depth_cb(t), qos_profile_sensor_data)
+                self.create_subscription(Image, t, self._mk_depth_cb(t),
+                                         qos_profile_sensor_data, callback_group=self._cbg)
             for t in DEPTH_INFOS:
-                self.create_subscription(CameraInfo, t, self._info_cb, qos_profile_sensor_data)
+                self.create_subscription(CameraInfo, t, self._info_cb,
+                                         qos_profile_sensor_data, callback_group=self._cbg)
             self.get_logger().info(f"vat_rgbd_relay(cloud) subscribed: depth={DEPTH_TOPICS}")
 
         def _info_cb(self, m):
@@ -273,10 +278,12 @@ def main():
 
     rclpy.init()
     node = Sub()
+    ex = MultiThreadedExecutor(num_threads=3)
+    ex.add_node(node)
     pub_thread = threading.Thread(target=relay.run, name="rgbd-pub", daemon=True)
     pub_thread.start()
     try:
-        rclpy.spin(node)
+        ex.spin()
     except KeyboardInterrupt:
         pass
     finally:
