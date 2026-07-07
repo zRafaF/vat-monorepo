@@ -116,7 +116,8 @@ RGBD_MAX_RANGE_M  = float(os.environ.get("RGBD_MAX_RANGE_M", "4.0"))
 RGBD_FLIP_X       = float(os.environ.get("RGBD_FLIP_X", "1"))
 RGBD_FLIP_Y       = float(os.environ.get("RGBD_FLIP_Y", "1"))
 RGBD_POINT_SIZE   = float(os.environ.get("RGBD_POINT_SIZE", "4"))   # voxel point px
-RGBD_STRIDE       = int(os.environ.get("RGBD_STRIDE", "2"))         # depth pixel decimation
+RGBD_STRIDE       = int(os.environ.get("RGBD_STRIDE", "3"))         # depth pixel decimation (coarser=fewer voxels)
+RGBD_RENDER_HZ    = float(os.environ.get("RGBD_RENDER_HZ", "12"))   # cap voxel rebuild rate (protect render loop)
 STALE_S       = float(os.environ.get("POSE_STALE_S", "0.5"))
 DECAY_S       = float(os.environ.get("POSE_DECAY_S", "1.0"))
 SMOOTH_TAU    = float(os.environ.get("POSE_SMOOTH_TAU", "0.08"))
@@ -473,6 +474,7 @@ class PRISMViewer:
         log.info(f"[Viewer] Connecting to Zenoh at {ZENOH_ROUTER}...")
         self._z = self._open(self._conf())
         self._z_fast = self._open(self._conf())          # isolate low-latency pose/legs
+        self._z_rgbd = self._open(self._conf())          # isolate RGBD frames from the pose lane
         log.info("[Viewer] Connected (2 sessions: bulk + low-latency).")
 
         # bulk session cloud transport, chosen by STREAM_MODE (must match the server):
@@ -529,7 +531,7 @@ class PRISMViewer:
                 from vat_client.rgbd_view import RgbdClient
                 _kmap = {"off": 0, "depth": 1, "color": 2}
                 self._rgbd = RgbdClient(
-                    self._z_fast, ROBOT_NAME,
+                    self._z_rgbd, ROBOT_NAME,
                     kind=_kmap.get(RGBD_DEFAULT_KIND, 1),
                     fps=RGBD_FPS, max_range_m=RGBD_MAX_RANGE_M)
             except Exception as _e:
@@ -859,6 +861,10 @@ class PRISMViewer:
                 pass
             try:
                 self._z.close(); self._z_fast.close()
+                try:
+                    self._z_rgbd.close()
+                except Exception:
+                    pass
             except Exception:
                 pass
             log.info("[Viewer] Shut down.")
@@ -1186,19 +1192,29 @@ class PRISMViewer:
         segs = np.array([a,c1, a,c2, a,c3, a,c4, c1,c2, c2,c3, c3,c4, c4,c1], dtype=np.float32)
         self._rgbd_frustum.set_data(pos=segs)
         self._rgbd_frustum.visible = True
+        # THROTTLE the expensive work (deproject + GPU upload) to RGBD_RENDER_HZ and only
+        # when a genuinely NEW frame arrived, so it can never starve the render loop /
+        # pose predictor (that was the 1.3 s pose-latency + render stalls). The cheap
+        # frustum above still updates every tick.
         depth8, dm = r.latest_depth()
+        nowm = time.monotonic()
+        fid = r.frame_id()
+        due = (fid != getattr(self, "_rgbd_last_fid", -1)
+               and (nowm - getattr(self, "_rgbd_last_draw", 0.0)) >= 1.0 / max(1.0, RGBD_RENDER_HZ))
         if depth8 is not None and self._rgbd_cloud is not None:
-            # DEPTH -> 3D voxels deprojected into the WORLD (single frame, no accumulation)
-            pts, cols = self._rgbd_deproject(depth8, img, m, cam_pos, right, up, fwd)
-            if pts is not None and len(pts):
-                self._rgbd_cloud.set_data(pts, face_color=cols, edge_width=0, size=RGBD_POINT_SIZE)
-                self._rgbd_cloud.visible = True
-            else:
-                self._rgbd_cloud.visible = False
+            if due:
+                self._rgbd_last_fid = fid; self._rgbd_last_draw = nowm
+                pts, cols = self._rgbd_deproject(depth8, img, m, cam_pos, right, up, fwd)
+                if pts is not None and len(pts):
+                    self._rgbd_cloud.set_data(pts, face_color=cols, edge_width=0, size=RGBD_POINT_SIZE)
+                    self._rgbd_cloud.visible = True
+                else:
+                    self._rgbd_cloud.visible = False
             if self._rgbd_panel is not None:
                 self._rgbd_panel.visible = False
         elif self._rgbd_panel is not None:
-            # COLOR -> flat "what is it" panel filling the frustum at RGBD_PANEL_M
+            # COLOR -> flat "what is it" panel filling the frustum at RGBD_PANEL_M.
+            # Transform follows the pose every tick; the texture re-uploads only on a new frame.
             if self._rgbd_cloud is not None:
                 self._rgbd_cloud.visible = False
             d = RGBD_PANEL_M
@@ -1211,7 +1227,9 @@ class PRISMViewer:
             origin = Cc - right*(Wm/2.0)*sx + up*(Hm/2.0)*sy   # image (0,0) = top-left
             M = np.eye(4, dtype=np.float32)
             M[0, :3] = Xax; M[1, :3] = Yax; M[2, :3] = fwd; M[3, :3] = origin
-            self._rgbd_panel.set_data(np.ascontiguousarray(img))
+            if due:
+                self._rgbd_last_fid = fid; self._rgbd_last_draw = nowm
+                self._rgbd_panel.set_data(np.ascontiguousarray(img))
             self._rgbd_panel.transform = scene.transforms.MatrixTransform(M)
             self._rgbd_panel.visible = True
 
@@ -1416,6 +1434,11 @@ class PRISMViewer:
             f"  cubes +chg/-rm     +{int(s.get('cubes_changed',0))}/-{int(s.get('cubes_removed',0))}",
             f"  map points         {int(s.get('n_points',0))}",
             f"  render             {self._render_fps:4.0f} fps  stalls {self._render_stalls}",
+            "",
+            "RGBD (D435i)",
+            ("  " + (f"rx={self._rgbd._n_recv} dec={self._rgbd._n_dec} "
+                     f"fps={self._rgbd.fps():.1f} stale={self._rgbd.stale()} kind={self._rgbd.kind}")
+             if self._rgbd is not None else "  off"),
         ]
         for i, t in enumerate(self._mlines):
             t.text = lines[i] if i < len(lines) else ""

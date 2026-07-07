@@ -190,6 +190,10 @@ class RgbdClient:
                 return None, None
             return self._depth8, dict(self._meta)
 
+    def frame_id(self) -> int:
+        """Monotonic count of decoded frames (viewer uses it to redraw only on new data)."""
+        return self._n_dec
+
     def fps(self) -> float:
         if not self._recv_t or (time.monotonic() - self._recv_t[-1]) > 1.0:
             return 0.0

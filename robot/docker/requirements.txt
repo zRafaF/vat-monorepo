@@ -2,5 +2,10 @@ eclipse-zenoh==1.9.0
 numpy>=1.24
 opencv-python-headless>=4.9
 rosbags>=0.10
+# PyAV: periscope H.264/H.265 encode. The wheel bundles ffmpeg with software libx264/
+# libx265 (aarch64 wheels exist for cp310), so H.264 works with no system ffmpeg. NVENC
+# (hardware) is NOT in the bundled ffmpeg, so make_encoder falls back h264_nvenc→libx264
+# (CPU). Without this, periscope silently falls back to per-frame MJPEG (much heavier).
+av>=11.0
 # step — only a pre-release wheel (4.3a0) exists for aarch64/cp310, and pinning it here
 # would hard-fail the whole build. Kept out of this file so the container always builds;
