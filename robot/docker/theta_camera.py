@@ -185,9 +185,10 @@ def open_capture() -> cv2.VideoCapture:
 class ThetaCapture(threading.Thread):
     """Reads frames from the Theta and pushes them into the decimator."""
 
-    def __init__(self, decimator: "FrameDecimator", periscope=None):
+    def __init__(self, decimator: "FrameDecimator", periscope=None, vo_runner=None):
         super().__init__(daemon=True)
         self._decimator = decimator
+        self._vo_runner = vo_runner        # optional visual-odometry (VO_ENABLE)
         # Optional remote-periscope service: fed the SAME live full-res frame (no
         # second capture, no fps-capped archive). submit_frame is non-blocking.
         self._periscope = periscope
@@ -249,6 +250,8 @@ class ThetaCapture(threading.Thread):
                     self._decimator.push(ts_ns, frame)
                     if self._periscope is not None:
                         self._periscope.submit_frame(frame, ts_ns)
+                    if self._vo_runner is not None:
+                        self._vo_runner.on_frame(frame, ts_ns)
             except Exception as e:
                 log.warning(f"[Capture] error: {e}")
             finally:
@@ -563,7 +566,19 @@ def main():
         log.warning(f"[periscope] disabled (init failed): {e}")
         periscope = None
 
-    capture = ThetaCapture(decimator, periscope=periscope)
+    # Visual odometry (optional, VO_ENABLE): front-pinhole flow -> body motion
+    # direction for the fuser (strafe/rotation foolproofing). Guarded; never blocks.
+    vo_runner = None
+    try:
+        from visual_odometry import VoRunner
+        vo_runner = VoRunner(z, ROBOT_NAME, lambda: leg_tracker.get_imu_odom()[1][2])
+        if not vo_runner.enabled:
+            vo_runner = None
+    except Exception as e:
+        log.warning(f"[vo] disabled (init failed): {e}")
+        vo_runner = None
+
+    capture = ThetaCapture(decimator, periscope=periscope, vo_runner=vo_runner)
     capture.start()
 
     z.declare_subscriber(KEY_THROTTLE_FPS, _on_throttle_fps)

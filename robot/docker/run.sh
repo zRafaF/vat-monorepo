@@ -84,6 +84,16 @@ docker run -d --name "${NAME}" --restart unless-stopped \
     -e STICK_OFFSET_Z="${STICK_OFFSET_Z:-0.55}" \
     -e FALLBACK_BODY_HEIGHT="${FALLBACK_BODY_HEIGHT:-0.30}" \
     -e VERTICAL_FROM_LEGS="${VERTICAL_FROM_LEGS:-1}" \
+    -e VERTICAL_Z_OFFSET="${VERTICAL_Z_OFFSET:-0.0}" \
+    -e STRAFE_FROM_SPORT="${STRAFE_FROM_SPORT:-1}" \
+    -e VO_ENABLE="${VO_ENABLE:-0}" \
+    -e VO_FPS="${VO_FPS:-12}" \
+    -e VO_HFOV="${VO_HFOV:-90}" \
+    -e VO_MIN_CONF="${VO_MIN_CONF:-0.3}" \
+    -e VO_YAW_FLOW_SIGN="${VO_YAW_FLOW_SIGN:-1}" \
+    -e VO_LAT_SIGN="${VO_LAT_SIGN:-1}" \
+    -e VO_FUSE="${VO_FUSE:-1}" \
+    -e VO_MAX_AGE_S="${VO_MAX_AGE_S:-0.5}" \
     -e ESKF_ZUPT="${ESKF_ZUPT:-0}" \
     -e ESKF_ZUPT_SIGMA="${ESKF_ZUPT_SIGMA:-0.01}" \
     -e ESKF_ZUPT_HOLD_S="${ESKF_ZUPT_HOLD_S:-0.3}" \

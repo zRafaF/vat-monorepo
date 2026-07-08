@@ -43,7 +43,7 @@ import zenoh
 import vat_protocol as proto
 from vat_protocol import PoseState, FIX_CORRECTED, FIX_DEADRECKON
 from kinematics import (build_robot_model, LowStateTracker, RobotStateTracker,
-                        Transform, base_height_above_ground)
+                        Transform, base_height_above_ground, WHEEL_RADIUS)
 # The estimator backend is chosen by POSE_BACKEND via the make_estimator factory:
 #   * gtsam -> IMU-preintegration fixed-lag smoother that FUSES the accelerometer +
 #     gyro + wheel-odometry velocity + the delayed VGGT correction (the default);
@@ -75,6 +75,19 @@ FIX_HOLD_S    = float(os.environ.get("FIX_HOLD_S",          "1.0"))
 # stand<->prone + body tilt) instead of the flat SportModeState.body_height (often a
 # fallback constant). Fixes the "prone robot flies" artifact + gives a true height.
 VERTICAL_FROM_LEGS = os.environ.get("VERTICAL_FROM_LEGS", "1").strip().lower() in ("1","true","yes","on")
+# Fine-tune the published base Z (m, +up) if wheels still float/sink after the leg-FK fix.
+VERTICAL_Z_OFFSET = float(os.environ.get("VERTICAL_Z_OFFSET", "0.0"))
+# Strafe: take lateral body velocity from the Go2 onboard estimate (SportModeState
+# velocity) when available. Wheels give only forward speed, so without this a
+# rotate+strafe reads as pure rotation and the avatar swings. Degrades to the
+# non-holonomic prior (vy=0) when the velocity field is zeroed (lf/ topic).
+STRAFE_FROM_SPORT = os.environ.get("STRAFE_FROM_SPORT", "1").strip().lower() in ("1","true","yes","on")
+# Visual odometry (optional): use the VO body-motion DIRECTION to recover strafe from
+# the wheel forward speed (body_vy = body_vx * dir_y/dir_x). Inert until VO frames
+# arrive (VO_ENABLE=1 in the camera process), so it is safe to leave on.
+VO_FUSE = os.environ.get("VO_FUSE", "1").strip().lower() in ("1","true","yes","on")
+VO_MIN_CONF = float(os.environ.get("VO_MIN_CONF", "0.3"))
+VO_MAX_AGE_S = float(os.environ.get("VO_MAX_AGE_S", "0.5"))
 
 _KEYS = proto.keys(ROBOT_NAME)
 
@@ -123,7 +136,11 @@ class PoseFuser:
         except Exception:
             self._live = None
 
+        self._vo = None            # latest VoDelta (visual-odometry direction)
+        self._vo_ts = 0
         z.declare_subscriber(_KEYS["pose_correction"], self._on_correction)
+        if VO_FUSE:
+            z.declare_subscriber(_KEYS["vo"], self._on_vo)
         log.info(f"[Fuser] odom←'{ROBOT_NAME}/rt/lowstate' (IMU+wheels)  "
                  f"correction←'{_KEYS['pose_correction']}'  "
                  f"pose→'{_KEYS['pose']}'  @ {PUBLISH_HZ}Hz")
@@ -160,6 +177,15 @@ class PoseFuser:
                   f"{(now - c.timestamp_ns) * 1e-9:.2f}s → base "
                   f"{np.round(base_world.translation, 3)}")
 
+    def _on_vo(self, sample):
+        try:
+            v = proto.unpack_vo(bytes(sample.payload))
+        except proto.ProtocolError:
+            return
+        with self._lock:
+            self._vo = v
+            self._vo_ts = time.time_ns()
+
     def _publish_once(self):
         now = time.time_ns()
         # Richer odometry for the fusion backend: IMU attitude + gyro + ACCELEROMETER
@@ -168,11 +194,23 @@ class PoseFuser:
         imu_quat, gyro, accel, body_vx, body_wz, n_contact, valid = self._low.get_imu_odom()
         body = self._body.get()
         legs, legs_valid = self._low.get()          # leg-FK points for the vertical channel
+        body_vy = 0.0
+        if STRAFE_FROM_SPORT and body.valid:
+            _vy = float(body.linear_velocity[1])
+            if np.isfinite(_vy) and abs(_vy) < 2.0:
+                body_vy = _vy
+        # VO strafe: if a recent, confident VO direction exists, recover the lateral
+        # component from the wheel forward speed via the direction ratio (dir_y/dir_x).
+        # Independent of leg slip, so it captures the strafe during rotate+forward.
+        if VO_FUSE and self._vo is not None and self._vo.confidence >= VO_MIN_CONF \
+                and (now - self._vo_ts) < VO_MAX_AGE_S * 1e9 and abs(self._vo.dir_x) > 0.25:
+            _ratio = float(np.clip(self._vo.dir_y / self._vo.dir_x, -2.0, 2.0))
+            body_vy = float(body_vx) * _ratio
         world_acc = np.zeros(3, dtype=np.float64)
         with self._lock:
             dt = (now - self._last_pub_ns) * 1e-9
             self._last_pub_ns = now
-            self._est.predict(imu_quat, gyro, body_vx, valid, dt,
+            self._est.predict(imu_quat, gyro, body_vx, valid, dt, body_vy=body_vy,
                               now_ns=now, accel=accel, body_wz=body_wz)
             self._seq += 1
             st = self._est.state()
@@ -186,8 +224,16 @@ class PoseFuser:
             base_h = None
             if VERTICAL_FROM_LEGS and legs_valid and legs:
                 base_h = base_height_above_ground(legs, imu_quat)
-            pos[2] = base_h if (base_h is not None) else body.body_height
-            self._z_src = 'legs' if (base_h is not None) else 'body'
+            if base_h is not None:
+                # base_height_above_ground() is base-above-CONTACT (already +wheel radius).
+                # The client lifts the avatar by GROUND_CLEARANCE (=wheel radius) so the
+                # wheels rest on Z=0 — publish the hub-plane height (subtract the radius)
+                # so we don't double-count and the wheels touch instead of flying.
+                pos[2] = base_h - WHEEL_RADIUS + VERTICAL_Z_OFFSET
+                self._z_src = 'legs'
+            else:
+                pos[2] = body.body_height
+                self._z_src = 'body'
             corrected = (now - self._est.last_correction_ns) < FIX_HOLD_S * 1e9
             fix = FIX_CORRECTED if (self._est.have_vggt and corrected) else FIX_DEADRECKON
 

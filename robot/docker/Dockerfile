@@ -96,6 +96,7 @@ COPY robot/docker/dynamic_bridge.py   /app/
 COPY robot/docker/theta_camera.py     /app/
 COPY robot/docker/frame_archive.py    /app/
 COPY robot/docker/pose_fuser.py       /app/
+COPY robot/docker/visual_odometry.py  /app/
 COPY robot/docker/kinematics.py       /app/
 COPY robot/docker/estimator.py        /app/
 COPY robot/docker/pose_graph.py       /app/

@@ -66,6 +66,7 @@ MAGIC_VREQ  = 0x56524551  # "VREQ" — periscope view request (client → robot)
 MAGIC_PSCF  = 0x50534346  # "PSCF" — periscope encoded frame (robot → client)
 MAGIC_RGBR  = 0x52474252  # "RGBR" — RGBD request/config (client → robot)
 MAGIC_RGBF  = 0x52474246  # "RGBF" — RGBD single frame (robot → client)
+MAGIC_VODO  = 0x564F444F  # "VODO" — visual-odometry delta (camera proc → fuser)
 
 # cmd_vel flag bits (bitmask in the CmdVel.flags byte)
 CMDV_FLAG_ESTOP = 0x01   # latched emergency stop — robot enters Damp, ignores motion
@@ -138,6 +139,10 @@ def keys(robot_name: str = "go2", server_prefix: str = "server/prism") -> dict:
         # front of the robot on a D435i frustum — never merged into the map cloud.
         "rgbd_request":       f"{robot_name}/prism/rgbd/request",
         "rgbd_frame":         f"{robot_name}/prism/rgbd/frame",
+        # visual odometry: camera process -> fuser (same robot, over the local bus).
+        # Body-frame horizontal MOTION DIRECTION (de-rotated) + a yaw-rate cross-check;
+        # the fuser scales the direction by the wheel speed to recover strafe.
+        "vo":                 f"{robot_name}/prism/vo",
         # liveliness tokens
         "live_server":     f"{server_prefix}/liveliness",
         "live_pose":       f"{robot_name}/prism/pose/liveliness",
@@ -734,6 +739,39 @@ def unpack_rgbd_frame(buf: bytes) -> "RgbdFrame":
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Visual-odometry delta   {robot}/prism/vo   (camera process → fuser)
+# ═════════════════════════════════════════════════════════════════════════════
+#   magic i | ts_ns q | dir_x f | dir_y f | yaw_rate f | conf f
+#   dir_x/dir_y: unit body-frame horizontal motion direction (x fwd, y left),
+#   de-rotated with the gyro. conf in [0,1]; 0 = unusable (fuser ignores).
+_VODO_FMT = "!iqffff"
+_VODO_SIZE = struct.calcsize(_VODO_FMT)
+
+
+@dataclass
+class VoDelta:
+    timestamp_ns: int = 0
+    dir_x: float = 1.0
+    dir_y: float = 0.0
+    yaw_rate: float = 0.0
+    confidence: float = 0.0
+
+
+def pack_vo(v: "VoDelta") -> bytes:
+    return struct.pack(_VODO_FMT, MAGIC_VODO, int(v.timestamp_ns), float(v.dir_x),
+                       float(v.dir_y), float(v.yaw_rate), float(v.confidence))
+
+
+def unpack_vo(buf: bytes) -> "VoDelta":
+    if len(buf) < _VODO_SIZE:
+        raise ProtocolError("vo buffer too short")
+    v = struct.unpack_from(_VODO_FMT, buf, 0)
+    if v[0] != MAGIC_VODO:
+        raise ProtocolError(f"bad vo magic 0x{v[0] & 0xFFFFFFFF:08X}")
+    return VoDelta(timestamp_ns=v[1], dir_x=v[2], dir_y=v[3], yaw_rate=v[4], confidence=v[5])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Quaternion helpers   (Hamilton, xyzw order) — used by fuser and predictor
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -833,6 +871,7 @@ ENC_VREQ  = "application/vat.view_request"
 ENC_PSCF  = "application/vat.periscope_frame"
 ENC_RGBR  = "application/vat.rgbd_request"
 ENC_RGBF  = "application/vat.rgbd_frame"
+ENC_VODO  = "application/vat.vo"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
