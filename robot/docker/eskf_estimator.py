@@ -111,6 +111,13 @@ class ESKFEstimator:
         self._zupt_vx = float(os.environ.get("ESKF_ZUPT_VX", "0.03"))       # m/s
         self._zupt_gyro = float(os.environ.get("ESKF_ZUPT_GYRO", "0.05"))   # rad/s
         self._bias_beta = float(os.environ.get("ESKF_BIAS_BETA", "0.01"))   # bias EMA rate
+        # explicit ZUPT (default OFF): after SUSTAINED stillness, hard-pin velocity to
+        # 0. Off by default because rest already behaves and a naive per-sample clamp
+        # would kill the wheel-dropout continuity; the sustained gate makes it safe.
+        self._zupt_enable = os.environ.get("ESKF_ZUPT", "0").strip().lower() in ("1","true","yes","on")
+        self._zupt_sigma = float(os.environ.get("ESKF_ZUPT_SIGMA", "0.01"))  # m/s (tight)
+        self._zupt_hold_s = float(os.environ.get("ESKF_ZUPT_HOLD_S", "0.3")) # sustained stillness
+        self._still_s = 0.0
 
         self.have_vggt = False
         self.last_correction_ns = 0
@@ -151,6 +158,9 @@ class ESKFEstimator:
                       and float(np.linalg.norm(gyro)) < self._zupt_gyro)
         if stationary:
             self._a_bias = self._a_bias + self._bias_beta * a_world
+            self._still_s += dt
+        else:
+            self._still_s = 0.0
 
         self._last_t_ns = int(now_ns) if now_ns is not None \
             else self._last_t_ns + int(dt * 1e9)
@@ -184,6 +194,20 @@ class ESKFEstimator:
             self._v = self._v + dx[3:6]
             self._P = (np.eye(6) - K @ H) @ self._P
             self._P = 0.5 * (self._P + self._P.T)  # keep symmetric
+
+        # --- ZUPT: hard zero-velocity update after SUSTAINED stillness ---
+        if self._zupt_enable and stationary and self._still_s >= self._zupt_hold_s:
+            Hz = np.zeros((3, 6)); Hz[:, 3:6] = np.eye(3)
+            Sz = Hz @ self._P @ Hz.T + np.diag([self._zupt_sigma ** 2] * 3)
+            try:
+                Kz = self._P @ Hz.T @ np.linalg.inv(Sz)
+                dxz = Kz @ (-self._v)
+                self._p = self._p + dxz[0:3]
+                self._v = self._v + dxz[3:6]
+                self._P = (np.eye(6) - Kz @ Hz) @ self._P
+                self._P = 0.5 * (self._P + self._P.T)
+            except np.linalg.LinAlgError:
+                pass
 
         # --- record history on the robot clock (for delayed VGGT matching) ---
         self._history.append((self._last_t_ns, self._p.copy(), self._q.copy()))

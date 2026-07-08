@@ -83,6 +83,10 @@ docker run -d --name "${NAME}" --restart unless-stopped \
     -e STICK_OFFSET_Y="${STICK_OFFSET_Y:-0.0}" \
     -e STICK_OFFSET_Z="${STICK_OFFSET_Z:-0.55}" \
     -e FALLBACK_BODY_HEIGHT="${FALLBACK_BODY_HEIGHT:-0.30}" \
+    -e VERTICAL_FROM_LEGS="${VERTICAL_FROM_LEGS:-1}" \
+    -e ESKF_ZUPT="${ESKF_ZUPT:-0}" \
+    -e ESKF_ZUPT_SIGMA="${ESKF_ZUPT_SIGMA:-0.01}" \
+    -e ESKF_ZUPT_HOLD_S="${ESKF_ZUPT_HOLD_S:-0.3}" \
     -e PERISCOPE_ENABLE="${PERISCOPE_ENABLE:-1}" \
     -e PERISCOPE_CODEC="${PERISCOPE_CODEC:-mjpeg}" \
     -e PERISCOPE_RES="${PERISCOPE_RES:-480}" \

@@ -42,7 +42,8 @@ import zenoh
 
 import vat_protocol as proto
 from vat_protocol import PoseState, FIX_CORRECTED, FIX_DEADRECKON
-from kinematics import build_robot_model, LowStateTracker, RobotStateTracker, Transform
+from kinematics import (build_robot_model, LowStateTracker, RobotStateTracker,
+                        Transform, base_height_above_ground)
 # The estimator backend is chosen by POSE_BACKEND via the make_estimator factory:
 #   * gtsam -> IMU-preintegration fixed-lag smoother that FUSES the accelerometer +
 #     gyro + wheel-odometry velocity + the delayed VGGT correction (the default);
@@ -70,6 +71,10 @@ ATT_GAIN      = float(os.environ.get("ATTITUDE_GAIN",       "0.08"))
 POS_GAIN      = float(os.environ.get("CORRECTION_POS_GAIN", "1.0"))
 ROT_GAIN      = float(os.environ.get("CORRECTION_ROT_GAIN", "1.0"))
 FIX_HOLD_S    = float(os.environ.get("FIX_HOLD_S",          "1.0"))
+# Vertical channel: derive base height above the floor from LEG-FK stance (tracks
+# stand<->prone + body tilt) instead of the flat SportModeState.body_height (often a
+# fallback constant). Fixes the "prone robot flies" artifact + gives a true height.
+VERTICAL_FROM_LEGS = os.environ.get("VERTICAL_FROM_LEGS", "1").strip().lower() in ("1","true","yes","on")
 
 _KEYS = proto.keys(ROBOT_NAME)
 
@@ -162,6 +167,7 @@ class PoseFuser:
         # yaw rate. The NumPy backends ignore accel/body_wz, so this is safe for all.
         imu_quat, gyro, accel, body_vx, body_wz, n_contact, valid = self._low.get_imu_odom()
         body = self._body.get()
+        legs, legs_valid = self._low.get()          # leg-FK points for the vertical channel
         world_acc = np.zeros(3, dtype=np.float64)
         with self._lock:
             dt = (now - self._last_pub_ns) * 1e-9
@@ -175,9 +181,13 @@ class PoseFuser:
             pos, quat, world_vel = st[0], st[1], st[2]
             if len(st) >= 4:
                 world_acc = np.asarray(st[3], dtype=np.float64)
-            # Vertical comes from body height (map floor = Z 0), so the avatar
-            # rises/lowers with the dog's stance instead of staying pinned.
-            pos[2] = body.body_height
+            # Vertical (map floor = Z 0). Prefer leg-FK stance height (drops when the
+            # dog goes prone, accounts for tilt) over the flat SportModeState value.
+            base_h = None
+            if VERTICAL_FROM_LEGS and legs_valid and legs:
+                base_h = base_height_above_ground(legs, imu_quat)
+            pos[2] = base_h if (base_h is not None) else body.body_height
+            self._z_src = 'legs' if (base_h is not None) else 'body'
             corrected = (now - self._est.last_correction_ns) < FIX_HOLD_S * 1e9
             fix = FIX_CORRECTED if (self._est.have_vggt and corrected) else FIX_DEADRECKON
 
@@ -222,7 +232,7 @@ class PoseFuser:
                          f"vggt={self._est.have_vggt} corrections={self._corrections} "
                          f"corr_lag={self._last_corr_lag_s:.2f}s stale_dropped={stale} "
                          f"body_vx={body_vx:+.2f}m/s |vel|={float(np.linalg.norm(vel)):.2f}m/s "
-                         f"pos={np.round(pos, 2)}")
+                         f"z={pos[2]:+.2f}({getattr(self,'_z_src','?')}) pos={np.round(pos, 2)}")
                 last_log = time.time()
             time.sleep(max(0.0, period - (time.time() - t0)))
 
