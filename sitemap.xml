@@ -1,55 +1,75 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/architecture/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/architecture/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/bringup/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/bringup/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/streaming_poc/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/periscope/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/archive/insta360/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/reconstruction_engine/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/blog/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/roadmap/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/setup/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/robot_data_sources/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/setup/client/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/archive/insta360/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/setup/robot/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/archive/streaming_poc/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/setup/server/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/blog/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/setup/development/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/reference/wire_protocol/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/setup/development/documentation/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/setup/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
     <url>
-         <loc>https://github.com/ZrafaF/vat-monorepo/setup/development/vpn/</loc>
-         <lastmod>2026-06-26</lastmod>
+         <loc>https://zrafaf.github.io/vat-monorepo/setup/client/</loc>
+         <lastmod>2026-07-20</lastmod>
+    </url>
+    <url>
+         <loc>https://zrafaf.github.io/vat-monorepo/setup/robot/</loc>
+         <lastmod>2026-07-20</lastmod>
+    </url>
+    <url>
+         <loc>https://zrafaf.github.io/vat-monorepo/setup/server/</loc>
+         <lastmod>2026-07-20</lastmod>
+    </url>
+    <url>
+         <loc>https://zrafaf.github.io/vat-monorepo/setup/development/</loc>
+         <lastmod>2026-07-20</lastmod>
+    </url>
+    <url>
+         <loc>https://zrafaf.github.io/vat-monorepo/setup/development/documentation/</loc>
+         <lastmod>2026-07-20</lastmod>
+    </url>
+    <url>
+         <loc>https://zrafaf.github.io/vat-monorepo/setup/development/vpn/</loc>
+         <lastmod>2026-07-20</lastmod>
     </url>
 </urlset>
