@@ -10,7 +10,7 @@ There are three machines:
 |---|---|---|
 | 🤖 **ROBOT** | Jetson on the Go2-W | camera stack (host ROS Foxy) + Docker (bridge, decimator, pose fuser) |
 | ☁️ **SERVER** | GPU box | Zenoh router + mapping server (PRISM-VGGT) |
-| 💻 **CLIENT** | your laptop | diagnostic tools + Rerun viewer |
+| 💻 **CLIENT** | your laptop | diagnostic tools + VisPy 3D viewer |
 
 ### The Makefile is the control file
 
@@ -135,7 +135,7 @@ Nothing else changes on the robot.
 make test_robot_state
 ```
 
-✅ Expect a live Rerun view: the body frame tilts with the real robot; the
+✅ Expect a live 3D view: the body frame tilts with the real robot; the
 **four legs draw as lines** (hip→knee→foot) with FR/FL/RR/RL foot markers;
 the **selfie-stick** shows as a line on the back with the camera at its tip;
 the **live 360° image** renders in the `camera/equirect` panel; and
@@ -151,11 +151,11 @@ unitree_go overlay + DDS interface (see [robot setup §3](setup/robot.md)).
 ## Stage 2.5 — Dead-reckoned motion (no cloud yet)
 
 Still only the robot container — **no mapping server required.** The on-robot
-fuser (`pose_fuser.py`) runs a placeholder estimator: it takes the body attitude
-from the IMU (complementary-filtered with the gyro) and **integrates the leg/
-wheel-odometry velocity** to produce a dead-reckoned global pose, published at
-`PUBLISH_HZ` (50 Hz default) on `go2/prism/pose`. The same `make test_robot_state`
-view now places the avatar at that pose and draws a **trail**.
+fuser (`pose_fuser.py`) runs an **Error-State Kalman Filter** (`POSE_BACKEND=eskf`):
+attitude comes from the IMU, translation from **wheel odometry**, and vertical
+height from **leg forward-kinematics** — producing a dead-reckoned global pose
+published at `PUBLISH_HZ` (30 Hz default) on `go2/prism/pose`. The same
+`make test_robot_state` view now places the avatar at that pose and draws a **trail**.
 
 ```bash
 make test_robot_state      # then drive with `make teleop` in another shell
@@ -169,10 +169,10 @@ it. Returning to the start should bring the avatar *roughly* back; the gap is th
 accumulated drift. When Stage 3's mapping server is added, corrections turn the
 avatar **green** and pull the drift out.
 
-> This is intentionally a placeholder, not an EKF. The data path and message
-> contract (`go2/prism/pose`, full pose+velocity payload) are what matter; a real
-> filter drops in behind the same Zenoh key. See `docs/architecture.md` →
-> *Estimator choice*.
+> The estimator is a pure-NumPy ESKF running as a Zenoh client inside the robot
+> container (an earlier GTSAM backend was removed — it never loaded on the Jetson).
+> A different filter could drop in behind the same `go2/prism/pose` key without
+> touching the rest of the system. See [Architecture → Estimator: the ESKF](architecture.md#estimator-the-eskf).
 
 ---
 

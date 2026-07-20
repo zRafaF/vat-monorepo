@@ -1,10 +1,11 @@
 site_name: VAT Documentation
-site_url: https://github.com/ZrafaF/vat-monorepo
+site_url: https://zrafaf.github.io/vat-monorepo/
 site_author: Rafael Farias Meneses
 site_description: >-
-  Documentation for the Volumetric Asynchronous Teleoperation (VAT) project, which includes 
-  a robot, server, and client components. This documentation provides setup instructions, 
-  usage guidelines, and development information for the VAT project.
+  Documentation for the Volumetric Asynchronous Teleoperation (VAT) project: a
+  Unitree Go2-W robot streaming live 360° point clouds and pose over Zenoh to a
+  PRISM-VGGT mapping server and a remote 3D client. Covers the system design, the
+  reconstruction engine, and step-by-step setup and reproduction instructions.
 
 # Repository
 repo_name: zrafaf/vat-monorepo
@@ -91,19 +92,24 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Architecture: architecture.md
-  - Remote Periscope: periscope.md
-  - PRISM Streaming POC: streaming_poc.md
-  - Bring-up Runbook: bringup.md
-  - Robot Data Sources: robot_data_sources.md
-  - Setup:
+  - Understand:
+      - Architecture: architecture.md
+      - Reconstruction Engine: reconstruction_engine.md
+      - Remote Periscope: periscope.md
+      - Robot Data Sources: robot_data_sources.md
+      - Roadmap: roadmap.md
+  - Set up & run:
       - setup/index.md
       - Robot: setup/robot.md
       - Server: setup/server.md
       - Client: setup/client.md
+      - Bring-up Runbook: bringup.md
       - Development:
-        - setup/development/index.md
-        - Documentation: setup/development/documentation.md
-        - VPN: setup/development/vpn.md
+          - setup/development/index.md
+          - VPN: setup/development/vpn.md
+          - Documentation: setup/development/documentation.md
+  - Reference:
+      - Wire Protocol: reference/wire_protocol.md
   - Archive:
       - Insta360 (retired): archive/insta360.md
+      - Streaming POC (dev log): archive/streaming_poc.md

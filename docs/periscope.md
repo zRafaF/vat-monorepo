@@ -9,13 +9,15 @@ budget — you trade coverage for angular detail — until the 4K sensor runs ou
 real pixels, past which it becomes an honest digital zoom on the client.
 
 This is the concrete realization of the **"Beacon" / virtual monitor** described
-in [Architecture → The Client](architecture.md#1-the-client-xrvr-interface): a
+in [Architecture → The Client](architecture.md#1-the-client): a
 real-time HD feed projected at the point of interest for detailed inspection,
 without paying the bandwidth of the full sphere.
 
-!!! note "Status"
-    Design / specification. Not yet implemented. This page is the contract the
-    implementation should follow.
+!!! success "Status: implemented"
+    The periscope works today. It runs in the robot's camera process
+    (`robot/docker/periscope/`), is enabled by `PERISCOPE_ENABLE=1` in `vat.env`, and is
+    viewed in the client. You can exercise it with `make periscope-probe`. This page also
+    documents the projection/zoom math and the design intent behind the current settings.
 
 ---
 
@@ -185,7 +187,7 @@ The periscope rides the **existing Zenoh bus**, not a parallel media line.
   and **subscribed** by the robot. This respects the outbound-only constraint:
   the robot never accepts an inbound connection — it dials out to the hub and the
   router relays the request over that link, exactly like every other stream. See
-  [Networking](architecture.md#2-the-cloud-global-mapping-routing).
+  [Networking](architecture.md#2-the-cloud).
 - **Video channel (robot → client).** Encoded HEVC/H.264 frames published on a
   dedicated key, on its **own publisher/session** with:
     - `reliability = best_effort`, `congestion_control = DROP` — under congestion

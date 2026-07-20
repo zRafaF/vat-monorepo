@@ -2,17 +2,19 @@
 
 Live **360° point-cloud + robot pose** from a **Unitree Go2-W** carrying a
 **RICOH Theta X** camera, streamed over [Zenoh](https://zenoh.io) to a
-**PRISM-VGGT** mapping server (GPU), and rendered in a **Rerun** 3D viewer on any
+**PRISM-VGGT** mapping server (GPU), and rendered in a **VisPy** 3D viewer on any
 machine — across the public internet / VPN.
 
 The robot sends a light, real-time stream for online mapping and keeps a
 full-resolution local archive for heavy offline reconstruction (Gaussian splats,
 NeRF) later. Pose is authoritative on the robot: the cloud computes a slow,
-drift-free VGGT pose, the dog fuses it with fast onboard odometry, and the client
-dead-reckons between samples like multiplayer netcode.
+drift-free VGGT pose, the dog fuses it with fast onboard odometry in an ESKF, and
+the client dead-reckons between samples like multiplayer netcode.
 
-> Status: pre-POC bring-up. Walk the staged tests (`make steps`) until each is
-> green. See `docs/` for the full design and setup.
+> Status: research prototype in staged bring-up. Reconstruction, live streaming,
+> the remote periscope, and teleoperation work; autonomous navigation is planned.
+> Walk the staged tests (`make steps`) until each is green. See `docs/` for the
+> full design and setup.
 
 ---
 
@@ -20,14 +22,14 @@ dead-reckons between samples like multiplayer netcode.
 
 ```
 RICOH Theta X ──UVC──▶ theta_camera (robot, docker)
-                         ├─ downscale → {robot}/prism/camera/frame  (1036×518 JPEG → server)
+                         ├─ downscale → {robot}/prism/camera/frame  (1036×518 WebP → server)
                          └─ full-res 4K twin → local SQLite archive (10 GB rolling, fetch by seq)
 
-dynamic_bridge (robot) ── ROS state (lf/sportmodestate, /lowstate) ──▶ Zenoh
+dynamic_bridge (robot) ── ROS state (IMU + wheel odom from /lowstate) ──▶ Zenoh
 mapping_server (server, GPU) ── PanoVGGT depth+pose + Nvblox TSDF ──▶ point-cloud deltas + trajectory
-pose path:  server VGGT pose ─▶ dog fuses w/ odometry ─▶ authoritative pose ─▶ client predicts
+pose path:  server VGGT pose ─▶ dog fuses w/ odometry (ESKF) ─▶ authoritative pose ─▶ client predicts
 control path:  client cmd_vel ─▶ teleop_bridge ─▶ Go2 sport Move API (deadman + e-stop)
-prism_rerun_viewer (client) ── point cloud + predicted robot block in Rerun 3D
+prism_viewer (client) ── point cloud + predicted robot block in VisPy 3D
 ```
 
 Three machines:
@@ -36,7 +38,7 @@ Three machines:
 |---|---|---|
 | 🤖 **ROBOT** | Jetson on the Go2-W | Theta UVC feed + Docker container (bridge, camera, pose fuser) |
 | ☁️ **SERVER** | GPU box | Zenoh router + PRISM-VGGT mapping server |
-| 💻 **CLIENT** | your laptop | diagnostic tools + Rerun viewer |
+| 💻 **CLIENT** | your laptop | diagnostic tools + VisPy 3D viewer |
 
 ---
 
@@ -51,7 +53,7 @@ vat-monorepo/
 ├── server/
 │   ├── router/             ← Zenoh router microservice (isolated uv env)
 │   └── mapping/            ← PRISM-VGGT mapping server + PRISM-VGGT/ submodule (CUDA)
-├── client/                 ← Rerun viewer + bring-up tools env
+├── client/                 ← VisPy 3D viewer (prism_viewer.py) + bring-up tools env
 ├── robot/
 │   ├── theta/theta_uvc.sh  ← Theta X UVC → /dev/video10 (gstthetauvc loopback)
 │   ├── docker/             ← bridge + theta_camera + frame_archive + pose_fuser + teleop_bridge + Dockerfile
@@ -163,5 +165,6 @@ make docs            # static build
 ```
 
 Start with [`docs/architecture.md`](docs/architecture.md),
-[`docs/streaming_poc.md`](docs/streaming_poc.md), and the setup guides under
+[`docs/reconstruction_engine.md`](docs/reconstruction_engine.md), the
+[bring-up runbook](docs/bringup.md), and the setup guides under
 [`docs/setup/`](docs/setup/).

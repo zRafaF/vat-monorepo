@@ -30,6 +30,12 @@ import numpy as np
 import zenoh
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Monorepo default: register submaps with a Sim(3) similarity (7-DoF). The PRISM-VGGT
+# submodule defaults to sl4; we override to sim3 here so it holds even when this server
+# is launched directly (not via `make mapping`, which also exports PRISM_ALIGN from
+# vat.env). Sim(3) is more loop-robust — see docs/reconstruction_engine.md. Set the
+# PRISM_ALIGN env var to sl4|se3 to run the ablation variants.
+os.environ.setdefault("PRISM_ALIGN", "sim3")
 
 import mapping_config as cfg
 import vat_protocol as proto
