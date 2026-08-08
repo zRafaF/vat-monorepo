@@ -104,6 +104,7 @@ nav:
       - Server: setup/server.md
       - Client: setup/client.md
       - Bring-up Runbook: bringup.md
+      - Capture & record: recording.md
       - Development:
           - setup/development/index.md
           - VPN: setup/development/vpn.md

@@ -131,3 +131,10 @@ bridge stops the robot if the stream lapses past its deadman window.
 For the remaining messages (periscope, RGBD, visual odometry) and the exact packing code, read
 `common/vat_protocol.py` directly — it is thoroughly commented and is the authoritative
 definition.
+
+!!! tip "Which of these messages carry a timestamp?"
+    `FRME`, `POSE`, `PCOR` and `PSCF` carry a capture timestamp on the robot clock; the
+    point-cloud, manifest, bundle, push and trajectory messages carry **none** (only a
+    `map_version`, and the manifest/bundle not even that). [Capture &
+    record](../recording.md) explains how the session recorder puts all of them on one
+    timeline anyway, and which timestamp to align on.

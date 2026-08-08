@@ -3,3 +3,6 @@
 **/__pycache__/
 
 site/
+
+# Live-session captures from tools/recorder (`make record`) - large, per-run data.
+recordings/

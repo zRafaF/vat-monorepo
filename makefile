@@ -20,6 +20,7 @@ CLIENT_RUN ?= cd client && uv run python
 .PHONY: help steps \
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-uvc-kill theta-stream robot-docker viewer record-frames \
+        record compose record-selftest \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         teleop fetch_frame fetch_pcd periscope-probe rgbd-probe rgbd-camera rgbd-relay \
         docs docs-serve clean
@@ -51,6 +52,12 @@ help:
 	@echo "                                (cloud + robot + legs; keys: arrows orbit, WASD pan,"
 	@echo "                                 N/M point size, C/[/] ceiling clip, 1 re-fetch)"
 	@echo "  make record-frames   [CLIENT] save 360° frames to disk (offline analysis)"
+	@echo "  make record          [ANY]    passively record a LIVE session (all streams,"
+	@echo "                                one common clock) → recordings/<session_id>/"
+	@echo "                                ARGS=\"--scene lab --trajectory-family loop --pass 1 --camera-height 1.152\""
+	@echo "  make compose         [ANY]    align/compose a recording (info | export | periscope | render)"
+	@echo "                                ARGS=\"export recordings/<id> --fps 10\""
+	@echo "  make record-selftest [ANY]    offline check of the recorder + composer (no robot)"
 	@echo "  make periscope-probe [CLIENT] headless periscope stream check (ARGS=\"--decode --save f.png\")"
 	@echo "  make rgbd-probe      [CLIENT] headless D435i panel stream check (ARGS=\"--kind depth --decode\")"
 	@echo "  make rgbd-camera     [ROBOT]  launch RealSense depth node (pinned to the Go2 NIC for the container)"
@@ -165,6 +172,31 @@ viewer: sync-client
 record-frames: sync-client
 	@echo ">> Recording 360° frames — a folder picker will open."
 	$(CLIENT_RUN) ../tools/record_frames.py
+
+# ── Session recorder (tools/recorder) ────────────────────────────
+# [ANY] Passively record a LIVE session: every stream, independently, all stamped on
+# one common clock (the robot capture clock) so they re-align afterwards. Pure
+# subscriber — it cannot disturb the robot, the mapping server or the client. Writes
+# recordings/<session_id>/ at the repo root; Ctrl-C stops cleanly and finalises.
+# Run `make record ARGS=--dry-run` first to see exactly which keys it will tap.
+#   make record ARGS="--scene lab --trajectory-family loop --pass 1 --camera-height 1.152"
+# For the full-res 360° archive pull, run this ON THE ROBOT with --where robot.
+# See docs/recording.md.
+record: sync-client
+	@echo ">> Reminder: router + robot container + 'make mapping' running."
+	@echo ">> MEASURE the camera height this session and pass --camera-height (metric anchor)."
+	$(CLIENT_RUN) ../tools/recorder/vat_record.py $(ARGS)
+
+# [ANY] Align / compose a recording. Subcommands: info | export | periscope | render.
+#   make compose ARGS="info recordings/<id>"
+#   make compose ARGS="export recordings/<id> --fps 10 --link hard"
+compose: sync-client
+	$(CLIENT_RUN) ../tools/recorder/compose.py $(ARGS)
+
+# [ANY] Offline end-to-end check of the recorder + composer: synthesises a session
+# through the real wire packers, records it, composes it. No robot / Zenoh / GPU.
+record-selftest: sync-client
+	$(CLIENT_RUN) ../tools/recorder/vat_record.py --selftest
 
 # ── Staged pre-POC tests ─────────────────────────────────────────────────────
 # All run in the client's own env; tools live in ../tools relative to client/.
