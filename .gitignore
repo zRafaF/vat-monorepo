@@ -7,3 +7,5 @@ site/
 # Live-session captures (large, per-run). The replay tool in recordings/ IS tracked.
 !recordings/
 recordings/data/
+
+**/.gradio
