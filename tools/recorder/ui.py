@@ -92,8 +92,13 @@ class Console:
         self._lock = threading.Lock()
         self.backfill_state = {"running": False, "message": "idle", "done": 0,
                                "total": 0, "bytes": 0}
-        self.fetch_on_stop = False
+        # Auto-fetch the full-res twins when a capture stops. On by default: the frames
+        # are only in the robot's rolling archive, and pulling them afterwards costs the
+        # live session nothing (see backfill.py).
+        self.fetch_on_stop = True
         self.fetch_every = 1
+        self.fetch_quality = 75      # full-res rarely needs to be pristine
+        self.fetch_max_width = 1920
 
     # ── recording ────────────────────────────────────────────────────────────
     @property
@@ -177,7 +182,9 @@ class Console:
         with self._lock:
             self.log_lines.append(f"— recorder exited with code {code} —")
         if self.fetch_on_stop and self.session_dir:
-            self.run_backfill(self.session_dir, every=self.fetch_every)
+            self.run_backfill(self.session_dir, every=self.fetch_every,
+                              quality=self.fetch_quality,
+                              max_width=self.fetch_max_width)
 
     def stop(self) -> str:
         if not self.recording:
@@ -398,43 +405,54 @@ def build_app(con: Console) -> gr.Blocks:
         with gr.Tab("Capture"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    gr.Markdown("#### Session")
                     scene = gr.Textbox(label="Scene", placeholder="lab")
                     with gr.Row():
                         family = gr.Dropdown(TRAJECTORY_FAMILIES, label="Trajectory",
                                              value="smooth")
                         pass_ix = gr.Number(label="Pass", value=1, precision=0)
-                    cam_h = gr.Number(
-                        label="Camera height (m) — the metric-scale anchor",
-                        value=1.15)
-                    h_src = gr.Textbox(label="How it was measured",
-                                       placeholder="tape, floor→lens centre, standing")
-                    mount = gr.Textbox(label="Mount geometry",
-                                       placeholder="rear selfie-stick, rigid")
-                    operator = gr.Textbox(label="Operator")
-                    flat = gr.Checkbox(label="Started over clear, flat, visible floor",
-                                       value=True)
-                    notes = gr.Textbox(label="Notes (one per line)", lines=2)
+                    cam_h = gr.Number(label="Camera height (m) — measure it each session",
+                                      value=1.15)
+                    with gr.Row():
+                        btn_start = gr.Button("● Start recording", variant="primary",
+                                              scale=2)
+                        btn_stop = gr.Button("■ Stop", variant="stop", scale=1)
+                    status = gr.Markdown("idle")
+                    fetch_on_stop = gr.Checkbox(
+                        label="Fetch full-res from the robot when I stop", value=True,
+                        info="The twins live in the robot's rolling archive; pulling them "
+                             "after the walk costs the live session nothing.")
+
                     with gr.Accordion("Advanced", open=False):
+                        gr.Markdown("**Session metadata** (goes into `meta.json`)")
+                        h_src = gr.Textbox(label="How the height was measured",
+                                           placeholder="tape, floor→lens centre, standing")
+                        mount = gr.Textbox(label="Mount geometry",
+                                           placeholder="rear selfie-stick, rigid")
+                        operator = gr.Textbox(label="Operator")
+                        flat = gr.Checkbox(
+                            label="Started over clear, flat, visible floor", value=True)
+                        notes = gr.Textbox(label="Notes (one per line)", lines=2)
                         session_id = gr.Textbox(
                             label="Session id (blank = auto from timestamp + metadata)")
+                        gr.Markdown("**Capture**")
                         streams = gr.CheckboxGroup(
                             STREAM_CHOICES, value=list(STREAM_CHOICES),
                             label="Streams (full-res is fetched afterwards, not live)")
                         duration = gr.Textbox(label="Auto-stop after", placeholder="5m")
                         max_size = gr.Textbox(label="Size cap", placeholder="4GB")
                         keyframe_s = gr.Number(label="Map keyframe every (s)", value=10)
-                    with gr.Row():
-                        btn_start = gr.Button("● Start recording", variant="primary")
-                        btn_stop = gr.Button("■ Stop", variant="stop")
-                    status = gr.Markdown("idle")
-                    with gr.Row():
-                        fetch_on_stop = gr.Checkbox(
-                            label="Fetch full-res from the robot when I stop",
-                            value=False)
-                        fetch_every = gr.Number(label="every Nth frame", value=1,
-                                                precision=0)
-                    btn_reset = gr.Button("↺ Reset PRISM map (publishes!)")
+                        gr.Markdown("**Auto-fetch on stop** — full-res is re-encoded by "
+                                    "the robot before it replies, so this is the only "
+                                    "place link bytes are saved. 0 = as archived (4K q92).")
+                        with gr.Row():
+                            fetch_every = gr.Number(label="every Nth frame", value=1,
+                                                    precision=0)
+                            fetch_q = gr.Slider(0, 100, value=75, step=1,
+                                                label="JPEG quality")
+                            fetch_w = gr.Dropdown([0, 1280, 1920, 2560, 3840],
+                                                  value=1920, label="max width px")
+                        gr.Markdown("**Operator action** — this one publishes on the bus.")
+                        btn_reset = gr.Button("↺ Reset PRISM map")
 
                 with gr.Column(scale=2):
                     headline = gr.Markdown("### idle")
@@ -444,8 +462,8 @@ def build_app(con: Console) -> gr.Blocks:
                         datatype=["str", "number", "str", "str", "number", "number",
                                   "number"],
                         interactive=False, label="Live streams", wrap=True)
-                    logbox = gr.Textbox(label="Recorder log", lines=14,
-                                        max_lines=14, autoscroll=True)
+                    logbox = gr.Textbox(label="Recorder log", lines=14, max_lines=14,
+                                        autoscroll=True)
 
         with gr.Tab("Full-res & archive"):
             gr.Markdown(
@@ -490,9 +508,11 @@ def build_app(con: Console) -> gr.Blocks:
         # ── wiring ───────────────────────────────────────────────────────────
         def on_start(scene, family, pass_ix, cam_h, h_src, mount, operator, flat,
                      notes, session_id, streams, duration, max_size, keyframe_s,
-                     fos, fev):
+                     fos, fev, fq, fw):
             con.fetch_on_stop = bool(fos)
             con.fetch_every = max(1, int(fev or 1))
+            con.fetch_quality = int(fq or 0)
+            con.fetch_max_width = int(fw or 0)
             msg = con.start(
                 {"scene": scene, "family": family, "pass_index": pass_ix,
                  "camera_height": cam_h, "height_source": h_src, "mount": mount,
@@ -505,7 +525,7 @@ def build_app(con: Console) -> gr.Blocks:
             on_start,
             [scene, family, pass_ix, cam_h, h_src, mount, operator, flat, notes,
              session_id, streams, duration, max_size, keyframe_s, fetch_on_stop,
-             fetch_every],
+             fetch_every, fetch_q, fetch_w],
             [status, pick])
         btn_stop.click(lambda: con.stop(), None, status).then(
             lambda: (gr.update(choices=[r[0] for r in archive_rows(con.out_root)]),

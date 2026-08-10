@@ -443,6 +443,17 @@ points.
     start/stop captures and reset the PRISM map, so it logs a warning at startup, and
     `--auth user:pass` is there when you want it.
 
+The default view is deliberately small: **Scene**, **Trajectory**, **Pass**, **Camera
+height**, Start/Stop, and a *fetch full-res when I stop* tick-box that is **on by
+default** — the twins only exist in the robot's rolling archive, and pulling them after
+the walk costs the live session nothing. Everything else (the rest of the §3.2 metadata,
+stream selection, caps, transcode quality, reset) is folded into **Advanced**.
+
+The auto-fetch defaults to quality 75 at 1920 px wide, since full-res rarely needs to be
+pristine; set both to 0 in Advanced for exactly-as-archived 4K. Until the robot container
+is rebuilt with the transcode support those parameters are ignored and you get full res
+either way.
+
 It gives you the session metadata form, **Start** / **Stop**, live per-stream progress
 (sample counts, rates, dropped samples, errors, bytes on disk, resident memory, the clock
 offset and whether the clock baseline is established), **Reset PRISM map**, **Fetch
