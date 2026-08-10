@@ -57,6 +57,7 @@ import logging
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,11 @@ def _jpeg(width: int, height: int, tint: int) -> bytes:
     return buf.tobytes()
 
 
+def have_ffmpeg() -> bool:
+    """Both binaries — encoding needs ffmpeg, packet boundaries need ffprobe."""
+    return bool(shutil.which("ffmpeg")) and bool(shutil.which("ffprobe"))
+
+
 def h264_access_units(n_frames: int = 60, w: int = 640, h: int = 480,
                       fps: int = 15, gop: int = 15):
     """Encode a real H.264 Annex-B stream and split it into per-frame access units.
@@ -109,6 +115,13 @@ def h264_access_units(n_frames: int = 60, w: int = 640, h: int = 480,
     exactly what a decoder would see — which is the point: the recorder concatenates
     these back and remuxes with ``ffmpeg -c copy``, and that only works on real AUs.
     """
+    if not have_ffmpeg():
+        raise RuntimeError(
+            "the H.264 periscope stream needs ffmpeg + ffprobe on PATH.\n"
+            "  install:  sudo apt-get install -y ffmpeg\n"
+            "  or run:   make rig ARGS=\"--codec mjpeg\"   (JPEG periscope instead)\n"
+            "Note the RECORDER itself does not need ffmpeg — it only uses it for the "
+            "optional periscope mp4 remux, and skips that with a log line.")
     tmp = tempfile.mkdtemp(prefix="rig-h264-")
     es = os.path.join(tmp, "s.h264")
     subprocess.run(
@@ -197,9 +210,18 @@ class FakeRig:
         self._grid_lock = threading.Lock()
         self.z.declare_queryable(self.K["pcd_blocks"], self._on_blocks)
 
-        self.units = ([] if args.codec == "none"
+        codec = args.codec
+        if codec == "auto":
+            codec = "h264" if have_ffmpeg() else "mjpeg"
+            if codec == "mjpeg":
+                log.warning("ffmpeg/ffprobe not on PATH — periscope falls back to MJPEG. "
+                            "That still exercises the recorder's periscope path end to "
+                            "end; only the H.264 remux goes untested. "
+                            "`sudo apt-get install -y ffmpeg` for the full check.")
+        self.codec = codec
+        self.units = ([] if codec == "none"
                       else h264_access_units(n_frames=args.periscope_frames)
-                      if args.codec == "h264" else None)
+                      if codec == "h264" else None)
         self.seq = 0
         self.pose_seq = 0
         self.peri_seq = 0
@@ -446,7 +468,9 @@ def main(argv=None) -> int:
     p.add_argument("--full-height", type=int, default=1920)
     p.add_argument("--archive-window", type=int, default=200,
                    help="rolling archive depth in frames (small = exercise misses)")
-    p.add_argument("--codec", choices=("h264", "mjpeg", "none"), default="h264")
+    p.add_argument("--codec", choices=("auto", "h264", "mjpeg", "none"), default="auto",
+                   help="periscope codec. 'auto' (default) uses real H.264 when ffmpeg "
+                        "is installed and falls back to MJPEG when it is not")
     p.add_argument("--periscope-frames", type=int, default=60)
     p.add_argument("--drop-pushes", type=float, default=0.0,
                    help="fraction of pushes to shed, to exercise manifest repair")
