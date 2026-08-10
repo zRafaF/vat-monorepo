@@ -71,12 +71,12 @@ PUSH_GRACE_S = float(os.environ.get("BLOCK_PUSH_GRACE_S", "0.25"))
 # Robot→local clock-offset estimator window (see common/vat_telemetry.py).
 CLOCK_WINDOW_S = float(os.environ.get("RECORDER_CLOCK_WINDOW_S", "15.0"))
 
-# Default output root: <repo>/recordings/, resolved against the repo rather than the
+# Default output root: <repo>/recordings/data/, resolved against the repo rather than the
 # current directory so `make record` (which runs from client/, like every other tool)
 # doesn't scatter a `client/recordings/` alongside it. Override with RECORDER_OUT_ROOT
 # or --out — point it at a big disk for long full-res captures.
 DEFAULT_OUT_ROOT = os.environ.get("RECORDER_OUT_ROOT") or os.path.join(
-    REPO_ROOT, "recordings")
+    REPO_ROOT, "recordings", "data")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -237,6 +237,26 @@ def session_provenance() -> dict:
     }
 
 
+def viewer_host(router: str = "") -> str:
+    """An address a browser **on another machine** can reach this box on.
+
+    Needed because the tools here are run on a headless server but looked at from a
+    laptop: a URL containing ``localhost`` resolves on whichever machine the browser
+    is running on, not on the server, so a page loads and then silently shows nothing.
+    The router endpoint from ``vat.env`` is the one address every machine in the
+    deployment already agrees on (a Tailscale IP in our setup), which makes it a far
+    better default than ``localhost``. Falls back to the resolved hostname.
+    """
+    hostish = (router or ZENOH_ROUTER).split("/")[-1].split(":")[0]
+    if hostish and hostish not in ("127.0.0.1", "0.0.0.0", "localhost", "::1"):
+        return hostish
+    import socket
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "localhost"
+
+
 def zenoh_summary(keys_subscribed, keys_queried) -> dict:
     """The transport block of ``meta.json``: what we listened to, verbatim."""
     return {
@@ -268,6 +288,13 @@ def _selftest() -> None:
     assert KEYS["camera_frame"] == f"{ROBOT_NAME}/prism/camera/frame"
     assert KEYS["pcd_push"] == f"{SERVER_PREFIX}/pcd/push"
     assert _canonical_hash({"a": 1, "b": 2}) == _canonical_hash({"b": 2, "a": 1})
+    # The router host is what a browser on another machine can reach — 'localhost' is
+    # exactly the value this helper exists to avoid handing out.
+    assert viewer_host("tcp/100.76.214.80:7447") == "100.76.214.80"
+    assert viewer_host("tcp/vat-server:7447") == "vat-server"
+    lo = viewer_host("tcp/127.0.0.1:7447")     # loopback router → hostname fallback
+    assert lo and ":" not in lo and "/" not in lo, lo
+    assert viewer_host()
     p = session_provenance()
     assert "mapping_config_hash" in p and "git" in p
     print(f"rec_config self-test OK  (robot={ROBOT_NAME} server={SERVER_PREFIX} "

@@ -21,6 +21,7 @@ CLIENT_RUN ?= cd client && uv run python
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-uvc-kill theta-stream robot-docker viewer record-frames \
         record compose record-selftest rig backfill record-ui sync-recorder \
+        replay sync-replay \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         teleop fetch_frame fetch_pcd periscope-probe rgbd-probe rgbd-camera rgbd-relay \
         docs docs-serve clean
@@ -61,6 +62,8 @@ help:
 	@echo "  make rig             [ANY]    fake robot+cloud on the real Zenoh keys (test the live path)"
 	@echo "  make record-ui       [ANY]    browser console: start/stop, live progress, fetch full-res, zip"
 	@echo "  make backfill        [ANY]    fetch full-res panoramas into a FINISHED recording"
+	@echo "  make replay          [ANY]    play a recorded session back in Rerun (map, poses, panorama, ESDF)"
+	@echo "                                ARGS=\"recordings/data/<id> --save run.rrd\""
 	@echo "                                ARGS=\"recordings/<id> --every 2\""
 	@echo "  make periscope-probe [CLIENT] headless periscope stream check (ARGS=\"--decode --save f.png\")"
 	@echo "  make rgbd-probe      [CLIENT] headless D435i panel stream check (ARGS=\"--kind depth --decode\")"
@@ -123,6 +126,10 @@ sync-router:
 # env does not grow a web stack.
 sync-recorder:
 	cd tools/recorder && uv sync
+
+# Replay env (Rerun) — a pure reader, so it needs no Zenoh and no Gradio.
+sync-replay:
+	cd recordings && uv sync
 
 sync-docs:
 	uv sync --group docs
@@ -233,6 +240,14 @@ backfill: sync-client
 record-ui: sync-recorder
 	@echo ">> Recorder console on :7860 (share URL printed): start/stop, live progress, fetch full-res, zips."
 	cd tools/recorder && uv run python ui.py $(ARGS)
+
+# [ANY] Play a recorded session back in Rerun: the map growing, the trajectory walked,
+# the panorama, the periscope and the ESDF, all on the ONE session timeline. Reads only
+# what the recorder wrote -- no robot, no Zenoh, no mapping server. See recordings/README.md.
+#   make replay ARGS="recordings/data/<id>"                  # web viewer (headless-friendly)
+#   make replay ARGS="recordings/data/<id> --save run.rrd"    # then: rerun run.rrd
+replay: sync-replay
+	cd recordings && uv run python replay.py $(ARGS)
 
 # ── Staged pre-POC tests ─────────────────────────────────────────────────────
 # All run in the client's own env; tools live in ../tools relative to client/.

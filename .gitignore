@@ -4,5 +4,6 @@
 
 site/
 
-# Live-session captures from tools/recorder (`make record`) - large, per-run data.
-recordings/
+# Live-session captures (large, per-run). The replay tool in recordings/ IS tracked.
+!recordings/
+recordings/data/

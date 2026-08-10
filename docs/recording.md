@@ -464,6 +464,26 @@ Stop sends **SIGINT** to the recorder, i.e. exactly the clean-flush path Ctrl-C 
 UI has no privileged shortcut the CLI lacks. Everything it does is a subprocess of the
 same scripts.
 
+A **Replay** tab does the same for playback: it lists every recording under the output
+root — labelled with duration, size, status and whether full-res has been fetched — so you
+pick a run from a dropdown instead of typing a session path, press **▶ Open in Rerun**,
+and get a clickable viewer link once the run is loaded (a long walk takes a while, so the
+link only appears when the viewer really has the data). Map mode, panorama source, stream
+skipping, the point cap and the ports are under *Advanced*. The replay is spawned in the
+`recordings/` uv project — `cd recordings && uv run python replay.py …`, exactly what
+`make replay` runs — because Rerun lives there, not in the console's env. You can replay
+an old session while a capture is running; the two are separate processes.
+
+!!! warning "The Rerun viewer URL is resolved by *your browser*"
+    Rerun serves the viewer page on one port and streams the data over gRPC from another,
+    and the gRPC address is embedded in the page for the **browser** to fetch. So on a
+    headless server a `localhost` URL points at the machine you are browsing *from*: the
+    page loads and then stays empty. Both `replay.py` and the console therefore default
+    `--viewer-host` to the router host from `vat.env` (a `100.x` Tailscale address here),
+    and **both** ports — `9090` for the page and `9876` for the stream — must be reachable
+    from your browser. Note the Gradio share URL does *not* tunnel them; use the tailnet
+    address, or `--save run.rrd` and scrub it locally, which is nicer anyway.
+
 !!! warning "One button publishes"
     **Reset PRISM map** puts an empty payload on `{server}/cmd/reset` — the same thing the
     viewer's reset does. It is an explicit operator action and is deliberately *not* part

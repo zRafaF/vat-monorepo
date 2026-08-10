@@ -1,0 +1,26 @@
+[project]
+name = "vat-replay"
+version = "1.0.0"
+description = "Play a recorded VAT session back in Rerun"
+# Standalone, isolated uv project (own recordings/.venv + uv.lock), same convention as
+# client/, server/mapping/, server/router/ and tools/recorder/:
+#     cd recordings && uv sync && uv run python replay.py data/<session_id>
+#
+# Kept separate from tools/recorder because this is a pure *reader*: it needs Rerun and a
+# JPEG/H.264 decoder, but no Zenoh transport and no Gradio. It imports the recorder's own
+# reader (tools/recorder/compose.py) so a recording is never parsed twice by two
+# different implementations.
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "rerun-sdk>=0.36",              # the viewer + logging SDK
+    "numpy>=1.24",
+    # Draco: only needed for `--map replay` (rebuilding the map from recorded pushes).
+    "DracoPy>=1.4",
+    # Periscope decode uses the viewer's own decoder (client/vat_client/periscope_view.py),
+    # which needs PyAV for H.264/H.265 and cv2 for MJPEG.
+    "av>=11.0",
+    "opencv-python-headless>=4.9",
+]
+
+[tool.uv]
+package = false

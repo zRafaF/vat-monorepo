@@ -24,6 +24,9 @@ What it does
 * **Reset the PRISM map** — see the warning below.
 * **Archive**: every recording under the output root, with its size, duration, status and
   stream counts; download any of them as a zip.
+* **Replay**: pick a recording from a list and open it in Rerun — no paths to type. The
+  replay itself runs in its own uv project (``recordings/``, which owns the Rerun
+  dependency), spawned exactly as ``make replay`` would.
 
 .. warning::
    The reset button is the **one** control here that publishes on the bus. It puts an
@@ -70,9 +73,27 @@ log = logging.getLogger("vat-ui")
 
 PY = sys.executable
 RECORD = os.path.join(_HERE, "vat_record.py")
+REPLAY_DIR = os.path.join(rcfg.REPO_ROOT, "recordings")
+REPLAY = os.path.join(REPLAY_DIR, "replay.py")
 TRAJECTORY_FAMILIES = ("smooth", "stop-and-go", "loop", "other")
 STREAM_CHOICES = ("panorama_transmit", "periscope", "pointcloud", "poses",
                   "esdf", "status", "trajectory")
+REPLAY_STREAMS = ("map", "poses", "trajectory", "panorama", "periscope", "esdf",
+                  "status")
+
+
+def replay_cmd() -> List[str]:
+    """How to invoke ``recordings/replay.py`` — in *its* env, not this one.
+
+    Rerun lives in the ``recordings/`` uv project, not in the recorder's, so the console
+    must shell out the same way ``make replay`` does (``cd recordings && uv run …``).
+    Falling back to this interpreter is only useful when someone has installed both sets
+    of dependencies in one env; it fails loudly with an ImportError otherwise, which is
+    clearer than pretending the button is broken.
+    """
+    if shutil.which("uv"):
+        return ["uv", "run", "python", "replay.py"]
+    return [PY, REPLAY]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -99,6 +120,14 @@ class Console:
         self.fetch_every = 1
         self.fetch_quality = 75      # full-res rarely needs to be pristine
         self.fetch_max_width = 1920
+        # Replay (Rerun) child process — independent of the recorder, so you can look at
+        # yesterday's walk while today's is being captured.
+        self.replay_proc: Optional[subprocess.Popen] = None
+        self.replay_lines: List[str] = []
+        self.replay_url = ""
+        self.replay_session = ""
+        self.replay_ready = False
+        self._rlock = threading.Lock()
 
     # ── recording ────────────────────────────────────────────────────────────
     @property
@@ -246,6 +275,97 @@ class Console:
         threading.Thread(target=work, daemon=True).start()
         return f"fetching full-res for {os.path.basename(session)}…"
 
+    # ── replay in Rerun ──────────────────────────────────────────────────────
+    @property
+    def replaying(self) -> bool:
+        return self.replay_proc is not None and self.replay_proc.poll() is None
+
+    def start_replay(self, session_id: str, *, map_mode: str = "keyframe",
+                     panorama: str = "auto", port: int = 9090,
+                     grpc_port: int = 9876, host: str = "",
+                     max_points: int = 300_000, skip=()) -> str:
+        if self.replaying:
+            return "⚠️ a replay is already running — Stop it first (or reuse its link)."
+        if not session_id:
+            return "pick a recording first."
+        session = os.path.join(self.out_root, session_id)
+        if not os.path.isdir(session):
+            return f"no such recording: {session_id}"
+        # The host goes into the URL the *browser* uses for the gRPC stream, so it must be
+        # reachable from the browser — never 'localhost'. See rec_config.viewer_host.
+        host = (host or "").strip() or rcfg.viewer_host()
+        cmd = replay_cmd() + [
+            session, "--viewer-host", host,
+            "--port", str(int(port)), "--grpc-port", str(int(grpc_port)),
+            "--map", str(map_mode), "--panorama", str(panorama),
+            "--max-points", str(int(max_points))]
+        for s in (skip or ()):
+            cmd += ["--skip", str(s)]
+        with self._rlock:
+            self.replay_lines = [f"$ {' '.join(cmd)}", ""]
+        self.replay_ready = False
+        try:
+            self.replay_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, cwd=REPLAY_DIR)
+        except Exception as e:                                  # noqa: BLE001
+            return f"❌ could not start the replay: {e}"
+        threading.Thread(target=self._drain_replay, daemon=True).start()
+        self.replay_url = f"http://{host}:{int(port)}"
+        self.replay_session = session_id
+        return f"⏳ loading `{session_id}` into Rerun…"
+
+    def _drain_replay(self) -> None:
+        p = self.replay_proc
+        if p is None or p.stdout is None:
+            return
+        for line in p.stdout:
+            line = line.rstrip()
+            with self._rlock:
+                self.replay_lines.append(line)
+                del self.replay_lines[:-400]
+            # replay.py logs '[replay] open  http://…' only once the whole recording is
+            # in the viewer's store, which is the moment the link is worth clicking.
+            if "[replay] open" in line:
+                self.replay_ready = True
+        code = p.wait()
+        with self._rlock:
+            self.replay_lines.append(f"— replay exited with code {code} —")
+        self.replay_ready = False
+
+    def stop_replay(self) -> str:
+        if not self.replaying:
+            return "no replay running."
+        try:
+            self.replay_proc.send_signal(signal.SIGINT)
+        except Exception as e:                                  # noqa: BLE001
+            return f"could not signal the replay: {e}"
+        for _ in range(50):
+            if self.replay_proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        if self.replay_proc.poll() is None:
+            self.replay_proc.terminate()
+        self.replay_ready = False
+        self.replay_url = ""
+        return "■ replay stopped."
+
+    def replay_log(self) -> str:
+        with self._rlock:
+            return "\n".join(self.replay_lines[-200:])
+
+    def replay_view(self) -> tuple:
+        """(status markdown, link markdown) for the Replay tab."""
+        if self.replaying:
+            if self.replay_ready:
+                return (f"🟢 serving `{self.replay_session}`",
+                        f"### 👉 [{self.replay_url}]({self.replay_url})\n\n"
+                        f"Opens the Rerun web viewer. Both this port and the gRPC port "
+                        f"must be reachable from the machine you are browsing from.")
+            return (f"⏳ loading `{self.replay_session}` into Rerun — "
+                    f"big maps and full-res panoramas take a while…", "")
+        return ("idle", "")
+
     # ── PRISM map reset (the one publishing control) ──────────────────────────
     def reset_map(self) -> str:
         try:
@@ -359,6 +479,29 @@ def archive_rows(out_root: str) -> list:
             if r:
                 rows.append(r)
     return rows
+
+
+def session_choices(out_root: str) -> list:
+    """``[(label, session_id)]`` for the pickers — newest first, labelled with what it is.
+
+    This is the "file picker": the operator chooses a recording from a list instead of
+    typing a path, and the value handed back is still just the directory name, so every
+    callback stays identical to the CLI's ``recordings/data/<id>`` argument.
+    """
+    out = []
+    for r in archive_rows(out_root):
+        name, status, dur, size = r[0], r[1], r[2], r[3]
+        full = f" · {r[5]} full-res" if len(r) > 5 and r[5] else ""
+        out.append((f"{name}   —   {dur}s · {size} · {status}{full}", name))
+    return out
+
+
+def picker_update(out_root: str, keep: str = ""):
+    """Refresh a session dropdown, preserving the selection (or defaulting to newest)."""
+    ch = session_choices(out_root)
+    ids = [v for _l, v in ch]
+    value = keep if keep in ids else (ids[0] if ids else None)
+    return gr.update(choices=ch, value=value)
 
 
 def make_zip(out_root: str, session_id: str, include_fullres: bool = True):
@@ -505,6 +648,48 @@ def build_app(con: Console) -> gr.Blocks:
             zip_status = gr.Markdown("")
             zip_file = gr.File(label="Download", interactive=False)
 
+        with gr.Tab("Replay"):
+            gr.Markdown(
+                "#### Play a recording back in Rerun\n"
+                "Pick a recording and press the button — the map growing, the trajectory "
+                "walked, the panorama, the periscope and the ESDF, all on one timeline "
+                "(the robot capture clock). Nothing touches the robot or the bus.\n\n"
+                "This spawns `recordings/replay.py` in its own uv project, exactly as "
+                "`make replay` does. Loading takes a while for a long walk; the link "
+                "appears when the viewer is actually ready.")
+            with gr.Row():
+                rpick = gr.Dropdown(label="Recording", choices=[], interactive=True,
+                                    scale=4)
+                btn_rrefresh = gr.Button("↻ Refresh", scale=1)
+            with gr.Row():
+                btn_replay = gr.Button("▶ Open in Rerun", variant="primary", scale=2)
+                btn_replay_stop = gr.Button("■ Stop replay", variant="stop", scale=1)
+            rstatus = gr.Markdown("idle")
+            rlink = gr.Markdown("")
+            with gr.Accordion("Advanced", open=False):
+                with gr.Row():
+                    rmap = gr.Radio(("keyframe", "replay", "none"), value="keyframe",
+                                    label="Map",
+                                    info="keyframe = the materialised map states "
+                                         "(fast); replay = rebuild every Draco push")
+                    rpano = gr.Radio(("auto", "transmit", "fullres"), value="auto",
+                                     label="Panorama",
+                                     info="auto prefers full-res when it was fetched")
+                rskip = gr.CheckboxGroup(REPLAY_STREAMS, value=[],
+                                         label="Skip streams (when one is huge)")
+                with gr.Row():
+                    rmax = gr.Number(label="max points per cloud frame", value=300000,
+                                     precision=0)
+                    rport = gr.Number(label="viewer port", value=9090, precision=0)
+                    rgrpc = gr.Number(label="gRPC port", value=9876, precision=0)
+                rhost = gr.Textbox(
+                    label="Host your browser should use", value=rcfg.viewer_host(),
+                    info="Goes into the viewer URL and is resolved BY YOUR BROWSER, so "
+                         "'localhost' would point at your own machine. Defaults to the "
+                         "router host from vat.env.")
+            rlog = gr.Textbox(label="Replay log", lines=10, max_lines=10,
+                              autoscroll=True)
+
         # ── wiring ───────────────────────────────────────────────────────────
         def on_start(scene, family, pass_ix, cam_h, h_src, mount, operator, flat,
                      notes, session_id, streams, duration, max_size, keyframe_s,
@@ -519,17 +704,19 @@ def build_app(con: Console) -> gr.Blocks:
                  "operator": operator, "flat_floor": bool(flat), "notes": notes,
                  "session_id": session_id},
                 streams, duration or "", max_size or "", keyframe_s or 10)
-            return msg, gr.update(choices=[r[0] for r in archive_rows(con.out_root)])
+            return msg, picker_update(con.out_root), picker_update(con.out_root)
 
         btn_start.click(
             on_start,
             [scene, family, pass_ix, cam_h, h_src, mount, operator, flat, notes,
              session_id, streams, duration, max_size, keyframe_s, fetch_on_stop,
              fetch_every, fetch_q, fetch_w],
-            [status, pick])
+            [status, pick, rpick])
         btn_stop.click(lambda: con.stop(), None, status).then(
-            lambda: (gr.update(choices=[r[0] for r in archive_rows(con.out_root)]),
-                     archive_rows(con.out_root)), None, [pick, arch])
+            lambda p, r: (picker_update(con.out_root, p),
+                          picker_update(con.out_root, r),
+                          archive_rows(con.out_root)),
+            [pick, rpick], [pick, rpick, arch])
         btn_reset.click(lambda: con.reset_map(), None, status)
 
         def on_dry(sid, every):
@@ -554,15 +741,24 @@ def build_app(con: Console) -> gr.Blocks:
             [pick, bf_every, bf_cap, bf_sleep, bf_q, bf_w], bf_status)
 
         btn_refresh.click(
-            lambda: (archive_rows(con.out_root),
-                     gr.update(choices=[r[0] for r in archive_rows(con.out_root)])),
-            None, [arch, pick])
+            lambda p: (archive_rows(con.out_root), picker_update(con.out_root, p)),
+            [pick], [arch, pick])
 
         def on_zip(sid, include):
             path, msg = make_zip(con.out_root, sid, bool(include))
             return (path, msg) if path else (None, msg)
 
         btn_zip.click(on_zip, [pick, inc_full], [zip_file, zip_status])
+
+        # ── replay ───────────────────────────────────────────────────────────
+        btn_rrefresh.click(lambda r: picker_update(con.out_root, r), [rpick], [rpick])
+        btn_replay.click(
+            lambda sid, m, pano, skip, mx, port, grpc, host: con.start_replay(
+                sid, map_mode=m, panorama=pano, skip=skip or (),
+                max_points=int(mx or 0), port=int(port or 9090),
+                grpc_port=int(grpc or 9876), host=host or ""),
+            [rpick, rmap, rpano, rskip, rmax, rport, rgrpc, rhost], rstatus)
+        btn_replay_stop.click(lambda: con.stop_replay(), None, rstatus)
 
         def tick():
             head, rows = live_view(con)
@@ -571,12 +767,13 @@ def build_app(con: Console) -> gr.Blocks:
             if bs["running"] and bs.get("total"):
                 bmsg = (f"⏳ {bs['done']}/{bs['total']} · "
                         f"{rcfg.human_size(bs['bytes'])}")
-            return head, rows, con.log_text(), bmsg
+            rstat, rl = con.replay_view()
+            return head, rows, con.log_text(), bmsg, rstat, rl, con.replay_log()
 
-        gr.Timer(2.0).tick(tick, None, [headline, table, logbox, bf_status])
-        app.load(lambda: (archive_rows(con.out_root),
-                          gr.update(choices=[r[0] for r in archive_rows(con.out_root)])),
-                 None, [arch, pick])
+        gr.Timer(2.0).tick(tick, None, [headline, table, logbox, bf_status,
+                                        rstatus, rlink, rlog])
+        app.load(lambda: (archive_rows(con.out_root), picker_update(con.out_root),
+                          picker_update(con.out_root)), None, [arch, pick, rpick])
     return app
 
 
@@ -612,8 +809,28 @@ def _selftest() -> int:
         # the polling callback must survive an idle console (no session yet)
         head, rows = live_view(con)
         assert "idle" in head and rows == []
-        assert archive_rows(con.out_root) == []
+        assert con.replay_view() == ("idle", "")
         assert make_zip(con.out_root, "", True)[0] is None
+        # the picker must degrade to "nothing to pick" rather than raising, and the
+        # replay buttons must refuse an empty selection instead of spawning a process
+        assert session_choices(con.out_root) == []
+        assert picker_update(con.out_root)["value"] is None
+        assert "pick a recording" in con.start_replay("")
+        assert "no such recording" in con.start_replay("nope")
+        assert con.replay_proc is None and "no replay running" in con.stop_replay()
+        # …and it must label a real session directory, value = the plain directory name
+        sid = "2026-08-08T00-00-00_selftest"
+        os.makedirs(os.path.join(con.out_root, sid), exist_ok=True)
+        with open(os.path.join(con.out_root, sid, "MANIFEST.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"status": "complete", "duration_s": 12.0,
+                       "streams": {"poses": {"samples": 7}}}, f)
+        ch = session_choices(con.out_root)
+        assert ch and ch[0][1] == sid and sid in ch[0][0] and "complete" in ch[0][0], ch
+        assert picker_update(con.out_root)["value"] == sid
+        assert picker_update(con.out_root, "gone")["value"] == sid   # stale → newest
+        assert replay_cmd()[-1].endswith("replay.py")
+        shutil.rmtree(os.path.join(con.out_root, sid), ignore_errors=True)
         print(f"ui self-test OK  (gradio {gr.__version__}: builds, launches, serves)")
         return 0
     finally:
