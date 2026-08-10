@@ -20,7 +20,7 @@ CLIENT_RUN ?= cd client && uv run python
 .PHONY: help steps \
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-uvc-kill theta-stream robot-docker viewer record-frames \
-        record compose record-selftest \
+        record compose record-selftest rig \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         teleop fetch_frame fetch_pcd periscope-probe rgbd-probe rgbd-camera rgbd-relay \
         docs docs-serve clean
@@ -58,6 +58,7 @@ help:
 	@echo "  make compose         [ANY]    align/compose a recording (info | export | periscope | render)"
 	@echo "                                ARGS=\"export recordings/<id> --fps 10\""
 	@echo "  make record-selftest [ANY]    offline check of the recorder + composer (no robot)"
+	@echo "  make rig             [ANY]    fake robot+cloud on the real Zenoh keys (test the live path)"
 	@echo "  make periscope-probe [CLIENT] headless periscope stream check (ARGS=\"--decode --save f.png\")"
 	@echo "  make rgbd-probe      [CLIENT] headless D435i panel stream check (ARGS=\"--kind depth --decode\")"
 	@echo "  make rgbd-camera     [ROBOT]  launch RealSense depth node (pinned to the Go2 NIC for the container)"
@@ -197,6 +198,14 @@ compose: sync-client
 # through the real wire packers, records it, composes it. No robot / Zenoh / GPU.
 record-selftest: sync-client
 	$(CLIENT_RUN) ../tools/recorder/vat_record.py --selftest
+
+# [ANY] Fake rig: publish synthetic robot+cloud traffic on the REAL Zenoh keys so the
+# recorder's live path (subscriptions, the archive query/reply, the block-repair pull,
+# a real H.264 periscope stream) can be exercised without the robot. Needs 'make router'.
+#   make rig ARGS="--drop-pushes 0.35"      # shed pushes to exercise manifest repair
+rig: sync-client
+	@echo ">> Reminder: 'make router' must be running. This is a TEST FIXTURE, not the robot."
+	$(CLIENT_RUN) ../tools/recorder/fake_rig.py $(ARGS)
 
 # ── Staged pre-POC tests ─────────────────────────────────────────────────────
 # All run in the client's own env; tools live in ../tools relative to client/.

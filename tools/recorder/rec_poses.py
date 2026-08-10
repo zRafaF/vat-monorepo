@@ -178,7 +178,9 @@ class CorrectionRecorder(StreamRecorder):
     def _on_correction(self, sample) -> None:
         raw = bytes(sample.payload)
         c = proto.unpack_pose_correction(raw)
-        st = self.clock.stamp(c.timestamp_ns)
+        # observe=False: the timestamp is the capture time of a keyframe the cloud
+        # solved seconds ago, so it must not set the clock's transport baseline.
+        st = self.clock.stamp(c.timestamp_ns, observe=False)
         # The exact version↔capture-time pin: this keyframe time is a genuine
         # FrameInput.timestamp threaded all the way through the engine.
         self.clock.pin_version(c.map_version, c.timestamp_ns, "pose_correction",

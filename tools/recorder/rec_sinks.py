@@ -423,10 +423,17 @@ class SessionWriter:
 
     # ── blobs ────────────────────────────────────────────────────────────────
     def write_blob(self, data: bytes, *parts: str) -> Tuple[str, int]:
-        """Atomically write ``data``; return ``(abs_path, nbytes)``."""
+        """Atomically write ``data``; return ``(abs_path, nbytes)``.
+
+        The temp name is unique per call, not ``dst + ".tmp"``. Zenoh can deliver the
+        same sample twice when two routes exist (a peer link *and* the router path), so
+        two callback threads can legitimately write the same ``seq`` at the same moment;
+        with a shared temp name one thread's ``os.replace`` then fails with ENOENT
+        because the other already consumed it, and the frame is lost.
+        """
         dst = self.path(*parts)
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-        tmp = dst + ".tmp"
+        tmp = f"{dst}.{os.getpid():d}.{threading.get_ident():x}.tmp"
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, dst)

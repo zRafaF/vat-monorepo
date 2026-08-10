@@ -89,6 +89,7 @@ correction arrives).
 | `rec_periscope.py` | periscope elementary stream + timestamp sidecar + ffmpeg remux |
 | `rec_cloud.py` | point cloud (blocks *and* snapshot modes), ESDF slices, server status |
 | `rec_poses.py` | fused pose (TUM + JSONL), cloud corrections + gate metrics, camera trail |
+| `fake_rig.py` | **test fixture:** a synthetic robot + cloud publishing the real wire messages on the real Zenoh keys, so the live path can be exercised without a robot (see below) |
 
 Every module has a `_selftest()` and is runnable on its own, matching the convention in
 `common/` and `server/mapping/`:
@@ -104,6 +105,34 @@ packers, drives a **virtual clock** with per-stream transport latencies (so the
 derived-timestamp path is genuinely exercised rather than collapsed into a few
 milliseconds of real time), writes a real recording, and then composes it — asserting
 that replaying the raw Draco pushes reproduces the materialised keyframe exactly.
+
+---
+
+## Verified against a live bus
+
+The offline `--selftest` drives the handlers directly and never touches Zenoh, so the live
+path is tested with `fake_rig.py` — a synthetic robot + cloud that publishes the real wire
+messages on the real keys, including the archive queryable, the block-repair queryable and a
+**genuine H.264 elementary stream** cut into per-frame access units.
+
+```bash
+# terminal 1 — router      cd server/router && ZENOH_LISTEN=tcp/127.0.0.1:7447 uv run python router.py
+# terminal 2 — rig         make rig ARGS="--drop-pushes 0.35"
+# terminal 3 — recorder    make record ARGS="--duration 30s --scene rig --camera-height 1.15"
+```
+
+That run confirmed, on a real router: subscriptions on every key; the archive
+query/reply (`?seq=N`, `reply_err` on a miss) pulling real 3840×1920 twins; the
+manifest-diff **repair pull healing a 35 %-lossy push stream** (7 pulls, 8 647 cubes);
+`periscope.mp4` remuxing into decodable H.264; the two-recorder pattern running
+simultaneously; `compose export` resolving all nine streams at 238/238 ticks; and a 4K
+mp4 built from `frames/%06d.jpg`. Five bugs only a live bus could surface were found and
+fixed this way — see the git log.
+
+Note `--where robot` binds **no** inbound endpoint (`listen/endpoints: []`). A peer's
+default listener is `tcp/[::]:0`, which fails to bind outright on a host without IPv6
+(common in the robot container); the recorder is a pure consumer and never needs inbound
+peers. `--zenoh-listen` overrides.
 
 ---
 
@@ -188,6 +217,22 @@ python tools/recorder/compose.py periscope recordings/<id> --decode
 python tools/recorder/compose.py render recordings/<id> --out demo.mp4 --fps 10
 ```
 
+### A paired robot + cloud capture
+
+`--where robot` deliberately excludes the map, so a full capture is two sessions. Merge them
+at compose time — they share the session clock, so this is a per-stream union:
+
+```bash
+python tools/recorder/compose.py info   recordings/<cloud-id> --with recordings/<robot-id>
+python tools/recorder/compose.py export recordings/<cloud-id> --with recordings/<robot-id> \
+    --fps 10 --panorama fullres --link hard
+```
+
+Streams recorded on **both** sides (the transmit panorama, the fused pose) are
+de-duplicated by `seq`, preferring the copy whose blob is on disk. The map transport is
+taken from **one** session only — interleaving two copies of pushes and manifest removals
+would corrupt a replay — and the merge says so when it happens.
+
 `export` writes `timeline.csv`, `timeline.jsonl` and a `README.md` explaining the
 columns. Each row is one instant on the session clock with every stream resolved to
 what belonged there, and a `*_dt_ms` per stream saying how far the chosen sample sits
@@ -246,6 +291,12 @@ when a stream is substantially clipped.
   blob is gone when it loads a recording, so it can never hand you a dead path.
 * **`periscope.mp4` has nominal timing.** The stream is variable-rate;
   `periscope_timestamps.csv` is authoritative.
+* **At least one low-latency source-stamped stream is required** (`--poses`,
+  `--panorama-transmit` or `--periscope`), and the recorder now refuses to start without
+  one. The map carries no timestamps, so its session time is arrival minus the robot→local
+  offset — and that offset is only learnable from a stream whose arrival closely follows
+  its capture. `pose_correction` and the lagged full-res pull are both stamped verbatim but
+  deliberately **excluded** from the baseline for exactly this reason.
 * **DracoPy is required** for the map mirror, repair and keyframes. Without it every
   byte is still recorded, but understanding it is deferred to offline replay — the
   recorder says so loudly at startup. It is already a `client/` dependency.

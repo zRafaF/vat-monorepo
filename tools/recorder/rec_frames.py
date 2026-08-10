@@ -210,7 +210,10 @@ class PanoramaTransmitRecorder(StreamRecorder):
         self._idx.append([seq, ts_ns, st.ts_src, st.wall_ns, st.mono_ns,
                           len(raw), len(body), f"{cam_h:.4f}", w, h,
                           f"{st.latency_ms:.1f}", rel])
-        self.stats.sample(nbytes=len(raw), src_ts_ns=ts_ns, wall_ns=st.wall_ns, seq=seq)
+        # Only track seq gaps when keeping every frame: with --transmit-every N the seq
+        # sequence skips by design, and reporting that as loss would be a lie.
+        self.stats.sample(nbytes=len(raw), src_ts_ns=ts_ns, wall_ns=st.wall_ns,
+                          seq=(seq if self.every == 1 else None))
 
     def extra_summary(self) -> dict:
         return {
@@ -218,6 +221,7 @@ class PanoramaTransmitRecorder(StreamRecorder):
             "frames_dir": None if self.index_only else f"{self.name}/frames",
             "index_only": self.index_only,
             "decimate_every": self.every,
+            "seq_gaps_tracked": self.every == 1,
             "camera_height_wire": self.height.summary(),
             "note": ("wire_bytes = full Zenoh payload (20-byte FRME header + image); "
                      "image_bytes = encoded image only. Use wire_bytes for uplink."),
@@ -370,7 +374,10 @@ class PanoramaFullresRecorder(StreamRecorder):
         # ts/seq/camera_height, so the full-res twin keeps the transmit frame's
         # identity on the session clock — we never re-stamp it.
         a_ts_ns, a_seq, a_cam_h, body = proto.unpack_frame(payload)
-        st = self.clock.stamp(a_ts_ns)
+        # observe=False: this frame is pulled --fullres-lag seconds after capture, so
+        # `arrival - capture` is dominated by our own deliberate lag. Feeding it to the
+        # clock's running-minimum baseline would inflate the offset by seconds.
+        st = self.clock.stamp(a_ts_ns, observe=False)
         self.height.add(a_cam_h)
         if not self.budget.claim(len(body)):
             self.stats.skip()
@@ -398,7 +405,8 @@ class PanoramaFullresRecorder(StreamRecorder):
                           len(payload), len(body), f"{a_cam_h:.4f}", w, h,
                           f"{st.latency_ms:.1f}", self.sw.rel(path)])
         self.stats.sample(nbytes=len(payload), src_ts_ns=a_ts_ns,
-                          wall_ns=st.wall_ns, seq=a_seq)
+                          wall_ns=st.wall_ns,
+                          seq=(a_seq if self.every == 1 else None))
 
     def close(self) -> None:
         self._stop.set()
@@ -419,6 +427,7 @@ class PanoramaFullresRecorder(StreamRecorder):
             "index": self.sw.rel(self._idx.path),
             "frames_dir": f"{self.name}/frames",
             "decimate_every": self.every,
+            "seq_gaps_tracked": self.every == 1,
             "pull_lag_s": self.lag_s,
             "archive_misses": self.n_missing,
             "query_timeouts": self.n_timeout,

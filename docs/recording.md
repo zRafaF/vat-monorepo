@@ -363,6 +363,8 @@ video by hand, `export` already gave you everything.
 
 ## Checking it without a robot
 
+Two levels. The offline self-test drives the recorder's handlers directly:
+
 ```bash
 make record-selftest
 ```
@@ -378,6 +380,29 @@ Zenoh, no GPU.
 python tools/recorder/vat_record.py --selftest --selftest-keep /tmp/vatrec
 python tools/recorder/compose.py info /tmp/vatrec/e2e
 ```
+
+The second level exercises the **live** path — real Zenoh subscriptions, the archive
+query/reply, the block-repair pull, a real H.264 stream — using `fake_rig.py`, a synthetic
+robot + cloud that publishes the real wire messages on the real keys:
+
+```bash
+# [SERVER] make router
+make rig ARGS="--drop-pushes 0.35"          # sheds 35 % of pushes to exercise repair
+make record ARGS="--duration 30s --scene rig --camera-height 1.15"
+make compose ARGS="info recordings/<id>"
+```
+
+This is the right thing to run after touching the recorder and before taking the robot out.
+It is also how the live path was validated in the first place: the rig run proved the
+archive pull, the repair pull healing a lossy link, a decodable `periscope.mp4`, the
+two-recorder pattern, and a 4K video out of `compose export` — and it found five bugs the
+offline test could not see.
+
+!!! note "Peer mode binds nothing"
+    `--where robot` uses Zenoh peer mode but sets `listen/endpoints: []`. A peer's default
+    listener is `tcp/[::]:0`, which fails to bind on a host without IPv6 — common in the
+    robot container — and the recorder never needs inbound peers. `--zenoh-listen`
+    overrides if you want one.
 
 ---
 
@@ -427,4 +452,5 @@ python tools/recorder/compose.py info /tmp/vatrec/e2e
 | `--pointcloud-snapshot-query-s` | optional server-side snapshot queries as a cross-check. Off by default: each costs a full cloud extract. |
 | `--scene`, `--trajectory-family`, `--pass`, `--seed`, `--camera-height`, `--camera-height-source`, `--mount-geometry`, `--clear-flat-floor`, `--operator`, `--note`, `--meta` | the §3.2 session metadata, straight into `meta.json`. |
 | `--dry-run` | print the resolved plan (streams, keys, caps) and exit without recording. |
+| `--zenoh-listen` | peer mode only: bind an inbound endpoint (default: none). |
 | `--selftest` | offline end-to-end check. |

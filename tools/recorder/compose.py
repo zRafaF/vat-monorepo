@@ -81,6 +81,26 @@ import vat_protocol as proto       # noqa: E402
 
 log = logging.getLogger("vat-compose")
 
+#: every stream list a Recording holds, by attribute name (used for merging + tagging)
+_STREAM_ATTRS = ("panorama_transmit", "panorama_fullres", "periscope", "pointcloud",
+                 "esdf", "status", "fused", "corrections", "trajectory")
+
+#: identity of a sample, for de-duplicating a stream recorded on BOTH sides of a paired
+#: capture. In a robot+cloud pair the transmit panorama and the fused pose are seen by
+#: both recorders, and simply concatenating them would double every rate in the report
+#: and every asset in the timeline.
+_MERGE_KEY = {
+    "panorama_transmit": ("seq",),
+    "panorama_fullres": ("seq",),
+    "periscope": ("seq", "src_ts_ns"),
+    "fused": ("seq", "src_ts_ns"),
+    "corrections": ("src_ts_ns", "map_version"),
+}
+#: streams with no reliable per-sample identity. The map transport in particular must
+#: come from ONE session: replaying two interleaved copies of pushes and manifest
+#: removals would corrupt the reconstructed map.
+_MERGE_SINGLE = ("pointcloud", "esdf", "status", "trajectory")
+
 MAP_MODES = ("keyframe", "replay", "none")
 LINK_MODES = ("none", "hard", "copy")
 LAYOUTS = ("cloud", "cloud+panorama", "quad")
@@ -98,8 +118,9 @@ class Recording:
     of a recording is blobs, which stay on disk and are referenced by path.
     """
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, extra_roots=()):
         self.root = os.path.abspath(root)
+        self.roots = [self.root]
         if not os.path.isdir(self.root):
             raise SystemExit(f"not a directory: {self.root}")
         self.meta = _read_json(os.path.join(self.root, "meta.json")) or {}
@@ -124,12 +145,24 @@ class Recording:
 
         for rows in (self.panorama_transmit, self.panorama_fullres, self.periscope):
             _coerce_numeric(rows)
+        # Tag every row with the session it came from, so a merged recording can still
+        # resolve each blob against the right root (see `fp`).
+        for attr in _STREAM_ATTRS:
+            for r in getattr(self, attr):
+                r["_root"] = self.root
+
+        # A paired capture: the robot-side recorder holds the full-res panorama, the
+        # cloud-side one holds the map. They share the session clock (both stamp from the
+        # robot capture clock), so absorbing one into the other is just a per-stream
+        # union — no resampling, no clock translation.
+        for extra in extra_roots or ():
+            self.absorb(Recording(extra))
 
         # map_version → capture time, complete for the whole session. The index rows
         # carry the pin they knew about *at write time*, but the first artefacts of a
         # submap are published before its pose_correction/status arrive, so those rows
         # have no pin. MANIFEST.json holds the final table — use it to backfill.
-        self.version_pins = {}
+        self.version_pins = dict(getattr(self, "version_pins_extra", {}) or {})
         for k, v in (self.manifest.get("version_pins") or {}).items():
             try:
                 self.version_pins[int(k)] = v
@@ -175,8 +208,7 @@ class Recording:
         self.missing_blobs = {}
         for attr in ("panorama_transmit", "panorama_fullres"):
             rows = getattr(self, attr)
-            keep = [r for r in rows if not r.get("file")
-                    or os.path.exists(self.p(*str(r["file"]).split("/")))]
+            keep = [r for r in rows if not r.get("file") or os.path.exists(self.fp(r))]
             if len(keep) != len(rows):
                 self.missing_blobs[attr] = len(rows) - len(keep)
                 log.warning(f"[{attr}] {len(rows) - len(keep)} of {len(rows)} indexed "
@@ -184,9 +216,79 @@ class Recording:
                             f"copy) — ignoring those rows")
                 setattr(self, attr, keep)
 
+    # ── merging a paired capture ─────────────────────────────────────────────
+    def absorb(self, other: "Recording") -> None:
+        """Union another session's streams into this one.
+
+        Built for the two-recorder pattern: `--where robot` deliberately does not record
+        the map (the router is on the server, so it would cross the field link inbound),
+        so a full capture is a robot-side session plus a cloud-side one. Both stamp on
+        the same session clock, so each stream is simply taken from whichever session
+        actually has it; when BOTH have rows they are concatenated and re-sorted by
+        timestamp, which is the right answer for a stream that was recorded on both
+        sides. Every row keeps its own `_root`, so blobs still resolve.
+        """
+        self.roots.append(other.root)
+        for attr in _STREAM_ATTRS:
+            mine, theirs = getattr(self, attr), getattr(other, attr)
+            if not theirs:
+                continue
+            if not mine:
+                setattr(self, attr, list(theirs))
+                log.info(f"[merge] {attr}: {len(theirs)} row(s) from "
+                         f"{os.path.basename(other.root)}")
+            elif attr in _MERGE_SINGLE:
+                log.warning(
+                    f"[merge] {attr}: both sessions recorded it; keeping "
+                    f"{os.path.basename(self.root)}'s {len(mine)} row(s) and ignoring "
+                    f"{os.path.basename(other.root)}'s {len(theirs)}. This stream has no "
+                    f"per-sample identity, and interleaving two copies of the map "
+                    f"transport would corrupt a replay.")
+            else:
+                keys = _MERGE_KEY[attr]
+                seen, merged_rows, dupes = {}, [], 0
+                for r in list(mine) + list(theirs):
+                    k = tuple(r.get(c) for c in keys)
+                    prev = seen.get(k)
+                    if prev is None:
+                        seen[k] = r
+                        merged_rows.append(r)
+                        continue
+                    dupes += 1
+                    # Keep whichever copy actually has its blob on disk.
+                    if not prev.get("file") and r.get("file"):
+                        merged_rows[merged_rows.index(prev)] = r
+                        seen[k] = r
+                    elif prev.get("file") and not os.path.exists(self.fp(prev)) \
+                            and r.get("file") and os.path.exists(other.fp(r)):
+                        merged_rows[merged_rows.index(prev)] = r
+                        seen[k] = r
+                setattr(self, attr, merged_rows)
+                log.info(f"[merge] {attr}: {len(mine)} + {len(theirs)} → "
+                         f"{len(merged_rows)} rows ({dupes} duplicate(s) collapsed on "
+                         f"{'+'.join(keys)})")
+        self.version_pins_extra = dict(getattr(other, "version_pins", {}) or {})
+        for k, v in (other.manifest.get("version_pins") or {}).items():
+            try:
+                self.version_pins_extra[int(k)] = v
+            except (TypeError, ValueError):
+                pass
+        self._ts_cache = {}
+
+    @property
+    def merged(self) -> bool:
+        return len(self.roots) > 1
+
     # ── paths ────────────────────────────────────────────────────────────────
     def p(self, *parts: str) -> str:
         return os.path.join(self.root, *parts)
+
+    def fp(self, row: dict, key: str = "file") -> str:
+        """Absolute path of a row's blob, resolved against ITS OWN session root."""
+        rel = row.get(key)
+        if not rel:
+            return ""
+        return os.path.join(row.get("_root") or self.root, *str(rel).split("/"))
 
     def rel(self, *parts: str) -> str:
         return "/".join(parts)
@@ -288,8 +390,9 @@ class Recording:
         return row
 
 
-def load(root: str) -> Recording:
-    return Recording(root)
+def load(root: str, extra_roots=()) -> Recording:
+    """Load one session, optionally merging partner sessions from the same capture."""
+    return Recording(root, extra_roots=extra_roots)
 
 
 def _read_json(path: str) -> Optional[dict]:
@@ -415,6 +518,7 @@ def info(rep: Recording) -> dict:
     return {
         "session_id": rep.session_id,
         "root": rep.root,
+        "merged_roots": rep.roots if rep.merged else None,
         "status": rep.manifest.get("status") or rep.meta.get("status"),
         "stop_reason": rep.manifest.get("stop_reason"),
         "capture": rep.meta.get("capture", {}),
@@ -433,6 +537,9 @@ def print_info(rep: Recording) -> None:
     print(f"\nVAT recording — {i['session_id']}")
     print("=" * 78)
     print(f"  root          {i['root']}")
+    if i.get("merged_roots"):
+        for extra in i["merged_roots"][1:]:
+            print(f"  merged with   {extra}")
     print(f"  status        {i['status']}  ({i['stop_reason']})")
     print(f"  scene         {cap.get('scene')}   family={cap.get('trajectory_family')}"
           f"   pass={cap.get('pass_index')}   seed={cap.get('seed')}")
@@ -489,7 +596,7 @@ def _map_apply(store: bm.ClientBlockStore, rep: Recording, rec: dict) -> bool:
     path = rec.get("file")
     if not path:
         return False
-    full = rep.p(*path.split("/"))
+    full = rep.fp(rec)
     try:
         if kind == "push":
             with open(full, "rb") as f:
@@ -539,7 +646,7 @@ def replay_map(rep: Recording, until_ts_ns: Optional[int] = None
         if rec.get("kind") == "snapshot":
             # A whole-map snapshot supersedes the block state entirely.
             try:
-                with open(rep.p(*rec["file"].split("/")), "rb") as f:
+                with open(rep.fp(rec), "rb") as f:
                     v, xyz, rgb, _snap, _since = proto.unpack_pcd(f.read())
                 store.clear()
                 store.apply_bundle_bytes(bm.pack_bundle(
@@ -574,7 +681,7 @@ def _blocks_from_cloud(xyz, rgb, cube_m: float):
 
 def load_map_npz(rep: Recording, rec: dict) -> Tuple[np.ndarray, np.ndarray, int]:
     """Load a materialised keyframe ``.npz`` → ``(xyz, rgb uint8, map_version)``."""
-    with np.load(rep.p(*rec["file"].split("/"))) as z:
+    with np.load(rep.fp(rec)) as z:
         return (np.asarray(z["points"], np.float32),
                 np.asarray(z["colors"], np.uint8), int(z["map_version"]))
 
@@ -645,7 +752,7 @@ TIMELINE_COLUMNS = [
     "pose_fix", "pose_dt_ms", "pose_interpolated",
     "map_version", "map_capture_ts_ns", "map_keyframe_file", "map_points",
     "map_dt_ms", "map_replay_file",
-    "periscope_segment", "periscope_byte_offset", "periscope_byte_len",
+    "periscope_root", "periscope_segment", "periscope_byte_offset", "periscope_byte_len",
     "periscope_seq", "periscope_keyframe", "periscope_codec", "periscope_dt_ms",
     "periscope_yaw_deg", "periscope_pitch_deg", "periscope_hfov_deg",
     "esdf_npz", "esdf_submap_index", "esdf_dt_ms",
@@ -726,7 +833,7 @@ def export(rep: Recording, out_dir: str, *, fps: float = 10.0, at: str = "unifor
         os.makedirs(frames_dir, exist_ok=True)
 
     rows: List[dict] = []
-    last_linked_src: Optional[str] = None
+    last_linked_src = None            # (rel, abs) of the last frame placed
     n_linked = n_link_holes = 0
     for n, t in enumerate(ticks):
         row = {c: None for c in TIMELINE_COLUMNS}
@@ -779,7 +886,8 @@ def export(rep: Recording, out_dir: str, *, fps: float = 10.0, at: str = "unifor
 
         per = rep.nearest("periscope", t)
         if per:
-            row.update(periscope_segment=per.get("segment"),
+            row.update(periscope_root=per.get("_root"),
+                       periscope_segment=per.get("segment"),
                        periscope_byte_offset=per.get("byte_offset"),
                        periscope_byte_len=per.get("byte_len"),
                        periscope_seq=per.get("seq"),
@@ -808,15 +916,19 @@ def export(rep: Recording, out_dir: str, *, fps: float = 10.0, at: str = "unifor
             # single missing blob would silently truncate the video. Hold the previous
             # frame instead — that is what a video should do across a dropout anyway —
             # and flag the repeat so the timeline stays honest about it.
-            repeated = 0
-            if not src_rel and last_linked_src:
-                src_rel, repeated = last_linked_src, 1
+            src_abs = ""
             if src_rel:
+                src_row = (pfr if src_rel == row["panorama_fullres_file"] else ptx)
+                src_abs = rep.fp(src_row) if src_row else ""
+            repeated = 0
+            if not src_abs and last_linked_src:
+                src_rel, src_abs, repeated = last_linked_src[0], last_linked_src[1], 1
+            if src_abs:
                 dst = os.path.join(frames_dir, f"{n:06d}.jpg")
-                if _place(rep.p(*src_rel.split("/")), dst, link):
+                if _place(src_abs, dst, link):
                     row["linked_frame"] = f"frames/{n:06d}.jpg"
                     row["linked_frame_repeat"] = repeated
-                    last_linked_src = src_rel
+                    last_linked_src = (src_rel, src_abs)
                     n_linked += 1
             if row["linked_frame"] is None:
                 n_link_holes += 1
@@ -866,8 +978,19 @@ def _replay_to_ticks(rep: Recording, ticks: List[int], out_dir: str) -> Dict[int
     out: Dict[int, str] = {}
     ti = 0
     version = -1
+    # The map only changes once per submap (~1 Hz) but ticks run at --fps, so writing a
+    # file per tick would emit thousands of near-identical full-map .npz files — tens of
+    # GB for a five-minute capture. Write one per distinct state and point the
+    # intervening ticks at it.
+    last_written = {"version": None, "rel": None}
+    n_reused = 0
 
     def dump(tick_i: int, t_ns: int) -> None:
+        nonlocal n_reused
+        if last_written["rel"] is not None and last_written["version"] == version:
+            out[t_ns] = last_written["rel"]
+            n_reused += 1
+            return
         merged = store.merged()
         if merged is None:
             with store._lock:                                    # noqa: SLF001
@@ -889,6 +1012,8 @@ def _replay_to_ticks(rep: Recording, ticks: List[int], out_dir: str) -> Dict[int
         with open(os.path.join(os.path.dirname(out_dir), rel), "wb") as f:
             f.write(buf.getvalue())
         out[t_ns] = rel
+        last_written["version"] = version
+        last_written["rel"] = rel
 
     for rec in rep.pointcloud:
         t = rec["_t"]
@@ -897,7 +1022,7 @@ def _replay_to_ticks(rep: Recording, ticks: List[int], out_dir: str) -> Dict[int
             ti += 1
         if rec.get("kind") == "snapshot":
             try:
-                with open(rep.p(*rec["file"].split("/")), "rb") as f:
+                with open(rep.fp(rec), "rb") as f:
                     v, xyz, rgb, _s, _sv = proto.unpack_pcd(f.read())
                 store.clear()
                 store.apply_bundle_bytes(bm.pack_bundle(
@@ -911,6 +1036,9 @@ def _replay_to_ticks(rep: Recording, ticks: List[int], out_dir: str) -> Dict[int
     while ti < len(ticks):                        # remaining ticks see the final map
         dump(ti, ticks[ti])
         ti += 1
+    n_files = len(set(out.values()))
+    log.info(f"[replay] {n_files} distinct map state(s) written for {len(ticks)} ticks "
+             f"({n_reused} ticks reuse an unchanged map)")
     return out
 
 
@@ -1029,7 +1157,7 @@ def periscope_extract(rep: Recording, out_dir: str, *, limit: int = 0,
             if not seg:
                 continue
             if seg not in handles:
-                handles[seg] = open(rep.p(*seg.split("/")), "rb")
+                handles[seg] = open(rep.fp(r, "segment"), "rb")
             f = handles[seg]
             f.seek(int(r["byte_offset"]))
             payload = f.read(int(r["byte_len"]))
@@ -1273,13 +1401,22 @@ def _load_cloud(rep: Recording, work: str, rel: str):
         return None
 
 
+def _seg_abs(rep: Recording, row: dict) -> str:
+    """Absolute path of a timeline row's periscope segment (merge-aware)."""
+    seg = row.get("periscope_segment")
+    if not seg:
+        return ""
+    root = row.get("periscope_root") or rep.root
+    return os.path.join(root, *str(seg).split("/"))
+
+
 def _read_periscope(rep: Recording, handles: dict, row: dict):
     seg = row.get("periscope_segment")
     if not seg:
         return None
     if seg not in handles:
         try:
-            handles[seg] = open(rep.p(*seg.split("/")), "rb")
+            handles[seg] = open(_seg_abs(rep, row), "rb")
         except OSError:
             return None
     f = handles[seg]
@@ -1331,12 +1468,22 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Start with `info`, then `export`. See docs/recording.md.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    def _with(sp):
+        sp.add_argument("--with", dest="partners", action="append", default=[],
+                        metavar="SESSION",
+                        help="merge a partner session from the same capture "
+                             "(repeatable) — e.g. the robot-side full-res recording "
+                             "alongside the cloud-side map recording. Both are on the "
+                             "same session clock, so streams are simply unioned.")
+
     i = sub.add_parser("info", help="summarise a recording and its health")
     i.add_argument("session")
+    _with(i)
     i.add_argument("--json", action="store_true", help="machine-readable output")
 
     e = sub.add_parser("export", help="write aligned per-frame assets on one timeline")
     e.add_argument("session")
+    _with(e)
     e.add_argument("--out", default=None,
                    help="output dir (default <session>/aligned)")
     e.add_argument("--fps", type=float, default=10.0, help="uniform tick rate")
@@ -1363,6 +1510,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     q = sub.add_parser("periscope", help="slice periscope frames out of the stream")
     q.add_argument("session")
+    _with(q)
     q.add_argument("--out", default=None, help="output dir (default <session>/periscope_frames)")
     q.add_argument("--limit", type=int, default=0, help="stop after N frames")
     q.add_argument("--decode", action="store_true",
@@ -1370,6 +1518,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("render", help="render a synchronized demo video (needs Open3D)")
     r.add_argument("session")
+    _with(r)
     r.add_argument("--out", default="demo.mp4")
     r.add_argument("--fps", type=float, default=10.0)
     r.add_argument("--at", choices=("uniform", "panorama"), default="uniform")
@@ -1390,7 +1539,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(),
                         format="[%(levelname)s] %(message)s")
     args = build_parser().parse_args(argv)
-    rep = load(args.session)
+    rep = load(args.session, extra_roots=getattr(args, "partners", []) or [])
 
     if args.cmd == "info":
         if args.json:

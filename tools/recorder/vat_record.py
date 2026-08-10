@@ -84,9 +84,14 @@ DEFAULT_STREAMS = tuple(s for s in STREAMS if s != "panorama_fullres")
 #: is for. So the robot default is the streams the robot itself produces, plus the pose
 #: correction, which the cloud already sends down to the robot anyway (44 bytes).
 #: Record the map from the cloud side, in a second recorder, at the same time.
-DEFAULT_STREAMS_ROBOT = ("panorama_transmit", "panorama_fullres", "periscope", "poses")
-#: streams published by the cloud and consumed by the client — bulk, inbound-to-robot
-CLOUD_BULK_STREAMS = ("pointcloud", "esdf", "status", "trajectory")
+#: `status` is included despite being a cloud stream: it is one small JSON per submap
+#: (~1 Hz) and it is the ONLY source of map_version→capture-time pins, without which a
+#: robot-side recording cannot be placed against the map at all.
+DEFAULT_STREAMS_ROBOT = ("panorama_transmit", "panorama_fullres", "periscope", "poses",
+                        "status")
+#: bulk streams published by the cloud — these are the ones that would cost real
+#: inbound bandwidth on the field link if recorded from the robot side
+CLOUD_BULK_STREAMS = ("pointcloud", "esdf", "trajectory")
 
 TRAJECTORY_FAMILIES = ("smooth", "stop-and-go", "loop", "other")
 
@@ -219,6 +224,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="cube grid size, m — MUST match the server (default $CUBE_SIZE)")
     t.add_argument("--zenoh-mode", choices=("client", "peer"), default=None,
                    help="override the mode implied by --where")
+    t.add_argument("--zenoh-listen", default=None, metavar="ENDPOINT",
+                   help="peer mode only: bind this inbound endpoint. By default the "
+                        "recorder binds NOTHING — it is a pure consumer and never needs "
+                        "inbound peers, and zenoh's default peer listener fails outright "
+                        "on hosts without IPv6 (common in the robot container)")
     t.add_argument("--connect-retries", type=int, default=3,
                    help="Zenoh connect attempts before giving up (default 3)")
 
@@ -341,6 +351,16 @@ def resolve_streams(args) -> set:
     # The map transport carries no timestamps; `status` is the only stream that
     # pins a map_version to a capture time, so recording the cloud without it
     # produces a map you cannot place on the timeline.
+    # Full-res learns which seqs exist from the live transmit stream, and its own
+    # arrivals are lagged by design so they cannot establish the clock baseline. The
+    # transmit stream supplies both — and it is cheap — so it is implied.
+    if ("panorama_fullres" in enabled and "panorama_transmit" not in enabled
+            and "panorama_transmit" not in off):
+        enabled.add("panorama_transmit")
+        log.info("[plan] --panorama-fullres implies --panorama-transmit (it supplies the "
+                 "seq numbers to pull and the clock baseline); --no-panorama-transmit "
+                 "overrides, but then full-res opens its own subscription and the "
+                 "session clock has no baseline")
     if "pointcloud" in enabled and "status" not in enabled and "status" not in off:
         enabled.add("status")
         log.info("[plan] --pointcloud implies --status (it carries the "
@@ -708,6 +728,19 @@ def run_session(args) -> int:
     log.info(f"[vat-record] zenoh {zenoh_mode} → {rcfg.ZENOH_ROUTER}  "
              f"robot={rcfg.ROBOT_NAME}  server={rcfg.SERVER_PREFIX}  "
              f"stream_mode={rcfg.STREAM_MODE} cube={rcfg.CUBE_SIZE}m")
+    # The clock's transport baseline comes from a low-latency source-stamped stream.
+    # Without one, every ts_src=derived timestamp is absent or biased and the map cannot
+    # be placed on the session clock at all — so this is an error, not a warning.
+    baseline = {"poses", "panorama_transmit", "periscope"}.intersection(enabled)
+    if not baseline:
+        raise SystemExit(
+            "no stream can establish the clock baseline.\n"
+            "The map transport carries no timestamps, so its session time is derived from\n"
+            "arrival minus the robot->local offset — and that offset is only learnable from\n"
+            "a low-latency source-stamped stream (--poses, --panorama-transmit or\n"
+            "--periscope). pose_correction cannot supply it: its timestamp is a keyframe\n"
+            "capture time from seconds earlier.\n"
+            "Add --poses (cheap, 30 Hz, and the authoritative trajectory anyway).")
     if args.camera_height is None:
         log.warning("[vat-record] no --camera-height given. That measurement is the "
                     "METRIC-SCALE ANCHOR for this session (roadmap §3.2). The "
@@ -732,6 +765,14 @@ def run_session(args) -> int:
     conf = zenoh.Config()
     conf.insert_json5("connect/endpoints", f'["{rcfg.ZENOH_ROUTER}"]')
     conf.insert_json5("mode", f'"{zenoh_mode}"')
+    if zenoh_mode == "peer":
+        # A peer normally opens an inbound listener; on a host without IPv6 zenoh's
+        # default (tcp/[::]:0) fails to bind and zenoh.open raises outright. The
+        # recorder is a pure consumer, so bind nothing unless asked. Scouting and
+        # gossip still work, which is what makes the local archive pull local.
+        listen = f'["{args.zenoh_listen}"]' if args.zenoh_listen else "[]"
+        conf.insert_json5("listen/endpoints", listen)
+        log.info(f"[vat-record] peer mode, listen={listen} (pure consumer)")
     z = None
     for attempt in range(1, max(1, args.connect_retries) + 1):
         try:

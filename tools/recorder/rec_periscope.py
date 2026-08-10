@@ -141,7 +141,7 @@ class PeriscopeRecorder(StreamRecorder):
             self.frames_before_first_keyframe += 1
 
         if self._seg_f is None or codec != self._seg_codec:
-            if self._seg_codec is not None:
+            if self._seg_codec is not None and codec != self._seg_codec:
                 log.warning(f"[{self.name}] codec changed {self._seg_codec}→{codec} "
                             f"— rolling to a new segment")
             self._open_segment(codec)
@@ -195,6 +195,10 @@ class PeriscopeRecorder(StreamRecorder):
 
     # ── finalisation ─────────────────────────────────────────────────────────
     def close(self) -> None:
+        # Refuse late frames BEFORE tearing the segment down. Zenoh keeps delivering
+        # while we flush and mux; without this a straggler finds no open segment and
+        # starts an empty new one.
+        self._closed = True
         self._close_segment()
         if self.mux_mp4:
             for i, seg in enumerate(self._segments):

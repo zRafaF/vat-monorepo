@@ -99,6 +99,7 @@ class SessionClock:
         self._version_pins: Dict[int, dict] = {}
         # counters for the session manifest
         self.n_source = 0
+        self.n_source_unobserved = 0   # verbatim, but kept out of the offset baseline
         self.n_derived = 0
         self.n_wall = 0
         self._offset_first_s: Optional[float] = None
@@ -147,20 +148,29 @@ class SessionClock:
             return self._offset.to_local_ns(int(session_ns))
 
     # ── stamping ─────────────────────────────────────────────────────────────
-    def stamp(self, src_ts_ns: Optional[int] = None) -> Stamp:
+    def stamp(self, src_ts_ns: Optional[int] = None, *, observe: bool = True) -> Stamp:
         """Build a :class:`Stamp` for a sample arriving now.
 
         Pass the wire's capture timestamp when the message has one — it is used
-        verbatim and also feeds the offset estimator. Pass ``None`` (or 0) for the
-        map-transport messages that carry no timestamp; the session time is then
-        *derived* from arrival and flagged as such.
+        verbatim. Pass ``None`` (or 0) for the map-transport messages that carry no
+        timestamp; the session time is then *derived* from arrival and flagged as such.
+
+        ``observe=False`` records the timestamp verbatim but keeps it OUT of the offset
+        estimator. Required for ``pose_correction``: its timestamp is the capture time
+        of a keyframe the cloud solved seconds ago, so ``arrival − sender`` is dominated
+        by pipeline latency, not transport. Feeding it to a running-minimum filter is
+        harmless while a real low-latency stream is also being observed, but if it were
+        the *only* observed stream the baseline would be inflated by seconds and every
+        derived map timestamp would land far too early.
         """
         wall_ns = self._wall_ns_fn()
         mono_ns = self._mono_ns_fn()
         if src_ts_ns and int(src_ts_ns) > 0:
-            lat_s = self.observe_source(int(src_ts_ns), wall_ns)
+            lat_s = self.observe_source(int(src_ts_ns), wall_ns) if observe else 0.0
             with self._lock:
                 self.n_source += 1
+                if not observe:
+                    self.n_source_unobserved += 1
             return Stamp(int(src_ts_ns), TS_SOURCE, wall_ns, mono_ns, lat_s * 1e3)
         derived = self.to_session_ns(wall_ns)
         if derived is None:
@@ -172,6 +182,16 @@ class SessionClock:
         return Stamp(derived, TS_DERIVED, wall_ns, mono_ns, 0.0)
 
     # ── map_version ↔ capture-time index ─────────────────────────────────────
+    @property
+    def baseline_observed(self) -> bool:
+        """True once a low-latency source-stamped stream has taught us the offset.
+
+        Without it, every ``ts_src=derived`` timestamp is either absent (``wall``) or
+        biased, so the map cannot be placed on the session clock. ``vat_record`` warns
+        at startup when no stream capable of supplying it is enabled.
+        """
+        return self.offset_s is not None
+
     def now_wall_ns(self) -> int:
         return self._wall_ns_fn()
 
@@ -232,6 +252,7 @@ class SessionClock:
         with self._lock:
             return {
                 "stamps_source": self.n_source,
+                "stamps_source_unobserved": self.n_source_unobserved,
                 "stamps_derived": self.n_derived,
                 "stamps_wall": self.n_wall,
                 "offset_s_first_known": self._offset_first_s,
