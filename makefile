@@ -206,6 +206,8 @@ compose: sync-client
 # through the real wire packers, records it, composes it. No robot / Zenoh / GPU.
 record-selftest: sync-client
 	$(CLIENT_RUN) ../tools/recorder/vat_record.py --selftest
+	@echo ">> console smoke test (builds, launches, serves) ..."
+	-cd tools/recorder && uv run python ui.py --selftest
 
 # [ANY] Fake rig: publish synthetic robot+cloud traffic on the REAL Zenoh keys so the
 # recorder's live path (subscriptions, the archive query/reply, the block-repair pull,

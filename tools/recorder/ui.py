@@ -47,6 +47,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -57,6 +58,8 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import rec_config as rcfg          # noqa: F401 — also puts repo/common on sys.path
+
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")   # no telemetry from a lab box
 
 import gradio as gr                # noqa: E402
 
@@ -382,7 +385,7 @@ def make_zip(out_root: str, session_id: str, include_fullres: bool = True):
 
 
 def build_app(con: Console) -> gr.Blocks:
-    with gr.Blocks(title="VAT recorder") as app:
+    with gr.Blocks(title="VAT recorder", analytics_enabled=False) as app:
         gr.Markdown(
             f"# VAT recorder console\n"
             f"`{rcfg.ZENOH_ROUTER}` · robot `{rcfg.ROBOT_NAME}` · server "
@@ -544,13 +547,55 @@ def build_app(con: Console) -> gr.Blocks:
     return app
 
 
+def _selftest() -> int:
+    """Build the app AND actually launch it, then fetch the pages.
+
+    Constructing the Blocks graph is not enough: ``launch()`` has its own keyword
+    surface, and a removed kwarg there (Gradio 6 dropped ``show_api``) only shows up
+    when a real server starts. So this binds a port, serves, and asserts on the HTTP
+    response — which is the cheapest way to catch a Gradio API change before an
+    operator does.
+    """
+    import urllib.request
+    con = Console(os.path.join(tempfile.gettempdir(), "vat-ui-selftest"))
+    app = build_app(con)
+    port = 7899
+    app.launch(server_name="127.0.0.1", server_port=port, prevent_thread_lock=True,
+               theme=gr.themes.Soft(), quiet=True)
+    try:
+        time.sleep(3)
+        for path in ("/", "/config"):
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
+                                        timeout=15) as r:
+                body = r.read()
+                assert r.status == 200 and body, (path, r.status)
+                if path == "/config":
+                    cfg = json.loads(body)
+                    assert cfg.get("title") == "VAT recorder"
+                    assert len(cfg.get("components", [])) > 20, cfg.get("components")
+                    assert cfg.get("analytics_enabled") is False
+        # the polling callback must survive an idle console (no session yet)
+        head, rows = live_view(con)
+        assert "idle" in head and rows == []
+        assert archive_rows(con.out_root) == []
+        assert make_zip(con.out_root, "", True)[0] is None
+        print(f"ui self-test OK  (gradio {gr.__version__}: builds, launches, serves)")
+        return 0
+    finally:
+        app.close()
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Browser console for vat-record.")
+    p.add_argument("--selftest", action="store_true",
+                   help="build + launch + fetch the pages, then exit")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--out", default=None, help="output root (default <repo>/recordings)")
     p.add_argument("--share", action="store_true", help="public gradio tunnel")
     a = p.parse_args(argv)
+    if a.selftest:
+        return _selftest()
     con = Console(a.out or rcfg.DEFAULT_OUT_ROOT)
     log.info(f"[ui] output root {con.out_root}")
     log.info(f"[ui] zenoh {rcfg.ZENOH_ROUTER}  robot={rcfg.ROBOT_NAME}")
@@ -558,7 +603,7 @@ def main(argv=None) -> int:
         log.info("[ui] ffmpeg not on PATH — periscope mp4 remux will be skipped "
                  "(the elementary stream + timestamps CSV are still written)")
     build_app(con).launch(server_name=a.host, server_port=a.port, share=a.share,
-                          theme=gr.themes.Soft(), show_api=False)
+                          theme=gr.themes.Soft(), quiet=False)
     return 0
 
 
