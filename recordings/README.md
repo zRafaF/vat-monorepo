@@ -13,32 +13,48 @@ sessions there without any flag. Everything in `data/` is gitignored; this tool 
 
 ## Play a run back
 
-The easy way — no paths to type: open the recorder console and use the **Replay** tab,
-which lists every recording under `data/` with its duration and size, and prints a
-clickable viewer link once the run is loaded.
+**Run this where the screen is** — your laptop, not the mapping server. Rerun is a desktop
+app, and the default mode is the one Rerun itself recommends
+([operating modes](https://rerun.io/docs/reference/sdk/operating-modes)): `rr.spawn()`
+launches the native viewer — the `rerun` executable that ships inside `rerun-sdk`, so
+`uv run` already has it on `PATH` — and streams the session into it. No browser, no ports.
 
 ```bash
-make record-ui                    # → Replay tab → pick a recording → ▶ Open in Rerun
+make replay                                       # folder picker, then the app opens
+make replay ARGS="--list"                         # what is in data/
+make replay ARGS="--newest"                       # skip the picker
+make replay ARGS="recordings/data/<session_id>"
 ```
 
-From a terminal:
+With no argument you get a native folder picker (Tk) rooted at `data/`; with no GUI it
+falls back to a numbered prompt, and failing that the newest recording. The window
+outlives the command — the data lives in the viewer, not in the script — and if a viewer
+is already open on the port, the session simply appears in it.
+
+The recording is on the headless server instead? Two options, both better than a browser:
 
 ```bash
-make replay ARGS="--list"                                    # what is in data/
-make replay                                                  # the newest recording
-make replay ARGS="recordings/data/<session_id>"              # web viewer, headless-friendly
-make replay ARGS="recordings/data/<session_id> --save run.rrd"
+# on the server
+make replay ARGS="<session> --save /tmp/run.rrd"      # then copy it over…
+# on your laptop
+rerun /tmp/run.rrd                                    # …and scrub it locally
 ```
 
-Then either open the printed URL, or copy the `.rrd` to your own machine and
-`rerun run.rrd` — scrubbing is much nicer locally than over a remote web viewer.
+or point the server at a viewer you already have open (works across the tailnet, and
+`rerun` must be listening — start it, then):
 
-> **The viewer URL must be reachable *from your browser*.** Rerun's web page fetches the
-> data over gRPC from a second port, and that address is resolved by the browser — so on
-> a headless server `localhost` would point at your own laptop and the page would load
-> and then sit empty. Both tools therefore default `--viewer-host` to the router host
-> from `vat.env` (a Tailscale address here), and **both** the viewer port (9090) and the
-> gRPC port (9876) have to be reachable. `--viewer-host` overrides it.
+```bash
+make replay ARGS="<session> --connect rerun+http://<your-laptop>:9876/proxy"
+```
+
+`--serve` still exists (browser viewer, `--viewer-host` for the address the browser should
+use) but needs **two** ports reachable and scrubs poorly; prefer `--save`.
+
+The recorder console's **Replay** tab wraps the same two paths: *Open in Rerun* when the
+console is running on a machine with a screen, *Build .rrd* + download when it is not.
+
+> First run of the viewer prints Rerun's analytics notice; `rerun analytics disable` turns
+> it off for good.
 
 Everything lands on **one timeline** (`session`, the robot capture clock in nanoseconds),
 so the map, the trajectory, the panorama, the periscope and the ESDF all line up. Map

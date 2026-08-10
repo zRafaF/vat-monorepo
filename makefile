@@ -62,7 +62,7 @@ help:
 	@echo "  make rig             [ANY]    fake robot+cloud on the real Zenoh keys (test the live path)"
 	@echo "  make record-ui       [ANY]    browser console: start/stop, live progress, fetch full-res, zip"
 	@echo "  make backfill        [ANY]    fetch full-res panoramas into a FINISHED recording"
-	@echo "  make replay          [ANY]    play a recorded session back in Rerun (map, poses, panorama, ESDF)"
+	@echo "  make replay          [CLIENT] play a recorded session back in the Rerun app (run it where the screen is)"
 	@echo "                                ARGS=\"recordings/data/<id> --save run.rrd\""
 	@echo "                                ARGS=\"recordings/<id> --every 2\""
 	@echo "  make periscope-probe [CLIENT] headless periscope stream check (ARGS=\"--decode --save f.png\")"
@@ -241,11 +241,15 @@ record-ui: sync-recorder
 	@echo ">> Recorder console on :7860 (share URL printed): start/stop, live progress, fetch full-res, zips."
 	cd tools/recorder && uv run python ui.py $(ARGS)
 
-# [ANY] Play a recorded session back in Rerun: the map growing, the trajectory walked,
-# the panorama, the periscope and the ESDF, all on the ONE session timeline. Reads only
-# what the recorder wrote -- no robot, no Zenoh, no mapping server. See recordings/README.md.
-#   make replay ARGS="recordings/data/<id>"                  # web viewer (headless-friendly)
-#   make replay ARGS="recordings/data/<id> --save run.rrd"    # then: rerun run.rrd
+# [CLIENT] Play a recorded session back in the Rerun app: the map growing, the trajectory
+# walked, the panorama, the periscope and the ESDF, all on the ONE session timeline. Reads
+# only what the recorder wrote -- no robot, no Zenoh, no mapping server. RUN THIS WHERE THE
+# SCREEN IS (your laptop): the default mode launches the native Rerun viewer. On a headless
+# box use --save and open the .rrd locally. See recordings/README.md.
+#   make replay                                              # folder picker, then Rerun opens
+#   make replay ARGS="--list"                                # what is in recordings/data/
+#   make replay ARGS="recordings/data/<id>"
+#   make replay ARGS="recordings/data/<id> --save run.rrd"   # headless: then `rerun run.rrd`
 replay: sync-replay
 	cd recordings && uv run python replay.py $(ARGS)
 

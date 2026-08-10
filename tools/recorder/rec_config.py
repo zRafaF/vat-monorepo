@@ -257,6 +257,42 @@ def viewer_host(router: str = "") -> str:
         return "localhost"
 
 
+REPLAY_DIR = os.path.join(REPO_ROOT, "recordings")
+
+
+def viewer_executable(name: str = "rerun") -> str:
+    """Path to the native Rerun Viewer, or ``''`` if it cannot be found.
+
+    Looks on ``PATH`` first, then inside the ``recordings/`` uv project — ``rerun-sdk``
+    installs the viewer binary there, and that directory is *not* on ``PATH`` when the
+    recorder console (a different uv project) is the one asking.
+    """
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return name if os.path.exists(name) else ""
+    import shutil
+    found = shutil.which(name)
+    if found:
+        return found
+    for sub in ("bin", "Scripts"):
+        for ext in ("", ".exe"):
+            cand = os.path.join(REPLAY_DIR, ".venv", sub, name + ext)
+            if os.path.exists(cand):
+                return cand
+    return ""
+
+
+def has_display() -> bool:
+    """Can a GUI window appear on *this* machine?
+
+    Windows and macOS always can. On Linux it needs X or Wayland, which a headless
+    mapping server has not got — the case where "open the viewer" cannot work and the
+    answer is an ``.rrd`` file instead.
+    """
+    if sys.platform in ("win32", "darwin"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
 def zenoh_summary(keys_subscribed, keys_queried) -> dict:
     """The transport block of ``meta.json``: what we listened to, verbatim."""
     return {
@@ -295,6 +331,9 @@ def _selftest() -> None:
     lo = viewer_host("tcp/127.0.0.1:7447")     # loopback router → hostname fallback
     assert lo and ":" not in lo and "/" not in lo, lo
     assert viewer_host()
+    assert viewer_executable("definitely-not-a-real-binary") == ""
+    assert viewer_executable("/nonexistent/rerun") == ""
+    assert isinstance(has_display(), bool)
     p = session_provenance()
     assert "mapping_config_hash" in p and "git" in p
     print(f"rec_config self-test OK  (robot={ROBOT_NAME} server={SERVER_PREFIX} "

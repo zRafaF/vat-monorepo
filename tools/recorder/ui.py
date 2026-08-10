@@ -124,8 +124,9 @@ class Console:
         # yesterday's walk while today's is being captured.
         self.replay_proc: Optional[subprocess.Popen] = None
         self.replay_lines: List[str] = []
-        self.replay_url = ""
         self.replay_session = ""
+        self.replay_mode = "viewer"
+        self.replay_rrd = ""
         self.replay_ready = False
         self._rlock = threading.Lock()
 
@@ -275,35 +276,51 @@ class Console:
         threading.Thread(target=work, daemon=True).start()
         return f"fetching full-res for {os.path.basename(session)}…"
 
-    # ── replay in Rerun ──────────────────────────────────────────────────────
+    # ── replay: hand the session to Rerun ────────────────────────────────────
+    # Two shapes, because the console runs in two places. On a machine with a screen
+    # (a laptop) 'viewer' opens the native Rerun app directly. On the headless server
+    # 'rrd' builds a file you download and open with `rerun run.rrd` at home. There is
+    # deliberately no embedded browser viewer any more: it needed two ports open and
+    # scrubbed badly. See recordings/replay.py.
     @property
     def replaying(self) -> bool:
         return self.replay_proc is not None and self.replay_proc.poll() is None
 
-    def start_replay(self, session_id: str, *, map_mode: str = "keyframe",
-                     panorama: str = "auto", port: int = 9090,
-                     grpc_port: int = 9876, host: str = "",
-                     max_points: int = 300_000, skip=()) -> str:
+    def start_replay(self, session_id: str, *, mode: str = "viewer",
+                     map_mode: str = "keyframe", panorama: str = "auto",
+                     max_points: int = 300_000, memory_limit: str = "75%",
+                     skip=()) -> str:
         if self.replaying:
-            return "⚠️ a replay is already running — Stop it first (or reuse its link)."
+            return "⚠️ a replay is already being prepared — wait for it to finish."
         if not session_id:
             return "pick a recording first."
         session = os.path.join(self.out_root, session_id)
         if not os.path.isdir(session):
             return f"no such recording: {session_id}"
-        # The host goes into the URL the *browser* uses for the gRPC stream, so it must be
-        # reachable from the browser — never 'localhost'. See rec_config.viewer_host.
-        host = (host or "").strip() or rcfg.viewer_host()
-        cmd = replay_cmd() + [
-            session, "--viewer-host", host,
-            "--port", str(int(port)), "--grpc-port", str(int(grpc_port)),
-            "--map", str(map_mode), "--panorama", str(panorama),
-            "--max-points", str(int(max_points))]
+        cmd = replay_cmd() + [session, "--map", str(map_mode),
+                              "--panorama", str(panorama),
+                              "--max-points", str(int(max_points))]
+        self.replay_rrd = ""
+        if mode == "rrd":
+            rrds = os.path.join(self.out_root, "_rrd")
+            os.makedirs(rrds, exist_ok=True)
+            self.replay_rrd = os.path.join(rrds, f"{session_id}.rrd")
+            cmd += ["--save", self.replay_rrd]
+        else:
+            if not rcfg.viewer_executable():
+                return ("❌ the Rerun viewer is not installed yet — run "
+                        "`make sync-replay` (or `cd recordings && uv sync`) once.")
+            if not rcfg.has_display():
+                return ("❌ this machine has no screen, so no Rerun window can open. "
+                        "Use **Build .rrd**, download it, and open it on your laptop "
+                        "with `rerun <file>.rrd` — or run this console there.")
+            cmd += ["--memory-limit", str(memory_limit)]
         for s in (skip or ()):
             cmd += ["--skip", str(s)]
         with self._rlock:
             self.replay_lines = [f"$ {' '.join(cmd)}", ""]
         self.replay_ready = False
+        self.replay_mode = mode
         try:
             self.replay_proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -311,9 +328,10 @@ class Console:
         except Exception as e:                                  # noqa: BLE001
             return f"❌ could not start the replay: {e}"
         threading.Thread(target=self._drain_replay, daemon=True).start()
-        self.replay_url = f"http://{host}:{int(port)}"
         self.replay_session = session_id
-        return f"⏳ loading `{session_id}` into Rerun…"
+        return (f"⏳ writing an .rrd for `{session_id}`…" if mode == "rrd"
+                else f"⏳ loading `{session_id}` — the Rerun window will open when the "
+                     f"whole session is in it…")
 
     def _drain_replay(self) -> None:
         p = self.replay_proc
@@ -324,47 +342,30 @@ class Console:
             with self._rlock:
                 self.replay_lines.append(line)
                 del self.replay_lines[:-400]
-            # replay.py logs '[replay] open  http://…' only once the whole recording is
-            # in the viewer's store, which is the moment the link is worth clicking.
-            if "[replay] open" in line:
-                self.replay_ready = True
         code = p.wait()
         with self._rlock:
             self.replay_lines.append(f"— replay exited with code {code} —")
-        self.replay_ready = False
-
-    def stop_replay(self) -> str:
-        if not self.replaying:
-            return "no replay running."
-        try:
-            self.replay_proc.send_signal(signal.SIGINT)
-        except Exception as e:                                  # noqa: BLE001
-            return f"could not signal the replay: {e}"
-        for _ in range(50):
-            if self.replay_proc.poll() is not None:
-                break
-            time.sleep(0.1)
-        if self.replay_proc.poll() is None:
-            self.replay_proc.terminate()
-        self.replay_ready = False
-        self.replay_url = ""
-        return "■ replay stopped."
+        self.replay_ready = (code == 0)
 
     def replay_log(self) -> str:
         with self._rlock:
             return "\n".join(self.replay_lines[-200:])
 
     def replay_view(self) -> tuple:
-        """(status markdown, link markdown) for the Replay tab."""
+        """(status markdown, file for download or None) for the Replay tab."""
         if self.replaying:
-            if self.replay_ready:
-                return (f"🟢 serving `{self.replay_session}`",
-                        f"### 👉 [{self.replay_url}]({self.replay_url})\n\n"
-                        f"Opens the Rerun web viewer. Both this port and the gRPC port "
-                        f"must be reachable from the machine you are browsing from.")
-            return (f"⏳ loading `{self.replay_session}` into Rerun — "
-                    f"big maps and full-res panoramas take a while…", "")
-        return ("idle", "")
+            return ((f"⏳ preparing `{self.replay_session}` — a long walk with full-res "
+                     f"panoramas takes a while"), None)
+        if not self.replay_session:
+            return ("idle", None)
+        if not self.replay_ready:
+            return (f"❌ `{self.replay_session}` failed — see the log below.", None)
+        if self.replay_mode == "rrd" and os.path.exists(self.replay_rrd):
+            return (f"✔ `{os.path.basename(self.replay_rrd)}` "
+                    f"({rcfg.human_size(os.path.getsize(self.replay_rrd))}) — download it "
+                    f"and open it with `rerun <file>.rrd`", self.replay_rrd)
+        return (f"✔ `{self.replay_session}` is in the Rerun window — scrub it there.",
+                None)
 
     # ── PRISM map reset (the one publishing control) ──────────────────────────
     def reset_map(self) -> str:
@@ -649,23 +650,31 @@ def build_app(con: Console) -> gr.Blocks:
             zip_file = gr.File(label="Download", interactive=False)
 
         with gr.Tab("Replay"):
+            local = bool(rcfg.viewer_executable()) and rcfg.has_display()
             gr.Markdown(
                 "#### Play a recording back in Rerun\n"
-                "Pick a recording and press the button — the map growing, the trajectory "
-                "walked, the panorama, the periscope and the ESDF, all on one timeline "
-                "(the robot capture clock). Nothing touches the robot or the bus.\n\n"
-                "This spawns `recordings/replay.py` in its own uv project, exactly as "
-                "`make replay` does. Loading takes a while for a long walk; the link "
-                "appears when the viewer is actually ready.")
+                "The map growing, the trajectory walked, the panorama, the periscope and "
+                "the ESDF, all on one timeline (the robot capture clock). Nothing touches "
+                "the robot or the bus — this only reads what was recorded.\n\n"
+                + ("**This machine has a screen**, so *Open in Rerun* launches the Rerun "
+                   "app right here."
+                   if local else
+                   "**This machine has no screen** (or no viewer installed), so use "
+                   "*Build .rrd*, download the file, and open it on your laptop with "
+                   "`rerun <file>.rrd`. Rerun is a desktop app — that is the good path, "
+                   "not a workaround."))
             with gr.Row():
                 rpick = gr.Dropdown(label="Recording", choices=[], interactive=True,
                                     scale=4)
                 btn_rrefresh = gr.Button("↻ Refresh", scale=1)
             with gr.Row():
-                btn_replay = gr.Button("▶ Open in Rerun", variant="primary", scale=2)
-                btn_replay_stop = gr.Button("■ Stop replay", variant="stop", scale=1)
+                btn_replay = gr.Button("▶ Open in Rerun (this machine)",
+                                       variant="primary" if local else "secondary",
+                                       scale=2)
+                btn_rrd = gr.Button("📦 Build .rrd to download",
+                                    variant="secondary" if local else "primary", scale=2)
             rstatus = gr.Markdown("idle")
-            rlink = gr.Markdown("")
+            rrd_file = gr.File(label="Download the .rrd", interactive=False)
             with gr.Accordion("Advanced", open=False):
                 with gr.Row():
                     rmap = gr.Radio(("keyframe", "replay", "none"), value="keyframe",
@@ -680,13 +689,8 @@ def build_app(con: Console) -> gr.Blocks:
                 with gr.Row():
                     rmax = gr.Number(label="max points per cloud frame", value=300000,
                                      precision=0)
-                    rport = gr.Number(label="viewer port", value=9090, precision=0)
-                    rgrpc = gr.Number(label="gRPC port", value=9876, precision=0)
-                rhost = gr.Textbox(
-                    label="Host your browser should use", value=rcfg.viewer_host(),
-                    info="Goes into the viewer URL and is resolved BY YOUR BROWSER, so "
-                         "'localhost' would point at your own machine. Defaults to the "
-                         "router host from vat.env.")
+                    rmem = gr.Textbox(label="viewer memory limit", value="75%",
+                                      info="Rerun drops the oldest data past this")
             rlog = gr.Textbox(label="Replay log", lines=10, max_lines=10,
                               autoscroll=True)
 
@@ -752,13 +756,18 @@ def build_app(con: Console) -> gr.Blocks:
 
         # ── replay ───────────────────────────────────────────────────────────
         btn_rrefresh.click(lambda r: picker_update(con.out_root, r), [rpick], [rpick])
-        btn_replay.click(
-            lambda sid, m, pano, skip, mx, port, grpc, host: con.start_replay(
-                sid, map_mode=m, panorama=pano, skip=skip or (),
-                max_points=int(mx or 0), port=int(port or 9090),
-                grpc_port=int(grpc or 9876), host=host or ""),
-            [rpick, rmap, rpano, rskip, rmax, rport, rgrpc, rhost], rstatus)
-        btn_replay_stop.click(lambda: con.stop_replay(), None, rstatus)
+
+        def on_replay(mode):
+            def go(sid, m, pano, skip, mx, mem):
+                return con.start_replay(sid, mode=mode, map_mode=m, panorama=pano,
+                                        skip=skip or (), max_points=int(mx or 0),
+                                        memory_limit=mem or "75%")
+            return go
+
+        btn_replay.click(on_replay("viewer"),
+                         [rpick, rmap, rpano, rskip, rmax, rmem], rstatus)
+        btn_rrd.click(on_replay("rrd"),
+                      [rpick, rmap, rpano, rskip, rmax, rmem], rstatus)
 
         def tick():
             head, rows = live_view(con)
@@ -767,11 +776,11 @@ def build_app(con: Console) -> gr.Blocks:
             if bs["running"] and bs.get("total"):
                 bmsg = (f"⏳ {bs['done']}/{bs['total']} · "
                         f"{rcfg.human_size(bs['bytes'])}")
-            rstat, rl = con.replay_view()
-            return head, rows, con.log_text(), bmsg, rstat, rl, con.replay_log()
+            rstat, rrd = con.replay_view()
+            return head, rows, con.log_text(), bmsg, rstat, rrd, con.replay_log()
 
         gr.Timer(2.0).tick(tick, None, [headline, table, logbox, bf_status,
-                                        rstatus, rlink, rlog])
+                                        rstatus, rrd_file, rlog])
         app.load(lambda: (archive_rows(con.out_root), picker_update(con.out_root),
                           picker_update(con.out_root)), None, [arch, pick, rpick])
     return app
@@ -809,7 +818,7 @@ def _selftest() -> int:
         # the polling callback must survive an idle console (no session yet)
         head, rows = live_view(con)
         assert "idle" in head and rows == []
-        assert con.replay_view() == ("idle", "")
+        assert con.replay_view() == ("idle", None)
         assert make_zip(con.out_root, "", True)[0] is None
         # the picker must degrade to "nothing to pick" rather than raising, and the
         # replay buttons must refuse an empty selection instead of spawning a process
@@ -817,7 +826,7 @@ def _selftest() -> int:
         assert picker_update(con.out_root)["value"] is None
         assert "pick a recording" in con.start_replay("")
         assert "no such recording" in con.start_replay("nope")
-        assert con.replay_proc is None and "no replay running" in con.stop_replay()
+        assert con.replay_proc is None, "a refused replay must not spawn anything"
         # …and it must label a real session directory, value = the plain directory name
         sid = "2026-08-08T00-00-00_selftest"
         os.makedirs(os.path.join(con.out_root, sid), exist_ok=True)
@@ -830,6 +839,12 @@ def _selftest() -> int:
         assert picker_update(con.out_root)["value"] == sid
         assert picker_update(con.out_root, "gone")["value"] == sid   # stale → newest
         assert replay_cmd()[-1].endswith("replay.py")
+        # "Open in Rerun" must refuse on a machine that cannot show a window, and say
+        # which of the two reasons it is — never spawn a viewer into the void.
+        if not rcfg.has_display():
+            msg = con.start_replay(sid, mode="viewer")
+            assert "no screen" in msg or "not installed" in msg, msg
+            assert con.replay_proc is None
         shutil.rmtree(os.path.join(con.out_root, sid), ignore_errors=True)
         print(f"ui self-test OK  (gradio {gr.__version__}: builds, launches, serves)")
         return 0

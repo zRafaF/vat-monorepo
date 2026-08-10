@@ -12,8 +12,24 @@ This is the "did we actually capture the run?" tool, and the one to reach for wh
 picking the stretch of a walk to build the paper's figure from. It reads only what
 ``vat_record`` wrote — no robot, no Zenoh, no mapping server.
 
-    make replay ARGS="recordings/data/<session_id>"          # serve a web viewer
-    make replay ARGS="recordings/data/<session_id> --save run.rrd"
+    make replay                       # folder picker, then the Rerun app opens
+    make replay ARGS="recordings/data/<session_id>"
+    make replay ARGS="--list"         # what is in recordings/data/
+
+**Run this on a machine with a screen.** The default mode is Rerun's own recommended one
+(`rr.spawn`): it launches the native Rerun Viewer — the ``rerun`` executable that ships
+inside ``rerun-sdk``, so ``uv run`` already has it on ``PATH`` — and streams the session
+into it. Nothing to open in a browser, nothing to port-forward. The window stays up after
+this script exits, because the data lives in the viewer, not here.
+
+The other modes exist for when the recording is on a headless box:
+
+* ``--save run.rrd`` writes a file; copy it to your laptop and ``rerun run.rrd``. With
+  ``--open`` it opens the file here instead.
+* ``--connect`` streams into a viewer you already have open (``rerun --serve`` /
+  ``rerun``), including one across a tailnet.
+* ``--serve`` is the old browser path, kept as a last resort. It needs *two* ports open to
+  your browser and is much worse to scrub; prefer ``--save``.
 
 What gets logged
 ----------------
@@ -34,10 +50,6 @@ What gets logged
 Everything is stamped on the ``session`` timeline in nanoseconds. Map artefacts use
 ``capture_ts_ns`` (the true capture time of that map version) rather than arrival, so the
 map lines up with where the robot actually was — see ``docs/recording.md``.
-
-Headless server? ``--serve`` (the default) prints a URL you open in a browser. ``--save``
-writes an ``.rrd`` you can open later with ``rerun run.rrd`` on your own machine, which is
-usually nicer for scrubbing.
 """
 
 from __future__ import annotations
@@ -374,12 +386,87 @@ def replay(session: str, *, partners=(), map_mode: str = "keyframe",
 
 
 def viewer_host() -> str:
-    """An address the *browser* can reach this machine on.
+    """An address the *browser* can reach this machine on (``--serve`` only).
 
     Lives in ``rec_config`` so the recorder console (``tools/recorder/ui.py``) and this
     tool cannot disagree about the URL they hand the operator.
     """
     return rcfg.viewer_host()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Where the data goes: the native viewer, a file, or (last resort) a browser
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def viewer_executable(name: str = "rerun") -> str:
+    """Path to the native Rerun Viewer, or ``''``.
+
+    ``rr.spawn`` searches ``PATH`` for this; ``rerun-sdk`` installs it into this project's
+    ``bin``/``Scripts``, so ``uv run`` finds it without anything extra. Resolving it
+    ourselves first only exists so we can say *why* the window did not open. Shared with
+    the recorder console via ``rec_config``.
+    """
+    return rcfg.viewer_executable(name)
+
+
+def has_display() -> bool:
+    """Can a GUI window actually appear on this machine? (see ``rec_config``)"""
+    return rcfg.has_display()
+
+
+def port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
+    """Is something accepting connections there? Used to tell "the viewer opened" from
+    "the viewer died on startup", which otherwise looks identical from this side."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def pick_session_dialog(root_dir: str) -> str:
+    """A native folder picker for choosing ``recordings/data/<session_id>``.
+
+    Deliberately a *system* dialog rather than anything web: this tool is meant to be run
+    on the machine with the screen, and a real file browser is what you want when you are
+    hunting for "the one from yesterday afternoon". Returns ``''`` when there is no GUI or
+    no Tk (both perfectly normal), and the caller falls back to a numbered prompt.
+    """
+    if not has_display():
+        return ""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:                                    # noqa: BLE001
+        return ""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.update()
+        chosen = filedialog.askdirectory(
+            initialdir=root_dir if os.path.isdir(root_dir) else os.getcwd(),
+            title="Choose a recorded session  (recordings/data/<session_id>)",
+            mustexist=True)
+        root.destroy()
+    except Exception:                                    # noqa: BLE001
+        return ""
+    return chosen or ""
+
+
+def prompt_session(sessions) -> str:
+    """Numbered fallback picker, for a terminal with no GUI."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return ""
+    print(f"\nrecordings under {rcfg.DEFAULT_OUT_ROOT}:\n")
+    for i, (name, when, size) in enumerate(sessions):
+        print(f"  [{i}] {name:<48} {when}  {rcfg.human_size(size)}")
+    try:
+        raw = input("\nwhich one? [0] ").strip() or "0"
+        return os.path.join(rcfg.DEFAULT_OUT_ROOT, sessions[int(raw)][0])
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        return ""
 
 
 def list_sessions():
@@ -412,23 +499,42 @@ def main(argv=None) -> int:
         prog="replay",
         description="Play a recorded VAT session back in Rerun.")
     p.add_argument("session", nargs="?", default=None,
-                   help="recordings/data/<session_id>; omit to use the newest, or pass "
-                        "--list to see what is there")
+                   help="recordings/data/<session_id>; omit for a folder picker "
+                        "(--newest to skip it, --list to just see what is there)")
     p.add_argument("--list", action="store_true",
                    help="list the recordings under the output root and exit")
-    p.add_argument("--viewer-host", default=None, metavar="HOST",
-                   help="host the BROWSER should use to reach the gRPC stream. Defaults "
-                        "to the router host from vat.env, because 'localhost' would "
-                        "resolve on the machine running the browser, not on the server")
+    p.add_argument("--newest", action="store_true",
+                   help="use the most recent recording without asking")
     p.add_argument("--with", dest="partners", action="append", default=[],
                    metavar="SESSION",
                    help="merge a partner session from the same capture (repeatable)")
-    p.add_argument("--save", default=None, metavar="FILE.rrd",
-                   help="write an .rrd instead of serving — open it later with "
-                        "`rerun FILE.rrd`, which scrubs much better locally")
-    p.add_argument("--serve", action="store_true",
-                   help="serve a web viewer (the default when --save is not given)")
-    p.add_argument("--port", type=int, default=9090, help="web viewer port")
+
+    g = p.add_argument_group(
+        "where to send it",
+        "Default: open the native Rerun Viewer on THIS machine and stream into it "
+        "(rr.spawn — Rerun's recommended mode). The rest are for a headless box.")
+    g.add_argument("--save", default=None, metavar="FILE.rrd",
+                   help="write an .rrd instead of opening a viewer — copy it to a "
+                        "machine with a screen and run `rerun FILE.rrd`")
+    g.add_argument("--open", dest="open_saved", action="store_true",
+                   help="with --save, also open the file in the viewer here afterwards")
+    g.add_argument("--connect", nargs="?", const="", default=None, metavar="URL",
+                   help="stream into a viewer that is ALREADY running instead of "
+                        "spawning one (default rerun+http://127.0.0.1:9876/proxy)")
+    g.add_argument("--serve", action="store_true",
+                   help="last resort: serve a browser viewer from this machine. Needs "
+                        "BOTH ports reachable from the browser and scrubs poorly — "
+                        "prefer --save")
+    g.add_argument("--memory-limit", default="75%",
+                   help="cap the viewer's memory; it drops the oldest data past this "
+                        "(default 75%% of system RAM)")
+    g.add_argument("--viewer-exe", default="rerun", metavar="NAME_OR_PATH",
+                   help="the viewer executable rr.spawn should launch")
+    p.add_argument("--viewer-host", default=None, metavar="HOST",
+                   help="--serve only: host the BROWSER should use to reach the gRPC "
+                        "stream. Defaults to the router host from vat.env, because "
+                        "'localhost' resolves on the browser's machine, not the server")
+    p.add_argument("--port", type=int, default=9090, help="--serve web viewer port")
     p.add_argument("--grpc-port", type=int, default=9876)
     p.add_argument("--map", dest="map_mode", choices=("keyframe", "replay", "none"),
                    default="keyframe",
@@ -448,6 +554,7 @@ def main(argv=None) -> int:
                    help="omit a stream (repeatable) — handy when one is huge")
     a = p.parse_args(argv)
 
+    # ── which recording ──────────────────────────────────────────────────────
     if a.list or not a.session:
         sessions = list_sessions()
         if not sessions:
@@ -458,16 +565,69 @@ def main(argv=None) -> int:
                 print(f"  [{i}] {name:<48} {when}  {rcfg.human_size(size)}")
             print()
             return 0
-        a.session = os.path.join(rcfg.DEFAULT_OUT_ROOT, sessions[0][0])
-        log.info(f"[replay] no session given — using the newest: {sessions[0][0]}")
+        if a.newest:
+            a.session = os.path.join(rcfg.DEFAULT_OUT_ROOT, sessions[0][0])
+            log.info(f"[replay] newest: {sessions[0][0]}")
+        else:
+            a.session = (pick_session_dialog(rcfg.DEFAULT_OUT_ROOT)
+                         or prompt_session(sessions))
+            if not a.session:
+                a.session = os.path.join(rcfg.DEFAULT_OUT_ROOT, sessions[0][0])
+                log.info(f"[replay] nothing picked — using the newest: "
+                         f"{sessions[0][0]}")
+    a.session = os.path.normpath(a.session)
+    if not os.path.isdir(a.session):
+        raise SystemExit(f"not a recording directory: {a.session}")
+    if not any(os.path.exists(os.path.join(a.session, f))
+               for f in ("MANIFEST.json", "meta.json")):
+        log.warning(f"[replay] {a.session} has no MANIFEST.json/meta.json — is this a "
+                    f"session directory, or its parent?")
+
+    # ── which sink ───────────────────────────────────────────────────────────
+    mode = ("save" if a.save else "serve" if a.serve
+            else "connect" if a.connect is not None else "viewer")
+    exe = viewer_executable(a.viewer_exe)
+    if mode == "viewer":
+        # Say exactly what is missing instead of letting rr.spawn fail obscurely — the
+        # usual cause is running this on the headless server rather than on a laptop.
+        if not exe:
+            raise SystemExit(
+                f"cannot find the Rerun Viewer executable {a.viewer_exe!r} on PATH.\n"
+                f"  `make replay` runs inside recordings/ where rerun-sdk provides it — "
+                f"try `cd recordings && uv sync` first,\n"
+                f"  or pass --viewer-exe /path/to/rerun, or use --save run.rrd.")
+        if not has_display():
+            raise SystemExit(
+                "no display on this machine, so no viewer window can open.\n"
+                "  Replay is meant to run where the screen is: copy the session to your "
+                "laptop and `make replay` there,\n"
+                "  or from here:  --save run.rrd   (then `rerun run.rrd` on the laptop)"
+                "   ·   --serve   (browser, needs two ports open)")
 
     # No '/' in the application id: Rerun 0.36 migrates such names and warns.
-    name = f"vat_replay_{os.path.basename(os.path.normpath(a.session))}"
+    name = f"vat_replay_{os.path.basename(a.session)}"
     rr.init(name, spawn=False)
-    if a.save:
+    if mode == "save":
         rr.save(a.save)
+    elif mode == "viewer":
+        # rr.spawn is Rerun's own recommended mode: it launches the native viewer and
+        # streams to it over gRPC. detach_process (the default) is what lets the window
+        # outlive this script, and an already-open viewer on the port simply receives the
+        # data instead of a second one starting.
+        log.info(f"[replay] opening the Rerun Viewer ({exe}) — the window stays open "
+                 f"after this finishes")
+        rr.spawn(port=a.grpc_port, memory_limit=a.memory_limit,
+                 hide_welcome_screen=True, executable_path=exe)
+    elif mode == "connect":
+        url = a.connect or f"rerun+http://127.0.0.1:{a.grpc_port}/proxy"
+        if not a.connect and not port_open(a.grpc_port):
+            raise SystemExit(
+                f"nothing is listening on 127.0.0.1:{a.grpc_port}, so there is no viewer "
+                f"to connect to.\n  Start one first (`rerun`), or drop --connect and let "
+                f"this open its own.")
+        log.info(f"[replay] streaming into the viewer at {url}")
+        rr.connect_grpc(url)
     else:
-        # Headless-friendly: serve gRPC, then a web viewer pointed at it.
         rr.serve_grpc(grpc_port=a.grpc_port)
 
     replay(a.session, partners=a.partners, map_mode=a.map_mode,
@@ -475,19 +635,47 @@ def main(argv=None) -> int:
            pose_decimate=a.pose_every, pano_decimate=a.panorama_every,
            peri_decimate=a.periscope_every, skip=set(a.skip))
 
-    if a.save:
-        log.info(f"[replay] wrote {a.save} — open with:  rerun {a.save}")
+    if mode in ("viewer", "connect", "save"):
+        # Flush and close the sink before exiting: with a file this closes it cleanly, and
+        # with the viewer it guarantees the last batch left this process.
+        rr.disconnect()
+        if mode == "save":
+            size = rcfg.human_size(os.path.getsize(a.save)) \
+                if os.path.exists(a.save) else "?"
+            log.info(f"[replay] wrote {a.save} ({size}) — open it with:  rerun {a.save}")
+            if a.open_saved:
+                if not exe:
+                    log.warning("[replay] --open: no viewer executable found")
+                else:
+                    import subprocess
+                    log.info(f"[replay] opening {a.save}")
+                    subprocess.Popen([exe, a.save])
+        elif not port_open(a.grpc_port):
+            # The viewer is a separate process: if it fell over on startup (a graphics
+            # driver it cannot use is the classic one) this side happily "logs" into a
+            # socket that nobody is holding. Say so instead of claiming success.
+            log.error(
+                f"nothing is listening on 127.0.0.1:{a.grpc_port} — the viewer process "
+                f"exited instead of opening a window, so NOTHING was displayed.\n"
+                f"  Its own error is above (a graphics/driver complaint is the usual "
+                f"one; try `{exe}` on its own to see it).\n"
+                f"  Meanwhile:  --save run.rrd  captures the same replay to a file.")
+            return 2
+        else:
+            log.info("[replay] streamed into the viewer — scrub it there. "
+                     "(This process is done; the window is not.)")
         return 0
-    # `connect_to` is resolved BY THE BROWSER, so it must be an address the browser can
-    # reach. "localhost" would point at whatever machine you are browsing from — which
-    # is why the page loaded but never showed any data.
+
+    # --serve: `connect_to` is resolved BY THE BROWSER, so it must be an address the
+    # browser can reach. "localhost" points at whatever machine you are browsing from —
+    # which is why the page used to load and then show nothing.
     host = a.viewer_host or viewer_host()
     rr.serve_web_viewer(web_port=a.port, open_browser=False,
                         connect_to=f"rerun+http://{host}:{a.grpc_port}/proxy")
     log.info(f"[replay] open  http://{host}:{a.port}   (streaming from "
              f"{host}:{a.grpc_port})")
-    log.info("[replay] both ports must be reachable from your browser; "
-             "--viewer-host overrides. Ctrl-C to stop.")
+    log.info("[replay] BOTH ports must be reachable from your browser; --viewer-host "
+             "overrides. Ctrl-C to stop.")
     try:
         import time
         while True:
