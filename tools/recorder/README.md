@@ -89,6 +89,9 @@ correction arrives).
 | `rec_periscope.py` | periscope elementary stream + timestamp sidecar + ffmpeg remux |
 | `rec_cloud.py` | point cloud (blocks *and* snapshot modes), ESDF slices, server status |
 | `rec_poses.py` | fused pose (TUM + JSONL), cloud corrections + gate metrics, camera trail |
+| `backfill.py` | fetch full-res panoramas into a **finished** recording, from the robot's rolling archive — the recommended way to get 4K frames, since nothing is pulled during the walk |
+| `ui.py` | browser console (Gradio): start/stop, live progress, reset the map, fetch full-res, zip + download past recordings |
+| `pyproject.toml` | isolated uv project for the console (`cd tools/recorder && uv sync`); the CLI still runs in the client env |
 | `fake_rig.py` | **test fixture:** a synthetic robot + cloud publishing the real wire messages on the real Zenoh keys, so the live path can be exercised without a robot (see below) |
 
 Every module has a `_selftest()` and is runnable on its own, matching the convention in
@@ -217,7 +220,20 @@ python tools/recorder/compose.py periscope recordings/<id> --decode
 python tools/recorder/compose.py render recordings/<id> --out demo.mp4 --fps 10
 ```
 
-### A paired robot + cloud capture
+### Full-res after the fact (preferred)
+
+```bash
+make backfill ARGS="recordings/<id> --dry-run"     # cost estimate
+make backfill ARGS="recordings/<id> --every 2"     # resumable; skips what it has
+```
+
+Pulls the robot's archived twins for the frames the recording already has, writing them
+into `panorama_fullres/` with `ts_src=source` (the original capture time) so `compose.py`
+cannot tell them from live-recorded frames. Zero realtime cost, and you pick the size
+afterwards. `panorama_fullres/backfill.json` logs each run, including seqs the robot had
+already evicted from its rolling window.
+
+### A paired robot + cloud capture (live full-res, advanced)
 
 `--where robot` deliberately excludes the map, so a full capture is two sessions. Merge them
 at compose time — they share the session clock, so this is a per-stream union:

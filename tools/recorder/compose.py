@@ -119,7 +119,7 @@ class Recording:
     """
 
     def __init__(self, root: str, extra_roots=()):
-        self.root = os.path.abspath(root)
+        self.root = _resolve_session(root)
         self.roots = [self.root]
         if not os.path.isdir(self.root):
             raise SystemExit(f"not a directory: {self.root}")
@@ -388,6 +388,33 @@ class Recording:
         row = dict(self.rows(stream)[int(self.order(stream)[i])])
         row["_dt_ms"] = (int(ts[i]) - t_ns) / 1e6
         return row
+
+
+def _resolve_session(root: str) -> str:
+    """Resolve a session path, tolerating the cwd `make` happens to use.
+
+    Every tool in this repo runs as `cd client && uv run python ../tools/...`, but the
+    recorder writes to `<repo>/recordings/`. So a copy-pasted `recordings/<id>` is
+    relative to the *repo*, not to `client/`. Try the literal path first, then the repo
+    root, then the default output root.
+    """
+    if os.path.isdir(root):
+        return os.path.abspath(root)
+    for base in (rcfg.REPO_ROOT, rcfg.DEFAULT_OUT_ROOT):
+        cand = os.path.join(base, root)
+        if os.path.isdir(cand):
+            return os.path.abspath(cand)
+    # bare session id under the default output root
+    cand = os.path.join(rcfg.DEFAULT_OUT_ROOT, os.path.basename(root))
+    if os.path.isdir(cand):
+        return os.path.abspath(cand)
+    raise SystemExit(
+        f"no such recording: {root}\n"
+        f"  looked in: {os.path.abspath(root)}\n"
+        f"             {os.path.join(rcfg.REPO_ROOT, root)}\n"
+        f"             {os.path.join(rcfg.DEFAULT_OUT_ROOT, os.path.basename(root))}\n"
+        f"  available: " + ", ".join(sorted(os.listdir(rcfg.DEFAULT_OUT_ROOT))[:8]
+                                     if os.path.isdir(rcfg.DEFAULT_OUT_ROOT) else ["(none)"]))
 
 
 def load(root: str, extra_roots=()) -> Recording:

@@ -809,6 +809,7 @@ def run_session(args) -> int:
                     pass
 
         log.info("[vat-record] recording — Ctrl-C to stop cleanly")
+        write_live(sw, recs, budgets, clock, "recording")
         last_progress = 0.0
         while not stop.is_set():
             stop.wait(0.5)
@@ -830,6 +831,7 @@ def run_session(args) -> int:
             if args.progress > 0 and now - last_progress >= args.progress:
                 last_progress = now
                 log.info(_progress_line(recs, b, rcfg))
+                write_live(sw, recs, budgets, clock, "recording")
         else:
             stop_reason = "stopped by signal (Ctrl-C)"
         status = "complete"
@@ -887,6 +889,62 @@ def run_session(args) -> int:
             pass
         _print_report(recs, budgets, sw, rcfg)
     return 0 if status == "complete" else 1
+
+
+def _rss_bytes():
+    """Resident set size of this process, or None. No hard dependency on psutil."""
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        import psutil
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        return None
+
+
+def write_live(sw, recs, budgets, clock, state: str, stop_reason: str = "") -> None:
+    """Write ``<session>/live.json`` — a machine-readable snapshot of the run.
+
+    Polled by ``ui.py`` for the live dashboard, and useful on its own
+    (``watch -n1 jq . recordings/<id>/live.json``) to watch a capture from another
+    shell without touching the recorder. Best-effort: a failure here must never
+    disturb the recording.
+    """
+    try:
+        b = budgets["session"]
+        streams = {}
+        for r in recs:
+            st = r.stats.summary()
+            streams[r.name] = {
+                "samples": st["samples"], "bytes": st["bytes"],
+                "mean_hz": st["mean_hz"], "errors": st["errors"],
+                "skipped": st["skipped"],
+                "seq_samples_missing": st["seq_samples_missing"],
+                "last_error": st["last_error"],
+                "status": r.status_line(),
+            }
+        sw.write_json({
+            "state": state, "stop_reason": stop_reason,
+            "session_id": sw.session_id, "pid": os.getpid(),
+            "updated_wall_ns": time.time_ns(),
+            "elapsed_s": round(b.elapsed_s, 2),
+            "duration_cap_s": b.duration_s or None,
+            "bytes_session": b.bytes_written,
+            "bytes_fullres": budgets["fullres"].bytes_written,
+            "max_bytes": b.max_bytes or None,
+            "rss_bytes": _rss_bytes(),
+            "clock_offset_s": clock.offset_s,
+            "clock_baseline_ok": clock.baseline_observed,
+            "version_pins": len(clock.version_pins()),
+            "streams": streams,
+        }, "live.json")
+    except Exception:
+        log.debug("[vat-record] live.json write failed", exc_info=True)
 
 
 def _iso(ns: int) -> str:

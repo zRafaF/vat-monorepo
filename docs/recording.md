@@ -217,7 +217,33 @@ Then Ctrl-C. The recorder flushes every index, writes a final map keyframe, remu
 periscope and writes `MANIFEST.json`. **A recording killed mid-session stays usable** —
 index files are flushed per record and blobs are published atomically.
 
-### 5. Full-resolution panoramas (optional, on the robot)
+### 5. Full-resolution panoramas — fetch them *after* the walk
+
+This is the recommended path, and it is better than capturing full-res live. The robot
+already archives a full-res twin of **every** transmitted frame locally
+(`ARCHIVE_ENABLE=true`, ~10 GB rolling ≈ 6 hours at 2.5 Hz), tagged with the same `seq` /
+`ts_ns` / `camera_height`. So walk the robot, stop the recorder, and *then* pull the twins
+for the frames you actually recorded:
+
+```bash
+make backfill ARGS="recordings/<session_id> --dry-run"     # what it would cost
+make backfill ARGS="recordings/<session_id> --every 2"     # fetch every other frame
+```
+
+Nothing competes with the live pose downlink or the map stream during the walk, so the
+capture itself is untouched — the whole point of a passive recorder. Afterwards you choose
+the cost: `--every N` decimates, `--max-size` caps, `--seq-from/--seq-to` grabs one
+stretch, and a re-run **resumes** (frames already present are skipped). The only deadline
+is the archive's rolling window, which for a five-minute walk is hours of slack.
+
+Backfilled frames land in `panorama_fullres/` of the same session with `ts_src=source` —
+the original capture timestamp — so `compose.py` treats them exactly like live-recorded
+ones (`--panorama fullres`). Together with `poses/robot_fused.tum` that is the
+full-resolution frames + timestamped trajectory an offline reconstruction (Gaussian splat,
+NeRF, photogrammetry) needs. `panorama_fullres/backfill.json` records what was fetched,
+and any seqs the robot had already evicted.
+
+### 5b. Or capture full-res live, on the robot (advanced)
 
 ```bash
 # ON THE ROBOT — the robot's own streams only (see the warning above)
@@ -360,6 +386,42 @@ only if you want this: `cd client && uv pip install open3d`. If you would rather
 video by hand, `export` already gave you everything.
 
 ---
+
+## The browser console
+
+Driving a capture from a terminal while holding the robot's remote is awkward, so there is
+a small Gradio console:
+
+```bash
+make record-ui                    # → http://<server>:7860
+```
+
+It gives you the session metadata form, **Start** / **Stop**, live per-stream progress
+(sample counts, rates, dropped samples, errors, bytes on disk, resident memory, the clock
+offset and whether the clock baseline is established), **Reset PRISM map**, **Fetch
+full-res** for any finished recording — with a *fetch on stop* tick-box so it starts by
+itself — and an archive table with a one-click zip download of any past recording.
+
+Stop sends **SIGINT** to the recorder, i.e. exactly the clean-flush path Ctrl-C takes; the
+UI has no privileged shortcut the CLI lacks. Everything it does is a subprocess of the
+same scripts.
+
+!!! warning "One button publishes"
+    **Reset PRISM map** puts an empty payload on `{server}/cmd/reset` — the same thing the
+    viewer's reset does. It is an explicit operator action and is deliberately *not* part
+    of the recorder: `vat_record.py` still declares no publisher. Resetting mid-recording
+    is legitimate (the capture will show the map going empty and rebuilding) — just know
+    that you did it.
+
+The console lives in its own uv project (`tools/recorder/pyproject.toml`) so the client
+viewer env does not grow a web stack. `make record` keeps using the client env.
+
+The recorder also writes `<session>/live.json` every progress tick, so you can watch a
+capture from any other shell without the UI:
+
+```bash
+watch -n1 "jq '.state, .elapsed_s, .streams' recordings/<id>/live.json"
+```
 
 ## Checking it without a robot
 

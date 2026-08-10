@@ -1,0 +1,36 @@
+[project]
+name = "vat-recorder"
+version = "1.0.0"
+description = "VAT passive session recorder + composer + browser console"
+# Standalone, isolated uv project (own tools/recorder/.venv + uv.lock), same convention
+# as client/, server/mapping/ and server/router/:
+#     cd tools/recorder && uv sync && uv run python ui.py
+#
+# Why separate from client/: the browser console needs Gradio, and the client env is the
+# operator's *viewer* env — it should not grow a web stack. The recorder modules
+# themselves are dependency-light and run happily in either env, so
+#     cd client && uv run python ../tools/recorder/vat_record.py
+# keeps working exactly as the other tools/ scripts do. Use this project when you want
+# the UI (`make record-ui`); use the client env for the plain CLI (`make record`).
+#
+# Capped <3.13 to match client/ so a checkout can share one interpreter.
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # Transport — the same major as every other VAT service
+    "eclipse-zenoh>=1.0",
+    # Numerics; point clouds, ESDF slices, poses
+    "numpy>=1.24",
+    # Draco: needed to mirror the map (repair pulls + materialised keyframes) and to
+    # replay recorded pushes in compose.py. Without it the recorder still stores every
+    # byte, but it cannot understand them live.
+    "DracoPy>=1.4",
+    # JPEG encode/decode for the fake rig and compose's frame extraction. Headless: this
+    # project never opens a window (that's the client viewer's job).
+    "opencv-python-headless>=4.9",
+    # The browser console
+    "gradio>=6.0",
+]
+
+[tool.uv]
+# Virtual project: install deps into tools/recorder/.venv and run the scripts directly.
+package = false

@@ -20,7 +20,7 @@ CLIENT_RUN ?= cd client && uv run python
 .PHONY: help steps \
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-uvc-kill theta-stream robot-docker viewer record-frames \
-        record compose record-selftest rig \
+        record compose record-selftest rig backfill record-ui sync-recorder \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         teleop fetch_frame fetch_pcd periscope-probe rgbd-probe rgbd-camera rgbd-relay \
         docs docs-serve clean
@@ -59,6 +59,9 @@ help:
 	@echo "                                ARGS=\"export recordings/<id> --fps 10\""
 	@echo "  make record-selftest [ANY]    offline check of the recorder + composer (no robot)"
 	@echo "  make rig             [ANY]    fake robot+cloud on the real Zenoh keys (test the live path)"
+	@echo "  make record-ui       [ANY]    browser console: start/stop, live progress, fetch full-res, zip"
+	@echo "  make backfill        [ANY]    fetch full-res panoramas into a FINISHED recording"
+	@echo "                                ARGS=\"recordings/<id> --every 2\""
 	@echo "  make periscope-probe [CLIENT] headless periscope stream check (ARGS=\"--decode --save f.png\")"
 	@echo "  make rgbd-probe      [CLIENT] headless D435i panel stream check (ARGS=\"--kind depth --decode\")"
 	@echo "  make rgbd-camera     [ROBOT]  launch RealSense depth node (pinned to the Go2 NIC for the container)"
@@ -115,6 +118,11 @@ sync-robot:
 
 sync-router:
 	cd server/router && uv sync
+
+# Browser console env (Gradio) — its own isolated project, so the client/viewer
+# env does not grow a web stack.
+sync-recorder:
+	cd tools/recorder && uv sync
 
 sync-docs:
 	uv sync --group docs
@@ -206,6 +214,23 @@ record-selftest: sync-client
 rig: sync-client
 	@echo ">> Reminder: 'make router' must be running. This is a TEST FIXTURE, not the robot."
 	$(CLIENT_RUN) ../tools/recorder/fake_rig.py $(ARGS)
+
+# [ANY] Fetch full-resolution panoramas into a FINISHED recording, from the robot's
+# rolling archive (~10GB ~ 6h). Nothing is fetched during the walk, so the capture is
+# untouched; afterwards you choose how much to pull. Resumable. Run it while nothing
+# else is capturing.  See docs/recording.md.
+#   make backfill ARGS="recordings/<id> --dry-run"      # what it would cost
+#   make backfill ARGS="recordings/<id> --every 2"
+backfill: sync-client
+	$(CLIENT_RUN) ../tools/recorder/backfill.py $(ARGS)
+
+# [ANY] Browser console for capturing: start/stop, live per-stream progress, memory and
+# size, reset the PRISM map, fetch full-res after the run, browse past recordings and
+# download any of them as a zip.  http://<host>:7860
+#   make record-ui ARGS="--port 8080"
+record-ui: sync-recorder
+	@echo ">> console on http://0.0.0.0:7860  (Ctrl-C to stop; a running capture keeps its own process)"
+	cd tools/recorder && uv run python ui.py $(ARGS)
 
 # ── Staged pre-POC tests ─────────────────────────────────────────────────────
 # All run in the client's own env; tools live in ../tools relative to client/.
