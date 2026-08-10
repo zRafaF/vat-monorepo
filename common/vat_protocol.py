@@ -126,6 +126,13 @@ def keys(robot_name: str = "go2", server_prefix: str = "server/prism") -> dict:
         # live config (anyone → robot)
         "cfg_throttle_fps": f"{robot_name}/rt/prism/config/throttle_fps",
         "cfg_window_size":  f"{robot_name}/rt/prism/config/window_size",
+        # Archive REPLY transcoding (UTF-8 int payloads). The archive stores full-res
+        # JPEG at ARCHIVE_JPEG_QUALITY; these set the quality / max width the robot
+        # re-encodes to *before answering* camera_archive_get, so a backfill can trade
+        # fidelity for link time without touching what is stored. 0 = serve as archived.
+        # A per-query "?q="/"?w=" overrides these for one request.
+        "cfg_archive_quality":  f"{robot_name}/rt/prism/config/archive_quality",
+        "cfg_archive_max_width": f"{robot_name}/rt/prism/config/archive_max_width",
         # teleoperation (client/server → robot, DOWN): velocity commands + e-stop
         "cmd_vel":         f"{robot_name}/teleop/cmd_vel",
         # remote periscope: aim request DOWN (client → robot, robot subscribes over

@@ -255,6 +255,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "writer is asynchronous (default 2.0)")
     pf.add_argument("--fullres-timeout", type=float, default=5.0, metavar="S",
                     help="archive query timeout (default 5.0)")
+    pf.add_argument("--fullres-quality", type=int, default=0, metavar="Q",
+                    help="ask the robot to re-encode at JPEG quality Q (1-100) before "
+                         "replying. 0 = as archived (default). Full-res is rarely needed "
+                         "pristine, and this is the only place link bytes can be saved")
+    pf.add_argument("--fullres-max-width", type=int, default=0, metavar="W",
+                    help="ask the robot to downscale to at most W px wide (e.g. 1920). "
+                         "0 = full resolution")
     pf.add_argument("--force", action="store_true",
                     help="allow --panorama-fullres with --where cloud (pulls full-res "
                          "over the field link — do not do this during a real capture)")
@@ -481,6 +488,7 @@ def build_recorders(enabled, sw, clock, args, rcfg, budgets):
         fullres = PanoramaFullresRecorder(
             sw, clock, budgets["fullres"], every=args.fullres_every,
             lag_s=args.fullres_lag, timeout_s=args.fullres_timeout,
+            quality=args.fullres_quality, max_width=args.fullres_max_width,
             # When the transmit stream is also recorded it feeds us the seqs, so we
             # skip a second subscription to the same key.
             own_subscription=("panorama_transmit" not in enabled))

@@ -101,7 +101,7 @@ def backfill(session: str, *, every: int = 1, max_bytes: int = 0, ring: bool = F
              timeout_s: float = 5.0, seq_lo: Optional[int] = None,
              seq_hi: Optional[int] = None, dry_run: bool = False,
              progress_s: float = 5.0, sleep_ms: float = 0.0,
-             status_cb=None) -> dict:
+             quality: int = 0, max_width: int = 0, status_cb=None) -> dict:
     """Fetch full-res twins for a finished recording. Returns a summary dict."""
     session = os.path.abspath(session)
     rows = read_transmit_index(session)
@@ -139,7 +139,20 @@ def backfill(session: str, *, every: int = 1, max_bytes: int = 0, ring: bool = F
     conf.insert_json5("mode", '"client"')
     z = zenoh.open(conf)
     key = rcfg.KEYS["camera_archive_get"]
-    log.info(f"[backfill] ? '{key}' via {rcfg.ZENOH_ROUTER}")
+    # Transcode ON THE ROBOT, before it replies: that is the only place a saving in
+    # transmitted bytes can be made. Omitted → served exactly as archived.
+    # NOTE: Zenoh selector parameters are separated by ';', NOT '&' as in an HTTP
+    # query string — `zenoh.Parameters("seq=19&q=70")["seq"]` returns the whole
+    # "19&q=70". Existing repo tools only ever pass one parameter, so this only bites
+    # the moment a second one is added.
+    extra = ""
+    if quality > 0:
+        extra += f";q={int(quality)}"
+    if max_width > 0:
+        extra += f";w={int(max_width)}"
+    log.info(f"[backfill] ? '{key}' via {rcfg.ZENOH_ROUTER}"
+             + (f"  transcode: q={quality or 'as-archived'} "
+                f"max_w={max_width or 'full'}" if extra else "  (as archived)"))
 
     sw = SessionWriter(os.path.dirname(session), os.path.basename(session))
     sw.subdir("panorama_fullres", "frames")
@@ -171,7 +184,7 @@ def backfill(session: str, *, every: int = 1, max_bytes: int = 0, ring: bool = F
             payload = None
             err = None
             try:
-                for reply in z.get(f"{key}?seq={seq}", timeout=timeout_s):
+                for reply in z.get(f"{key}?seq={seq}{extra}", timeout=timeout_s):
                     if reply.ok:
                         payload = bytes(reply.result.payload)
                         break
@@ -249,6 +262,8 @@ def backfill(session: str, *, every: int = 1, max_bytes: int = 0, ring: bool = F
         "already_present": len(wanted) - len(todo), "every": every,
         "seconds": round(dt, 1),
         "mean_bytes_per_frame": int(n_bytes / n_ok) if n_ok else 0,
+        "requested_quality": quality or None,
+        "requested_max_width": max_width or None,
     }
     log.info(f"[backfill] done: {n_ok} fetched, {n_miss} missing, "
              f"{rcfg.human_size(n_bytes)} in {dt:.0f}s")
@@ -296,6 +311,13 @@ def main(argv=None) -> int:
     p.add_argument("--seq-from", type=int, default=None, help="first seq to fetch")
     p.add_argument("--seq-to", type=int, default=None, help="last seq to fetch")
     p.add_argument("--timeout", type=float, default=5.0, help="per-frame query timeout")
+    p.add_argument("--quality", type=int, default=0, metavar="Q",
+                   help="ask the robot to re-encode at JPEG quality Q (1-100) before "
+                        "replying — cuts the bytes that cross the link. 0 = as archived. "
+                        "Needs a robot image with the archive-transcode support")
+    p.add_argument("--max-width", type=int, default=0, metavar="W",
+                   help="ask the robot to downscale to at most W px wide before replying "
+                        "(e.g. 1920 for half of 4K). 0 = full resolution")
     p.add_argument("--sleep-ms", type=float, default=0.0,
                    help="pause between fetches, to be gentle on the link")
     p.add_argument("--progress", type=float, default=5.0)
@@ -308,7 +330,8 @@ def main(argv=None) -> int:
     session = compose._resolve_session(a.session)          # noqa: SLF001
     backfill(session, every=a.every, max_bytes=rcfg.parse_size(a.max_size),
              ring=a.ring, timeout_s=a.timeout, seq_lo=a.seq_from, seq_hi=a.seq_to,
-             dry_run=a.dry_run, progress_s=a.progress, sleep_ms=a.sleep_ms)
+             dry_run=a.dry_run, progress_s=a.progress, sleep_ms=a.sleep_ms,
+             quality=a.quality, max_width=a.max_width)
     return 0
 
 

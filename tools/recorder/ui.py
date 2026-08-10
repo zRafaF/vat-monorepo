@@ -203,7 +203,8 @@ class Console:
 
     # ── full-res backfill ────────────────────────────────────────────────────
     def run_backfill(self, session: str, every: int = 1, max_size: str = "0",
-                     sleep_ms: float = 0.0) -> str:
+                     sleep_ms: float = 0.0, quality: int = 0,
+                     max_width: int = 0) -> str:
         if self.backfill_state["running"]:
             return "⚠️ a fetch is already running."
         if self.recording and os.path.abspath(session) != (self.session_dir or ""):
@@ -218,6 +219,7 @@ class Console:
                 summary = bf.backfill(
                     session, every=int(every), max_bytes=rcfg.parse_size(max_size),
                     sleep_ms=float(sleep_ms), progress_s=2.0,
+                    quality=int(quality), max_width=int(max_width),
                     status_cb=lambda d: self.backfill_state.update(
                         running=True, **{k: d[k] for k in
                                          ("done", "total", "bytes", "message")}))
@@ -457,6 +459,16 @@ def build_app(con: Console) -> gr.Blocks:
                 bf_every = gr.Number(label="every Nth frame", value=1, precision=0)
                 bf_cap = gr.Textbox(label="Size cap", value="0", placeholder="20GB")
                 bf_sleep = gr.Number(label="pause between fetches (ms)", value=0)
+            gr.Markdown(
+                "The robot can **re-encode before it replies**, which is the only place a "
+                "saving in transmitted bytes can be made. Leave both at 0 to get exactly "
+                "what is archived (4K, quality 92). Needs a robot image with archive "
+                "transcode support.")
+            with gr.Row():
+                bf_q = gr.Slider(0, 100, value=0, step=1,
+                                 label="JPEG quality (0 = as archived)")
+                bf_w = gr.Dropdown([0, 1280, 1920, 2560, 3840], value=0,
+                                   label="max width px (0 = full)")
             with gr.Row():
                 btn_dry = gr.Button("Estimate only")
                 btn_fetch = gr.Button("⬇ Fetch full-res", variant="primary")
@@ -515,10 +527,11 @@ def build_app(con: Console) -> gr.Blocks:
 
         btn_dry.click(on_dry, [pick, bf_every], bf_status)
         btn_fetch.click(
-            lambda sid, e, c, sl: (con.run_backfill(os.path.join(con.out_root, sid),
-                                                    int(e or 1), c or "0", sl or 0)
-                                   if sid else "pick a recording first."),
-            [pick, bf_every, bf_cap, bf_sleep], bf_status)
+            lambda sid, e, c, sl, q, w: (
+                con.run_backfill(os.path.join(con.out_root, sid), int(e or 1),
+                                 c or "0", sl or 0, int(q or 0), int(w or 0))
+                if sid else "pick a recording first."),
+            [pick, bf_every, bf_cap, bf_sleep, bf_q, bf_w], bf_status)
 
         btn_refresh.click(
             lambda: (archive_rows(con.out_root),
@@ -592,18 +605,37 @@ def main(argv=None) -> int:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--out", default=None, help="output root (default <repo>/recordings)")
-    p.add_argument("--share", action="store_true", help="public gradio tunnel")
+    p.add_argument("--share", action="store_true",
+                   help="public Gradio tunnel, for a headless server with no VPN route. "
+                        "Requires --auth: this console can start/stop captures and reset "
+                        "the PRISM map, so it must not be world-open")
+    p.add_argument("--auth", default=None, metavar="USER:PASS",
+                   help="require basic auth (mandatory with --share)")
     a = p.parse_args(argv)
     if a.selftest:
         return _selftest()
+    auth = None
+    if a.auth:
+        if ":" not in a.auth:
+            raise SystemExit("--auth expects USER:PASS")
+        auth = tuple(a.auth.split(":", 1))
+    if a.share and auth is None:
+        raise SystemExit(
+            "--share creates a PUBLIC url, and this console can start/stop recordings "
+            "and reset the PRISM map — so it needs credentials:\n"
+            "  make record-ui ARGS=\"--share --auth me:somelongsecret\"\n"
+            "If the server is on your tailnet you do not need --share at all: just open "
+            f"http://{rcfg.ZENOH_ROUTER.split('/')[-1].split(':')[0]}:7860 directly.")
     con = Console(a.out or rcfg.DEFAULT_OUT_ROOT)
     log.info(f"[ui] output root {con.out_root}")
     log.info(f"[ui] zenoh {rcfg.ZENOH_ROUTER}  robot={rcfg.ROBOT_NAME}")
     if shutil.which("ffmpeg") is None:
         log.info("[ui] ffmpeg not on PATH — periscope mp4 remux will be skipped "
                  "(the elementary stream + timestamps CSV are still written)")
+    if a.share:
+        log.info("[ui] creating a public Gradio tunnel (downloads frpc on first use)")
     build_app(con).launch(server_name=a.host, server_port=a.port, share=a.share,
-                          theme=gr.themes.Soft(), quiet=False)
+                          auth=auth, theme=gr.themes.Soft(), quiet=False)
     return 0
 
 

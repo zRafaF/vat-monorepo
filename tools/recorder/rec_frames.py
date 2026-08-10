@@ -250,12 +250,20 @@ class PanoramaFullresRecorder(StreamRecorder):
     def __init__(self, sw: SessionWriter, clock: SessionClock,
                  budget: Optional[Budget] = None, *, every: int = 1,
                  lag_s: float = 2.0, timeout_s: float = 5.0,
-                 queue_max: int = 512, own_subscription: bool = True):
+                 queue_max: int = 512, own_subscription: bool = True,
+                 quality: int = 0, max_width: int = 0):
         super().__init__(sw, clock, budget)
         self.every = max(1, int(every))
         self.lag_s = float(lag_s)
         self.timeout_s = float(timeout_s)
         self.own_subscription = bool(own_subscription)
+        # Ask the robot to re-encode before replying (see theta_camera's archive
+        # queryable). Cuts link bytes; 0/0 = served exactly as archived.
+        self.quality = int(quality)
+        self.max_width = int(max_width)
+        # ';' is the Zenoh selector parameter separator, not '&' (see backfill.py).
+        self._q_extra = ("" + (f";q={self.quality}" if self.quality > 0 else "")
+                         + (f";w={self.max_width}" if self.max_width > 0 else ""))
         self._key = rcfg.KEYS["camera_archive_get"]
         self.stats.key = self._key
         self.note_query(self._key)
@@ -338,7 +346,7 @@ class PanoramaFullresRecorder(StreamRecorder):
                 log.debug(f"[{self.name}] pull failed", exc_info=True)
 
     def _pull(self, seq: int) -> None:
-        sel = f"{self._key}?seq={seq}"
+        sel = f"{self._key}?seq={seq}{self._q_extra}"
         payload = None
         err = None
         for reply in self._z.get(sel, timeout=self.timeout_s):
@@ -429,6 +437,8 @@ class PanoramaFullresRecorder(StreamRecorder):
             "decimate_every": self.every,
             "seq_gaps_tracked": self.every == 1,
             "pull_lag_s": self.lag_s,
+            "requested_quality": self.quality or None,
+            "requested_max_width": self.max_width or None,
             "archive_misses": self.n_missing,
             "query_timeouts": self.n_timeout,
             "queue_overflow_drops": self.n_dropped_queue,

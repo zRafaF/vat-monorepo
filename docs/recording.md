@@ -243,6 +243,33 @@ full-resolution frames + timestamped trajectory an offline reconstruction (Gauss
 NeRF, photogrammetry) needs. `panorama_fullres/backfill.json` records what was fetched,
 and any seqs the robot had already evicted.
 
+!!! tip "Full-res does not have to be pristine"
+    The archive stores 4K JPEG at quality 92, but the **robot can re-encode before it
+    replies** — the only place a saving in *transmitted* bytes can be made:
+
+    ```bash
+    make backfill ARGS="recordings/<id> --quality 60 --max-width 1920"
+    ```
+
+    On synthetic frames that took 180 kB → 52 kB per frame. `--quality 0`
+    `--max-width 0` (the default) serves exactly what is archived. The frame's identity
+    is preserved — `ts_ns` / `seq` / `camera_height` are re-packed unchanged — so a
+    transcoded twin still aligns with the transmit frame and the pose stream; only the
+    pixels get cheaper.
+
+    Defaults can also be set live over Zenoh, following the existing `cfg_*` pattern:
+
+    ```bash
+    # serve 1920-wide q65 to every requester until told otherwise
+    python -c "import zenoh,os;z=zenoh.open(zenoh.Config());\
+    z.put('go2/rt/prism/config/archive_quality',b'65');\
+    z.put('go2/rt/prism/config/archive_max_width',b'1920')"
+    ```
+
+    A per-request `;q=`/`;w=` overrides the live default. **This needs a robot container
+    rebuild** — the transcode lives in `theta_camera.py`'s archive queryable. Until then
+    the parameters are simply ignored and you get frames as archived.
+
 ### 5b. Or capture full-res live, on the robot (advanced)
 
 ```bash
@@ -394,6 +421,15 @@ a small Gradio console:
 
 ```bash
 make record-ui                    # → http://<server>:7860
+```
+
+If the server is on your tailnet (`ROUTER_IP` in `vat.env` is a `100.x` Tailscale
+address), just browse to `http://<that-ip>:7860` — no tunnel, no exposure. For a headless
+box with no VPN route there is a public Gradio tunnel, which **requires credentials**
+because this console can start/stop captures and reset the map:
+
+```bash
+make record-ui ARGS="--share --auth me:somelongsecret"
 ```
 
 It gives you the session metadata form, **Start** / **Stop**, live per-stream progress

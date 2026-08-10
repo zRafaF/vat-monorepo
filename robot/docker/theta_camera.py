@@ -135,6 +135,18 @@ KEY_FRAME_GET    = _KEYS["camera_frame_get"]
 KEY_ARCHIVE_GET  = _KEYS["camera_archive_get"]
 KEY_THROTTLE_FPS = _KEYS["cfg_throttle_fps"]
 KEY_WINDOW_SIZE  = _KEYS["cfg_window_size"]
+KEY_ARCH_QUALITY = _KEYS["cfg_archive_quality"]
+KEY_ARCH_MAXW    = _KEYS["cfg_archive_max_width"]
+
+# Archive-reply transcoding. The archive keeps full-res JPEG at ARCHIVE_JPEG_QUALITY, but
+# a backfill usually does not need pristine 4K: re-encoding before the reply cuts the
+# bytes that actually cross the link, which is the only place that saving can be made.
+# 0 = serve exactly what is archived (default, lossless passthrough). Settable live on
+# KEY_ARCH_QUALITY / KEY_ARCH_MAXW, and overridable per request with ?q= / ?w=.
+ARCHIVE_SERVE_QUALITY  = int(os.environ.get("ARCHIVE_SERVE_QUALITY", "0"))
+ARCHIVE_SERVE_MAX_W    = int(os.environ.get("ARCHIVE_SERVE_MAX_WIDTH", "0"))
+_serve_quality = ARCHIVE_SERVE_QUALITY
+_serve_max_w   = ARCHIVE_SERVE_MAX_W
 
 # Mutable, live-tunable config
 _throttle_fps: float = float(os.environ.get("THROTTLE_FPS", "3.0"))
@@ -353,8 +365,15 @@ class FrameDecimator:
             seq = int(params["seq"]) if "seq" in params else -1
             payload = self._archive.get(seq) if self._archive is not None else None
             if payload is not None:
+                # Optional per-request transcode (?q=<1..100>;w=<max width> — Zenoh
+                # selector params are ';'-separated, not '&'), falling
+                # back to the live-config defaults. Shrinks what crosses the link.
+                q = int(params["q"]) if "q" in params else _serve_quality
+                mw = int(params["w"]) if "w" in params else _serve_max_w
+                payload, note = _transcode_archive_reply(payload, q, mw)
                 query.reply(KEY_ARCHIVE_GET, payload)
-                log.debug(f"[Archive] served seq={seq} ({len(payload)//1024}kB)")
+                log.debug(f"[Archive] served seq={seq} ({len(payload)//1024}kB)"
+                          + (f" [{note}]" if note else ""))
             else:
                 query.reply_err(f"archive seq {seq} not found".encode())
         except Exception as e:
@@ -466,6 +485,59 @@ class FrameDecimator:
 # ─────────────────────────────────────────────────────────────────────────────
 # Live-config callbacks
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _transcode_archive_reply(payload: bytes, quality: int, max_w: int):
+    """Re-encode a ``pack_frame`` archive reply smaller. Returns the new payload.
+
+    Preserves the frame's identity exactly — ``ts_ns`` / ``seq`` / ``camera_height`` are
+    re-packed unchanged — so a transcoded twin still lines up with the transmit frame and
+    the pose stream. Only the pixels get cheaper. On any failure the original is returned:
+    a smaller reply is an optimisation, never a reason to fail the request.
+    """
+    if quality <= 0 and max_w <= 0:
+        return payload, None
+    try:
+        ts_ns, seq, cam_h, jpeg = proto.unpack_frame(payload)
+        img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return payload, None
+        h, w = img.shape[:2]
+        if 0 < max_w < w:
+            img = cv2.resize(img, (max_w, max(1, int(round(h * max_w / w)))),
+                             interpolation=cv2.INTER_AREA)
+        q = quality if quality > 0 else ARCHIVE_JPEG_QUALITY
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(q)])
+        if not ok:
+            return payload, None
+        out = proto.pack_frame(ts_ns, seq, cam_h, buf.tobytes())
+        return out, (f"{w}x{h}->{img.shape[1]}x{img.shape[0]} q{q} "
+                     f"{len(jpeg)//1024}->{len(buf)//1024}kB")
+    except Exception as e:
+        log.debug(f"[Archive] transcode failed, serving as archived: {e}")
+        return payload, None
+
+
+def _on_archive_quality(sample):
+    global _serve_quality
+    try:
+        v = int(float(bytes(sample.payload).decode().strip()))
+        if 0 <= v <= 100:
+            _serve_quality = v
+            log.info(f"[Config] archive_quality → {v or 'as-archived'}")
+    except Exception as e:
+        log.warning(f"[Config] bad archive_quality payload: {e}")
+
+
+def _on_archive_max_width(sample):
+    global _serve_max_w
+    try:
+        v = int(float(bytes(sample.payload).decode().strip()))
+        if 0 <= v <= 8192:
+            _serve_max_w = v
+            log.info(f"[Config] archive_max_width → {v or 'as-archived'}")
+    except Exception as e:
+        log.warning(f"[Config] bad archive_max_width payload: {e}")
+
 
 def _on_throttle_fps(sample):
     global _throttle_fps
@@ -583,6 +655,8 @@ def main():
 
     z.declare_subscriber(KEY_THROTTLE_FPS, _on_throttle_fps)
     z.declare_subscriber(KEY_WINDOW_SIZE, _on_window_size)
+    z.declare_subscriber(KEY_ARCH_QUALITY, _on_archive_quality)
+    z.declare_subscriber(KEY_ARCH_MAXW, _on_archive_max_width)
 
     try:
         while True:
