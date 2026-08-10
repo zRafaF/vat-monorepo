@@ -423,14 +423,25 @@ a small Gradio console:
 make record-ui                    # → http://<server>:7860
 ```
 
-If the server is on your tailnet (`ROUTER_IP` in `vat.env` is a `100.x` Tailscale
-address), just browse to `http://<that-ip>:7860` — no tunnel, no exposure. For a headless
-box with no VPN route there is a public Gradio tunnel, which **requires credentials**
-because this console can start/stop captures and reset the map:
+It **prints a public share URL**, the same way `make studio` does in `PRISM-benchmarks`
+(`tools/preview.py`: `share=True`, `allowed_paths=[tmp, REPO_ROOT]`) — the server is
+headless, so a URL you can open from anywhere is the point. It also serves on `:7860`
+locally, so a tailnet address (`ROUTER_IP` in `vat.env` is a `100.x` Tailscale IP) works
+too.
 
 ```bash
-make record-ui ARGS="--share --auth me:somelongsecret"
+make record-ui                                    # public URL printed
+make record-ui ARGS="--no-share"                  # LAN / tailnet only
+make record-ui ARGS="--auth me:somelongsecret"    # add a password to the share URL
 ```
+
+`allowed_paths` includes the output root, so the zip download works wherever `--out`
+points.
+
+!!! note "The share URL is unauthenticated by default"
+    Like `make studio`, and for the same reason — it is a lab tool. But this console can
+    start/stop captures and reset the PRISM map, so it logs a warning at startup, and
+    `--auth user:pass` is there when you want it.
 
 It gives you the session metadata form, **Start** / **Stop**, live per-stream progress
 (sample counts, rates, dropped samples, errors, bytes on disk, resident memory, the clock

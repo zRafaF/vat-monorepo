@@ -574,6 +574,8 @@ def _selftest() -> int:
     app = build_app(con)
     port = 7899
     app.launch(server_name="127.0.0.1", server_port=port, prevent_thread_lock=True,
+               allowed_paths=[tempfile.gettempdir(), str(rcfg.REPO_ROOT),
+                              con.out_root],
                theme=gr.themes.Soft(), quiet=True)
     try:
         time.sleep(3)
@@ -605,12 +607,13 @@ def main(argv=None) -> int:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--out", default=None, help="output root (default <repo>/recordings)")
-    p.add_argument("--share", action="store_true",
-                   help="public Gradio tunnel, for a headless server with no VPN route. "
-                        "Requires --auth: this console can start/stop captures and reset "
-                        "the PRISM map, so it must not be world-open")
+    # Public share URL by default, matching PRISM-benchmarks' `make studio`
+    # (tools/preview.py: share=True, allowed_paths=[tmp, REPO_ROOT]) — the server is
+    # headless, so a printed public URL is the point.
+    p.add_argument("--no-share", dest="share", action="store_false", default=True,
+                   help="do NOT create a public share URL (LAN/tailnet access only)")
     p.add_argument("--auth", default=None, metavar="USER:PASS",
-                   help="require basic auth (mandatory with --share)")
+                   help="optionally require basic auth on top of the share URL")
     a = p.parse_args(argv)
     if a.selftest:
         return _selftest()
@@ -619,13 +622,6 @@ def main(argv=None) -> int:
         if ":" not in a.auth:
             raise SystemExit("--auth expects USER:PASS")
         auth = tuple(a.auth.split(":", 1))
-    if a.share and auth is None:
-        raise SystemExit(
-            "--share creates a PUBLIC url, and this console can start/stop recordings "
-            "and reset the PRISM map — so it needs credentials:\n"
-            "  make record-ui ARGS=\"--share --auth me:somelongsecret\"\n"
-            "If the server is on your tailnet you do not need --share at all: just open "
-            f"http://{rcfg.ZENOH_ROUTER.split('/')[-1].split(':')[0]}:7860 directly.")
     con = Console(a.out or rcfg.DEFAULT_OUT_ROOT)
     log.info(f"[ui] output root {con.out_root}")
     log.info(f"[ui] zenoh {rcfg.ZENOH_ROUTER}  robot={rcfg.ROBOT_NAME}")
@@ -633,9 +629,17 @@ def main(argv=None) -> int:
         log.info("[ui] ffmpeg not on PATH — periscope mp4 remux will be skipped "
                  "(the elementary stream + timestamps CSV are still written)")
     if a.share:
-        log.info("[ui] creating a public Gradio tunnel (downloads frpc on first use)")
-    build_app(con).launch(server_name=a.host, server_port=a.port, share=a.share,
-                          auth=auth, theme=gr.themes.Soft(), quiet=False)
+        log.info("[ui] public share URL will be printed below "
+                 "(Gradio downloads frpc on first use); --no-share to disable")
+    if auth is None and a.share:
+        log.warning("[ui] the share URL is UNAUTHENTICATED and this console can start / "
+                    "stop captures and reset the PRISM map. Add --auth user:pass if you "
+                    "are not comfortable with that.")
+    # allowed_paths so gr.File can serve the session zips, wherever --out points.
+    build_app(con).launch(
+        server_name=a.host, server_port=a.port, share=a.share, auth=auth,
+        allowed_paths=[tempfile.gettempdir(), str(rcfg.REPO_ROOT), con.out_root],
+        theme=gr.themes.Soft(), quiet=False)
     return 0
 
 

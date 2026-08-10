@@ -231,7 +231,7 @@ backfill: sync-client
 # download any of them as a zip.  http://<host>:7860
 #   make record-ui ARGS="--port 8080"
 record-ui: sync-recorder
-	@echo ">> console on http://0.0.0.0:7860  (Ctrl-C to stop; a running capture keeps its own process)"
+	@echo ">> Recorder console on :7860 (share URL printed): start/stop, live progress, fetch full-res, zips."
 	cd tools/recorder && uv run python ui.py $(ARGS)
 
 # ── Staged pre-POC tests ─────────────────────────────────────────────────────
