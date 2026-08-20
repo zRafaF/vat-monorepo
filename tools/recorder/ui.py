@@ -2,7 +2,7 @@
 """
 VAT — recorder console: a browser UI for capturing a session
 ===========================================================
-A small Gradio app around ``vat_record.py`` / ``backfill.py`` / ``compose.py`` so a
+A small Gradio app around ``vat_record.py`` and ``backfill.py`` so a
 capture can be driven from a phone or a laptop browser while you are holding the robot's
 remote, instead of from a terminal.
 
