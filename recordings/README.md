@@ -1,87 +1,38 @@
-# `recordings/` — captured sessions, and the tool to play them back
+# `recordings/` — where a capture lands
 
-```
-recordings/
-  replay.py         play a recorded session back in Rerun (this project)
-  pyproject.toml    isolated uv env: `cd recordings && uv sync`
-  data/             the sessions themselves — NOT in git (large, per-run)
-    <session_id>/   written by tools/recorder; see docs/recording.md for the layout
-```
+This is the recorder's default output root. `make record` and `make record-ui` write
+`recordings/data/<session_id>/` here, and `data/` is gitignored (a session is large, and
+`make backfill` makes it larger).
 
-`data/` is the recorder's default output root, so `make record` and `make record-ui` put
-sessions there without any flag. Everything in `data/` is gitignored; this tool is not.
+That is all this directory is. **Replay, composition, video and figures are not here.**
 
-## Play a run back
+## Where they went
 
-**Run this where the screen is** — your laptop, not the mapping server. Rerun is a desktop
-app, and the default mode is the one Rerun itself recommends
-([operating modes](https://rerun.io/docs/reference/sdk/operating-modes)): `rr.spawn()`
-launches the native viewer — the `rerun` executable that ships inside `rerun-sdk`, so
-`uv run` already has it on `PATH` — and streams the session into it. No browser, no ports.
+They live in the report repo, `uofa-2026-report/realworld/`:
 
-```bash
-make replay                                       # folder picker, then the app opens
-make replay ARGS="--list"                         # what is in data/
-make replay ARGS="--newest"                       # skip the picker
-make replay ARGS="recordings/data/<session_id>"
-```
-
-With no argument you get a native folder picker (Tk) rooted at `data/`; with no GUI it
-falls back to a numbered prompt, and failing that the newest recording. The window
-outlives the command — the data lives in the viewer, not in the script — and if a viewer
-is already open on the port, the session simply appears in it.
-
-The recording is on the headless server instead? Two options, both better than a browser:
-
-```bash
-# on the server
-make replay ARGS="<session> --save /tmp/run.rrd"      # then copy it over…
-# on your laptop
-rerun /tmp/run.rrd                                    # …and scrub it locally
-```
-
-or point the server at a viewer you already have open (works across the tailnet, and
-`rerun` must be listening — start it, then):
-
-```bash
-make replay ARGS="<session> --connect rerun+http://<your-laptop>:9876/proxy"
-```
-
-`--serve` still exists (browser viewer, `--viewer-host` for the address the browser should
-use) but needs **two** ports reachable and scrubs poorly; prefer `--save`.
-
-The recorder console's **Replay** tab wraps the same two paths: *Open in Rerun* when the
-console is running on a machine with a screen, *Build .rrd* + download when it is not.
-
-> First run of the viewer prints Rerun's analytics notice; `rerun analytics disable` turns
-> it off for good.
-
-Everything lands on **one timeline** (`session`, the robot capture clock in nanoseconds),
-so the map, the trajectory, the panorama, the periscope and the ESDF all line up. Map
-artefacts are placed at `capture_ts_ns` — the true capture time of that map version — not
-at arrival, so the map sits where the robot actually was. See
-[`docs/recording.md`](../docs/recording.md#the-common-clock).
-
-| entity | what it is |
+| you want to | run |
 |---|---|
-| `world/map` | the point cloud (materialised keyframes, or `--map replay` to rebuild per submap from the recorded Draco pushes) |
-| `world/robot` | the fused pose, plus the path walked so far |
-| `world/correction` | cloud pose corrections — sparse, gated, each one re-anchors the robot |
-| `world/trajectory` | the camera trail the cloud streamed |
-| `world/esdf` | ESDF slices, coloured as published |
-| `panorama` | the 360° frame, logged as an encoded JPEG so Rerun does the decoding |
-| `periscope` | the operator's video slice, if PyAV can decode it |
-| `metrics/*` | map version, cube count, uplink kB/s, observed latency, camera height |
+| capture a session | `make record` / `make record-ui` (this repo) |
+| pull the full-res panoramas afterwards | `make backfill` (this repo) |
+| look at a capture in Rerun | `make replay` in `uofa-2026-report/realworld/` |
+| align the streams, export frames, build video | `make info` / `make export` there |
+| build a paper figure or a metric from a capture | that project, next to the report that quotes it |
 
-Useful knobs (all exposed under *Advanced* in the console's Replay tab too):
-`--map replay` to watch the map build incrementally, `--panorama fullres`
-after a backfill, `--skip periscope` when one stream is huge, `--pose-every N` (30 Hz is
-more than a viewer needs), `--max-points` to cap cloud size, and `--with <other-session>`
-to merge a paired robot + cloud capture.
+The split is deliberate: this repo is the *system* — robot, mapping server, transport,
+recorder — and it keeps moving. A finished capture is *evidence*, and evidence belongs with
+the document that cites it, together with the code that turns it into a figure. That
+project vendors frozen copies of the readers (`vat_protocol`, `vat_blockmap`, the periscope
+decoder) so a figure stays reproducible without this checkout at a matching commit; see
+`uofa-2026-report/realworld/vendor/README.md`.
 
-## A recording is self-describing
+The recording **format** is still documented here, in
+[`docs/recording.md`](../docs/recording.md) — including the clock contract, the on-disk
+layout and the map-timestamp derivation — because this is the code that writes it.
 
-`meta.json` (identity, capture metadata, config hash, clock epoch, Zenoh keys) and
-`MANIFEST.json` (per-stream health, derived cross-checks, version pins) sit next to the
-data, and `README.txt` inside each session explains its own layout. `tools/recorder/`
-holds the capture and composition tools.
+## Moving a capture to where it gets used
+
+A session directory is self-contained; copy or move it into
+`uofa-2026-report/realworld/data/`. From the recorder console (*Full-res & archive* tab)
+*Build zip* packages one for transfer — note the zip contains a top-level folder, so
+unzipping it into `data/` leaves the session one level deeper than expected. The tools
+there look through that extra level, but flattening it is tidier.

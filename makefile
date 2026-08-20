@@ -20,8 +20,7 @@ CLIENT_RUN ?= cd client && uv run python
 .PHONY: help steps \
         sync-mapping sync-client sync-router sync-robot sync-docs \
         router mapping theta-uvc theta-uvc-kill theta-stream robot-docker viewer record-frames \
-        record compose record-selftest rig backfill record-ui sync-recorder \
-        replay sync-replay \
+        record record-selftest rig backfill record-ui sync-recorder \
         test_link test_frames_robot test_frames_server test_robot_state test_poses \
         teleop fetch_frame fetch_pcd periscope-probe rgbd-probe rgbd-camera rgbd-relay \
         docs docs-serve clean
@@ -36,7 +35,6 @@ help:
 	@echo "  make sync-client     client + bring-up tools env"
 	@echo "  make sync-robot      [ROBOT] host-side tools env (theta_pub)"
 	@echo "  make sync-recorder   recorder console env (Gradio)"
-	@echo "  make sync-replay     replay env (Rerun)"
 	@echo "  make sync-docs       docs env (mkdocs + plugins)"
 	@echo ""
 	@echo "Documentation:"
@@ -58,22 +56,18 @@ help:
 	@echo "  make record          [ANY]    passively record a LIVE session (all streams,"
 	@echo "                                one common clock) to recordings/SESSION_ID/"
 	@echo "                                ARGS='--scene lab --trajectory-family loop --pass 1 --camera-height 1.152'"
-	@echo "  make compose         [ANY]    align/compose a recording (info | export | periscope | render)"
-	@echo "                                ARGS='export recordings/ID --fps 10'"
-	@echo "  make record-selftest [ANY]    offline check of the recorder + composer (no robot)"
+	@echo "  make backfill        [ANY]    fetch full-res panoramas into a FINISHED recording"
+	@echo "  make record-selftest [ANY]    offline check of the recorder (no robot, no Zenoh)"
 	@echo "  make rig             [ANY]    fake robot+cloud on the real Zenoh keys (test the live path)"
 	@echo "  make record-ui       [ANY]    browser console: start/stop, live progress,"
-	@echo "                                fetch full-res, zips, and replay handoff"
+	@echo "                                fetch full-res, browse and zip past recordings"
 	@echo "                                ARGS='--port 8080 --no-share'"
-	@echo "  make backfill        [ANY]    fetch full-res panoramas into a FINISHED recording"
-	@echo "  make replay          [CLIENT] play a recording back in the Rerun app --"
-	@echo "                                RUN IT WHERE THE SCREEN IS (folder picker)"
-	@echo "                                ARGS='--list'   what is in recordings/data"
-	@echo "                                ARGS='--newest' skip the picker"
-	@echo "                                ARGS='SESSION --save run.rrd'  headless box"
 	@echo "  make rgbd-probe      [CLIENT] headless D435i panel stream check (ARGS='--kind depth --decode')"
 	@echo "  make rgbd-camera     [ROBOT]  launch RealSense depth node (pinned to the Go2 NIC for the container)"
 	@echo "  make rgbd-relay      [ROBOT]  (fallback) run the RGBD relay on the host instead of the container"
+	@echo ""
+	@echo "Replay, composition, video and figures moved to uofa-2026-report/realworld/"
+	@echo "  (that repo owns a capture once it is recorded; see recordings/README.md)"
 	@echo ""
 	@echo "Staged pre-POC tests (run in this order -- see 'make steps'):"
 	@echo "  make test_link           0  transport alive (router + bridge + rates)"
@@ -131,10 +125,6 @@ sync-router:
 # env does not grow a web stack.
 sync-recorder:
 	cd tools/recorder && uv sync
-
-# Replay env (Rerun) — a pure reader, so it needs no Zenoh and no Gradio.
-sync-replay:
-	cd recordings && uv sync
 
 sync-docs:
 	uv sync --group docs
@@ -208,14 +198,8 @@ record: sync-client
 	@echo ">> MEASURE the camera height this session and pass --camera-height (metric anchor)."
 	$(CLIENT_RUN) ../tools/recorder/vat_record.py $(ARGS)
 
-# [ANY] Align / compose a recording. Subcommands: info | export | periscope | render.
-#   make compose ARGS="info recordings/<id>"
-#   make compose ARGS="export recordings/<id> --fps 10 --link hard"
-compose: sync-client
-	$(CLIENT_RUN) ../tools/recorder/compose.py $(ARGS)
-
-# [ANY] Offline end-to-end check of the recorder + composer: synthesises a session
-# through the real wire packers, records it, composes it. No robot / Zenoh / GPU.
+# [ANY] Offline end-to-end check of the recorder: synthesises a session
+# through the real wire packers and records it. No robot / Zenoh / GPU.
 record-selftest: sync-client
 	$(CLIENT_RUN) ../tools/recorder/vat_record.py --selftest
 	@echo ">> console smoke test (builds, launches, serves) ..."
@@ -245,18 +229,6 @@ backfill: sync-client
 record-ui: sync-recorder
 	@echo ">> Recorder console on :7860 (share URL printed): start/stop, live progress, fetch full-res, zips."
 	cd tools/recorder && uv run python ui.py $(ARGS)
-
-# [CLIENT] Play a recorded session back in the Rerun app: the map growing, the trajectory
-# walked, the panorama, the periscope and the ESDF, all on the ONE session timeline. Reads
-# only what the recorder wrote -- no robot, no Zenoh, no mapping server. RUN THIS WHERE THE
-# SCREEN IS (your laptop): the default mode launches the native Rerun viewer. On a headless
-# box use --save and open the .rrd locally. See recordings/README.md.
-#   make replay                                              # folder picker, then Rerun opens
-#   make replay ARGS="--list"                                # what is in recordings/data/
-#   make replay ARGS="recordings/data/<id>"
-#   make replay ARGS="recordings/data/<id> --save run.rrd"   # headless: then `rerun run.rrd`
-replay: sync-replay
-	cd recordings && uv run python replay.py $(ARGS)
 
 # ── Staged pre-POC tests ─────────────────────────────────────────────────────
 # All run in the client's own env; tools live in ../tools relative to client/.

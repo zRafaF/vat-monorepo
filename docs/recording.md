@@ -11,14 +11,19 @@ than deciding the layout in advance and re-running the capture when we change ou
 make record ARGS="--scene lab --trajectory-family loop --pass 1 \
                   --camera-height 1.152 --operator rafael"
 # … drive the robot … Ctrl-C to stop cleanly
-
-make compose ARGS="info   recordings/20260808-201500_lab_loop_p1"
-make compose ARGS="export recordings/20260808-201500_lab_loop_p1 --fps 10"
+make backfill ARGS="recordings/data/<id>"      # pull the full-res twins afterwards
 ```
 
-Everything lands in `recordings/<session_id>/`. The tool lives in
+Everything lands in `recordings/data/<session_id>/`. The tool lives in
 [`tools/recorder/`](https://github.com/zrafaf/vat-monorepo/tree/main/tools/recorder) and
 its `README.md` there is the code-level reference.
+
+!!! info "This repo captures; the report repo composes"
+    Replay, composition, video and figures moved to `uofa-2026-report/realworld/`, next to
+    the document that cites them — it vendors frozen copies of the readers so a figure
+    stays reproducible without this checkout. What stays here is the capture path
+    (`vat-record`, `backfill`, the console) and **this page**, which is the format
+    reference, because this is the code that writes the format.
 
 ---
 
@@ -358,15 +363,22 @@ reproduces the materialised keyframe exactly.
 
 ---
 
-## Composing
+## Composing (in the report repo)
+
+The composer moved to `uofa-2026-report/realworld/` — `compose.py` there reads a session
+directory and puts every stream on one timeline:
 
 ```bash
-python tools/recorder/compose.py info    recordings/<id>
-python tools/recorder/compose.py export  recordings/<id> --fps 10 --link hard
-python tools/recorder/compose.py export  recordings/<id> --at panorama --map replay
-python tools/recorder/compose.py periscope recordings/<id> --decode
-python tools/recorder/compose.py render  recordings/<id> --out demo.mp4    # Open3D
+cd ../uofa-2026-report/realworld
+make info   ARGS=<session>                              # what is in it, how healthy
+make export ARGS="<session> --fps 10 --link hard"       # ffmpeg-ready frames/
+make export ARGS="<session> --at panorama --map replay"
+make periscope ARGS="<session> --decode"
+make replay ARGS=<session>                              # the native Rerun viewer
 ```
+
+What it produces from the recording is still worth understanding from this side, because
+it is what the on-disk format is *for*:
 
 `export` is the one to reach for. It builds a timeline — uniform at `--fps`, or one tick
 per panorama frame with `--at panorama` — and resolves every stream at every tick:
@@ -464,15 +476,10 @@ Stop sends **SIGINT** to the recorder, i.e. exactly the clean-flush path Ctrl-C 
 UI has no privileged shortcut the CLI lacks. Everything it does is a subprocess of the
 same scripts.
 
-A **Replay** tab lists every recording under the output root — labelled with duration,
-size, status and whether full-res has been fetched — so playback needs no paths either. It
-offers the two things that actually work, depending on where the console is running:
-**▶ Open in Rerun** launches the native Rerun app on that machine, and **📦 Build .rrd**
-writes a file you download and open on your laptop. The banner at the top of the tab says
-which one this machine can do. Map mode, panorama source, stream skipping, the point cap
-and the viewer memory limit are under *Advanced*. Both spawn `recordings/replay.py` in the
-`recordings/` uv project — exactly what `make replay` runs — because Rerun lives there,
-not in the console's env. You can replay an old session while a capture is running.
+The console does **not** replay: that lives in `uofa-2026-report/realworld/` with the
+rest of the composition tooling. What it does do is package a capture for the trip —
+*Build zip* in the *Full-res & archive* tab — so a session recorded on the server can be
+downloaded and dropped into that project's `data/`.
 
 ## Where to run what
 
@@ -498,12 +505,12 @@ short, the tailnet carries them fine, and the session is already on the machine 
 screen. Keep the server for long or full-res-heavy captures, where the disk and the wired
 link matter and the extra download is worth it.
 
-**Replay, though, belongs on the laptop.** Rerun is a desktop app; the browser viewer needs
-two ports open, drops frames while scrubbing, and was the cause of the "the page loads but
-nothing appears" confusion (its gRPC address is resolved by the *browser*, so `localhost`
-pointed at the wrong machine). The supported paths are the native viewer via
-[`rr.spawn`](https://rerun.io/docs/reference/sdk/operating-modes) — Rerun's own
-recommendation, and the default — or an `.rrd` file you open locally.
+**Looking at a capture belongs on the laptop**, and no longer lives in this repo at all:
+`uofa-2026-report/realworld/` opens a session in the native Rerun app via
+[`rr.spawn`](https://rerun.io/docs/reference/sdk/operating-modes) (Rerun is a desktop app,
+so it needs a screen). A capture made on the server therefore has one extra step — zip it
+from the console, or `scp` it — which is the main practical argument for recording on the
+laptop when the run is short.
 
 !!! warning "One button publishes"
     **Reset PRISM map** puts an empty payload on `{server}/cmd/reset` — the same thing the
@@ -532,14 +539,16 @@ make record-selftest
 
 Synthesises a ten-second session through the real wire packers, driving a virtual clock
 with per-stream transport latencies so the derived-timestamp path is genuinely exercised;
-writes a real recording; then composes it and asserts the cross-checks — including that
-replaying the raw Draco pushes reproduces the materialised keyframe exactly. No robot, no
+writes a real recording, and asserts the cross-checks. If a copy of the composer happens
+to be importable it also composes the result — including checking that replaying the raw
+Draco pushes reproduces the materialised keyframe exactly — but the composer now lives in
+the report repo, so by default that half is skipped and says so. No robot, no
 Zenoh, no GPU.
 
 ```bash
-# keep the synthetic recording and poke at it with compose.py
+# keep the synthetic recording, then read it from uofa-2026-report/realworld/
 python tools/recorder/vat_record.py --selftest --selftest-keep /tmp/vatrec
-python tools/recorder/compose.py info /tmp/vatrec/e2e
+cd ../uofa-2026-report/realworld && make info ARGS=/tmp/vatrec/e2e
 ```
 
 The second level exercises the **live** path — real Zenoh subscriptions, the archive
@@ -550,13 +559,14 @@ robot + cloud that publishes the real wire messages on the real keys:
 # [SERVER] make router
 make rig ARGS="--drop-pushes 0.35"          # sheds 35 % of pushes to exercise repair
 make record ARGS="--duration 30s --scene rig --camera-height 1.15"
-make compose ARGS="info recordings/<id>"
+# then, in uofa-2026-report/realworld:  make info ARGS=<session>
 ```
 
 This is the right thing to run after touching the recorder and before taking the robot out.
 It is also how the live path was validated in the first place: the rig run proved the
 archive pull, the repair pull healing a lossy link, a decodable `periscope.mp4`, the
-two-recorder pattern, and a 4K video out of `compose export` — and it found five bugs the
+two-recorder pattern, and a 4K video out of `compose export` (which then lived here) — and
+it found five bugs the
 offline test could not see.
 
 !!! note "Peer mode binds nothing"
@@ -590,7 +600,7 @@ offline test could not see.
   `periscope_timestamps.csv` is authoritative.
 * **`--fullres-ring` evicts blobs but keeps their index rows** — the row is still a true
   record of what the robot captured and what it cost, so it stays; `MANIFEST.json` reports
-  `evicted_by_ring` and `compose.py` ignores rows whose blob is gone.
+  `evicted_by_ring` and the composer ignores rows whose blob is gone.
 * **DracoPy is required** for the map mirror, repair and keyframes. Without it every byte
   is still recorded but understanding it is deferred to offline replay; the recorder says
   so loudly at startup. It is already a `client/` dependency.

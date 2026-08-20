@@ -237,62 +237,6 @@ def session_provenance() -> dict:
     }
 
 
-def viewer_host(router: str = "") -> str:
-    """An address a browser **on another machine** can reach this box on.
-
-    Needed because the tools here are run on a headless server but looked at from a
-    laptop: a URL containing ``localhost`` resolves on whichever machine the browser
-    is running on, not on the server, so a page loads and then silently shows nothing.
-    The router endpoint from ``vat.env`` is the one address every machine in the
-    deployment already agrees on (a Tailscale IP in our setup), which makes it a far
-    better default than ``localhost``. Falls back to the resolved hostname.
-    """
-    hostish = (router or ZENOH_ROUTER).split("/")[-1].split(":")[0]
-    if hostish and hostish not in ("127.0.0.1", "0.0.0.0", "localhost", "::1"):
-        return hostish
-    import socket
-    try:
-        return socket.gethostbyname(socket.gethostname())
-    except Exception:
-        return "localhost"
-
-
-REPLAY_DIR = os.path.join(REPO_ROOT, "recordings")
-
-
-def viewer_executable(name: str = "rerun") -> str:
-    """Path to the native Rerun Viewer, or ``''`` if it cannot be found.
-
-    Looks on ``PATH`` first, then inside the ``recordings/`` uv project — ``rerun-sdk``
-    installs the viewer binary there, and that directory is *not* on ``PATH`` when the
-    recorder console (a different uv project) is the one asking.
-    """
-    if os.sep in name or (os.altsep and os.altsep in name):
-        return name if os.path.exists(name) else ""
-    import shutil
-    found = shutil.which(name)
-    if found:
-        return found
-    for sub in ("bin", "Scripts"):
-        for ext in ("", ".exe"):
-            cand = os.path.join(REPLAY_DIR, ".venv", sub, name + ext)
-            if os.path.exists(cand):
-                return cand
-    return ""
-
-
-def has_display() -> bool:
-    """Can a GUI window appear on *this* machine?
-
-    Windows and macOS always can. On Linux it needs X or Wayland, which a headless
-    mapping server has not got — the case where "open the viewer" cannot work and the
-    answer is an ``.rrd`` file instead.
-    """
-    if sys.platform in ("win32", "darwin"):
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-
 def zenoh_summary(keys_subscribed, keys_queried) -> dict:
     """The transport block of ``meta.json``: what we listened to, verbatim."""
     return {
@@ -324,16 +268,6 @@ def _selftest() -> None:
     assert KEYS["camera_frame"] == f"{ROBOT_NAME}/prism/camera/frame"
     assert KEYS["pcd_push"] == f"{SERVER_PREFIX}/pcd/push"
     assert _canonical_hash({"a": 1, "b": 2}) == _canonical_hash({"b": 2, "a": 1})
-    # The router host is what a browser on another machine can reach — 'localhost' is
-    # exactly the value this helper exists to avoid handing out.
-    assert viewer_host("tcp/100.76.214.80:7447") == "100.76.214.80"
-    assert viewer_host("tcp/vat-server:7447") == "vat-server"
-    lo = viewer_host("tcp/127.0.0.1:7447")     # loopback router → hostname fallback
-    assert lo and ":" not in lo and "/" not in lo, lo
-    assert viewer_host()
-    assert viewer_executable("definitely-not-a-real-binary") == ""
-    assert viewer_executable("/nonexistent/rerun") == ""
-    assert isinstance(has_display(), bool)
     p = session_provenance()
     assert "mapping_config_hash" in p and "git" in p
     print(f"rec_config self-test OK  (robot={ROBOT_NAME} server={SERVER_PREFIX} "

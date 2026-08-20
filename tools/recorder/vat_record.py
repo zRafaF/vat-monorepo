@@ -154,8 +154,8 @@ FILES
                                  measured uplink (robot_kbps / robot_fps)
 
 NEXT STEP
-  python tools/recorder/compose.py info   {session_id_path}
-  python tools/recorder/compose.py export {session_id_path} --fps 10
+  cd ../uofa-2026-report/realworld && make info ARGS={session_id_path}
+  (replay, composition and figures live there; this repo only captures)
 """
 
 
@@ -203,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run the offline self-tests (no robot / Zenoh / GPU) and exit")
     g.add_argument("--selftest-keep", default=None, metavar="DIR",
                    help="with --selftest: build the synthetic session in DIR and keep "
-                        "it, so you can try compose.py against a known-good recording")
+                        "it, so the report repo's reader has a known-good recording to try")
 
     s = p.add_argument_group(
         "streams", "each independently toggleable; --no-X forces one off")
@@ -1023,8 +1023,9 @@ def _print_report(recs, budgets, sw, rcfg) -> None:
           f"   full-res {rcfg.human_size(budgets['fullres'].bytes_written)}"
           f"   {budgets['session'].elapsed_s:.1f}s")
     print(f"  {sw.root}")
-    print(f"\n  next:  python tools/recorder/compose.py info   {sw.root}")
-    print(f"         python tools/recorder/compose.py export {sw.root} --fps 10")
+    print(f"\n  next:  move/copy {sw.root} into uofa-2026-report/realworld/data/")
+    print("         and run `make info ARGS=<session>` there (replay + composition "
+          "live in that repo)")
     print("─" * 78 + "\n")
 
 
@@ -1034,13 +1035,13 @@ def _print_report(recs, budgets, sw, rcfg) -> None:
 
 
 def _selftest(keep_dir: Optional[str] = None) -> int:
-    """Offline end-to-end check: synthesise a session, then compose it.
+    """Offline end-to-end check: synthesise a session and read it back.
 
     Exercises the real wire packers, the real writers and the real composer — no
     robot, no Zenoh, no GPU. This is the test to run after touching anything here.
 
     ``keep_dir`` writes the synthetic session there and leaves it in place, which is
-    the quickest way to try ``compose.py`` against a known-good recording.
+    the quickest way to give the report repo's reader a known-good recording.
     """
     import json
     import shutil
@@ -1063,7 +1064,14 @@ def _selftest(keep_dir: Optional[str] = None) -> int:
 
     import vat_blockmap as bm
     import vat_protocol as proto
-    import compose
+    try:
+        # The composer moved to the report repo (uofa-2026-report/realworld/), which is
+        # where recordings are turned into figures and video. The capture half of this
+        # self-test is what belongs here; the composition half runs only if a copy of
+        # compose.py happens to be importable.
+        import compose
+    except ImportError:
+        compose = None
 
     class _S:
         def __init__(self, payload):
@@ -1270,86 +1278,93 @@ def _selftest(keep_dir: Optional[str] = None) -> int:
             assert s.get("errors", 0) == 0, (name, s.get("last_error"))
         sw.close()
 
-        # ── the composer must read it back and align everything ──
-        rep = compose.load(sw.root)
-        # the pin table backfills the capture time the index row could not know yet
-        pushes = [r for r in rep.pointcloud if r["kind"] == "push"]
-        assert pushes[0]["capture_ts_ns"] == T0, pushes[0]
-        assert pushes[0]["capture_ts_src"] == "pose_correction"
-        assert all(r.get("capture_ts_ns") for r in rep.pointcloud
-                   if r.get("map_version") is not None)
-        info = compose.info(rep)
-        assert info["streams"]["panorama_transmit"]["rows"] == 25
-        assert info["streams"]["pointcloud"]["keyframes"] == 11
-        assert info["streams"]["poses_robot_fused"]["rows"] == 300
+        if compose is None:
+            print("\n[selftest] composition checks SKIPPED: compose.py is not "
+                  "importable here.\n            It lives in "
+                  "uofa-2026-report/realworld/ now -- run this with --keep-dir and "
+                  "point\n            that project's `make info` / `make export` at "
+                  "the session it leaves behind.")
+        else:
+            # ── the composer must read it back and align everything ──
+            rep = compose.load(sw.root)
+            # the pin table backfills the capture time the index row could not know yet
+            pushes = [r for r in rep.pointcloud if r["kind"] == "push"]
+            assert pushes[0]["capture_ts_ns"] == T0, pushes[0]
+            assert pushes[0]["capture_ts_src"] == "pose_correction"
+            assert all(r.get("capture_ts_ns") for r in rep.pointcloud
+                       if r.get("map_version") is not None)
+            info = compose.info(rep)
+            assert info["streams"]["panorama_transmit"]["rows"] == 25
+            assert info["streams"]["pointcloud"]["keyframes"] == 11
+            assert info["streams"]["poses_robot_fused"]["rows"] == 300
 
-        out = os.path.join(tmp, "aligned")
-        tl = compose.export(rep, out, fps=5.0, map_mode="keyframe", link=False)
-        assert len(tl) >= 40, len(tl)                   # ~8.4 s at 5 Hz
-        for row in tl:
-            assert row["panorama_transmit_file"], row
-            assert row["pose_position_x"] is not None
-            assert row["map_keyframe_file"], row
-            assert row["periscope_byte_offset"] is not None
-            # every asset must be within a plausible distance of its tick
-            assert abs(row["panorama_transmit_dt_ms"]) <= 250.0
-            assert abs(row["pose_dt_ms"]) <= 40.0
-        # interpolated pose is monotonic in x (the synthetic robot walks forward)
-        xs = [r["pose_position_x"] for r in tl]
-        assert all(b >= a - 1e-6 for a, b in zip(xs, xs[1:])), "pose not monotonic"
-        assert os.path.exists(os.path.join(out, "timeline.csv"))
-        assert os.path.exists(os.path.join(out, "timeline.jsonl"))
-        assert os.path.exists(os.path.join(out, "README.md"))
+            out = os.path.join(tmp, "aligned")
+            tl = compose.export(rep, out, fps=5.0, map_mode="keyframe", link=False)
+            assert len(tl) >= 40, len(tl)                   # ~8.4 s at 5 Hz
+            for row in tl:
+                assert row["panorama_transmit_file"], row
+                assert row["pose_position_x"] is not None
+                assert row["map_keyframe_file"], row
+                assert row["periscope_byte_offset"] is not None
+                # every asset must be within a plausible distance of its tick
+                assert abs(row["panorama_transmit_dt_ms"]) <= 250.0
+                assert abs(row["pose_dt_ms"]) <= 40.0
+            # interpolated pose is monotonic in x (the synthetic robot walks forward)
+            xs = [r["pose_position_x"] for r in tl]
+            assert all(b >= a - 1e-6 for a, b in zip(xs, xs[1:])), "pose not monotonic"
+            assert os.path.exists(os.path.join(out, "timeline.csv"))
+            assert os.path.exists(os.path.join(out, "timeline.jsonl"))
+            assert os.path.exists(os.path.join(out, "README.md"))
 
-        # replaying raw pushes must reproduce the final keyframe exactly
-        xyz_replay, rgb_replay, mv = compose.replay_map(rep, until_ts_ns=None)
-        with np.load(os.path.join(sw.root, tl[-1]["map_keyframe_file"])) as z:
-            kf_pts = z["points"]
-        assert xyz_replay.shape == kf_pts.shape, (xyz_replay.shape, kf_pts.shape)
-        assert mv == 109, mv
-        a_sorted = np.sort(xyz_replay.view([("x", "f4"), ("y", "f4"), ("z", "f4")]),
-                           axis=0)
-        b_sorted = np.sort(kf_pts.view([("x", "f4"), ("y", "f4"), ("z", "f4")]), axis=0)
-        assert np.array_equal(a_sorted, b_sorted), "replay != materialised keyframe"
+            # replaying raw pushes must reproduce the final keyframe exactly
+            xyz_replay, rgb_replay, mv = compose.replay_map(rep, until_ts_ns=None)
+            with np.load(os.path.join(sw.root, tl[-1]["map_keyframe_file"])) as z:
+                kf_pts = z["points"]
+            assert xyz_replay.shape == kf_pts.shape, (xyz_replay.shape, kf_pts.shape)
+            assert mv == 109, mv
+            a_sorted = np.sort(xyz_replay.view([("x", "f4"), ("y", "f4"), ("z", "f4")]),
+                               axis=0)
+            b_sorted = np.sort(kf_pts.view([("x", "f4"), ("y", "f4"), ("z", "f4")]), axis=0)
+            assert np.array_equal(a_sorted, b_sorted), "replay != materialised keyframe"
 
-        # ── the effective map time must be the per-submap CAPTURE time, not one
-        #    arrival time smeared across the first second by the monotonic clamp ──
-        push_t = [r["_t"] for r in rep.pointcloud if r["kind"] == "push"]
-        assert len(set(push_t)) == 10, push_t
-        assert push_t == sorted(push_t)
-        assert push_t[0] == T0 and push_t[-1] == T0 + 9_000_000_000
-        assert all(r["_t_src"] == "capture" for r in rep.pointcloud
-                   if r.get("capture_ts_ns"))
-        # …so distinct map versions are actually addressable through the timeline
-        assert len({r["map_version"] for r in tl if r["map_version"]}) >= 9
+            # ── the effective map time must be the per-submap CAPTURE time, not one
+            #    arrival time smeared across the first second by the monotonic clamp ──
+            push_t = [r["_t"] for r in rep.pointcloud if r["kind"] == "push"]
+            assert len(set(push_t)) == 10, push_t
+            assert push_t == sorted(push_t)
+            assert push_t[0] == T0 and push_t[-1] == T0 + 9_000_000_000
+            assert all(r["_t_src"] == "capture" for r in rep.pointcloud
+                       if r.get("capture_ts_ns"))
+            # …so distinct map versions are actually addressable through the timeline
+            assert len({r["map_version"] for r in tl if r["map_version"]}) >= 9
 
-        # periscope extraction slices real frames back out of the elementary stream
-        pdir = os.path.join(tmp, "peri")
-        n = compose.periscope_extract(rep, pdir, limit=5)
-        assert n == 5 and len(os.listdir(pdir)) == 5
+            # periscope extraction slices real frames back out of the elementary stream
+            pdir = os.path.join(tmp, "peri")
+            n = compose.periscope_extract(rep, pdir, limit=5)
+            assert n == 5 and len(os.listdir(pdir)) == 5
 
-        # ── a hard kill can tear the last CSV row: it must be dropped, not crash ──
-        pcsv = sw.path("periscope_timestamps.csv")
-        text = open(pcsv).read().splitlines()
-        with open(pcsv, "w") as f:                       # truncate the final row
-            f.write("\n".join(text[:-1]) + "\n" + text[-1][:len(text[-1]) // 2])
-        torn = compose.load(sw.root)
-        assert len(torn.periscope) == len(rep.periscope) - 1
-        assert compose.periscope_extract(torn, os.path.join(tmp, "peri2"),
-                                         limit=0) == len(torn.periscope)
+            # ── a hard kill can tear the last CSV row: it must be dropped, not crash ──
+            pcsv = sw.path("periscope_timestamps.csv")
+            text = open(pcsv).read().splitlines()
+            with open(pcsv, "w") as f:                       # truncate the final row
+                f.write("\n".join(text[:-1]) + "\n" + text[-1][:len(text[-1]) // 2])
+            torn = compose.load(sw.root)
+            assert len(torn.periscope) == len(rep.periscope) - 1
+            assert compose.periscope_extract(torn, os.path.join(tmp, "peri2"),
+                                             limit=0) == len(torn.periscope)
 
-        # ── a blob the ring evicted (or any missing file) must be ignored on load,
-        #    and frames/ must stay gap-free so the documented ffmpeg call works ──
-        victim = rep.panorama_transmit[3]["file"]
-        os.remove(sw.path(*victim.split("/")))
-        pruned = compose.load(sw.root)
-        assert pruned.missing_blobs.get("panorama_transmit") == 1
-        assert len(pruned.panorama_transmit) == 24
-        out2 = os.path.join(tmp, "aligned2")
-        tl2 = compose.export(pruned, out2, fps=5.0, map_mode="none", link="copy")
-        linked = sorted(os.listdir(os.path.join(out2, "frames")))
-        assert linked == [f"{i:06d}.jpg" for i in range(len(linked))], "gap in frames/"
-        assert all(r["linked_frame"] for r in tl2), "a tick has no frame"
+            # ── a blob the ring evicted (or any missing file) must be ignored on load,
+            #    and frames/ must stay gap-free so the documented ffmpeg call works ──
+            victim = rep.panorama_transmit[3]["file"]
+            os.remove(sw.path(*victim.split("/")))
+            pruned = compose.load(sw.root)
+            assert pruned.missing_blobs.get("panorama_transmit") == 1
+            assert len(pruned.panorama_transmit) == 24
+            out2 = os.path.join(tmp, "aligned2")
+            tl2 = compose.export(pruned, out2, fps=5.0, map_mode="none", link="copy")
+            linked = sorted(os.listdir(os.path.join(out2, "frames")))
+            assert linked == [f"{i:06d}.jpg" for i in range(len(linked))], "gap in frames/"
+            assert all(r["linked_frame"] for r in tl2), "a tick has no frame"
 
         # ── --where robot must not default to the cloud's bulk streams ──
         class _Args:
@@ -1368,12 +1383,14 @@ def _selftest(keep_dir: Optional[str] = None) -> int:
         ra.where = "cloud"
         assert resolve_streams(ra) == set(DEFAULT_STREAMS)
 
-        print("\nvat_record self-test OK — synthetic session recorded, cross-checked "
-              "and composed end-to-end")
+        print("\nvat_record self-test OK — synthetic session recorded and "
+              "cross-checked"
+              + (" (and composed)" if compose is not None else ""))
         if keep_dir:
             print(f"\nsynthetic session kept at {sw.root}\n"
-                  f"  python tools/recorder/compose.py info   {sw.root}\n"
-                  f"  python tools/recorder/compose.py export {sw.root} --fps 10")
+                  f"  the reader lives in uofa-2026-report/realworld/:\n"
+                  f"    make info   ARGS={sw.root}\n"
+                  f"    make export ARGS='{sw.root} --fps 10'")
         return 0
     finally:
         if not keep_dir:

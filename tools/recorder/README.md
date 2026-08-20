@@ -4,6 +4,10 @@ Records the live VAT streams **without perturbing the session**, each stream
 independently, every sample timestamped on one common clock — so a real-world example
 video can be composed afterwards however the story needs.
 
+Composition is **not** here: `compose.py`, the Rerun replay and the figure scripts live in
+`uofa-2026-report/realworld/`, next to the report that cites them. This directory is the
+capture side — the recorder, the full-res backfill and the console.
+
 Built for the real-capture spec in `uofa-2026-report/PUBLICATION_ROADMAP.md` §3.2.
 
 The narrative version of this page, with the operator runbook, lives in the docs:
@@ -15,10 +19,13 @@ code.
 make record ARGS="--scene lab --trajectory-family loop --pass 1 \
                   --camera-height 1.152 --operator rafael"
 
-make compose ARGS="info   recordings/<session_id>"
-make compose ARGS="export recordings/<session_id> --fps 10"
+make backfill ARGS="recordings/data/<session_id>"   # full-res twins, after the walk
+make record-ui                                     # the browser console
 
 make record-selftest        # offline: no robot, no Zenoh, no GPU
+
+# then, in uofa-2026-report/realworld/ :
+#   make info ARGS=<session>     make export ARGS=<session>     make replay ARGS=<session>
 ```
 
 ---
@@ -69,7 +76,7 @@ manifest/bundle not even that. Those records get:
   `pose_correction` (exact) or the server `status` stream (approximate).
 
 **Align maps on `capture_ts_ns`; use `src_ts_ns` when you want observed latency.**
-`MANIFEST.json` carries the complete `version_pins` table, and `compose.py` backfills
+`MANIFEST.json` carries the complete `version_pins` table, and the composer backfills
 it into rows written before their pin existed (a submap's push is published before its
 correction arrives).
 
@@ -80,7 +87,6 @@ correction arrives).
 | file | what it owns |
 |---|---|
 | `vat_record.py` | the `vat-record` CLI: flags, session lifecycle, `meta.json`, safe Ctrl-C flush, `MANIFEST.json`, `--dry-run`, `--selftest` |
-| `compose.py` | the companion: `info` / `export` / `periscope` / `render` |
 | `rec_config.py` | env + Zenoh keys (from `vat_protocol.keys`, never hard-coded) + the config hash / git / `vat.env` provenance |
 | `rec_clock.py` | `SessionClock`: stamping, the robot↔local offset, the `map_version`→capture-time index |
 | `rec_sinks.py` | `SessionWriter`, atomic blobs, CSV/JSONL/TUM indexes, `Budget` / `RingBudget`, `StreamStats` |
@@ -106,8 +112,11 @@ python tools/recorder/vat_record.py --selftest     # all of them + end-to-end
 The end-to-end self-test synthesises a 10-second session through the **real** wire
 packers, drives a **virtual clock** with per-stream transport latencies (so the
 derived-timestamp path is genuinely exercised rather than collapsed into a few
-milliseconds of real time), writes a real recording, and then composes it — asserting
-that replaying the raw Draco pushes reproduces the materialised keyframe exactly.
+milliseconds of real time) and writes a real recording. If a copy of the composer is
+importable it also composes the result, asserting that replaying the raw Draco pushes
+reproduces the materialised keyframe exactly; since the composer moved to the report repo
+that half is skipped by default and says so. Use `--keep-dir` and point that project at
+the session it leaves behind.
 
 ---
 
@@ -198,27 +207,26 @@ for rec in map(json.loads, open("recordings/<id>/pointcloud/index.jsonl")):
 xyz, rgb = store.merged()
 ```
 
-`compose.py replay_map()` does exactly that, plus the manifest-removal and snapshot
+the composer's `replay_map()` does exactly that, plus the manifest-removal and snapshot
 cases.
 
 ---
 
-## Composition
+## Composition (in the report repo)
 
 ```bash
-# what's in it, and how healthy
-python tools/recorder/compose.py info recordings/<id>
-
-# aligned per-frame assets on one timeline — the path into any editor
-python tools/recorder/compose.py export recordings/<id> --fps 10 --link hard
-python tools/recorder/compose.py export recordings/<id> --at panorama --map replay
-
-# slice encoded periscope frames back out (optionally decode to PNG)
-python tools/recorder/compose.py periscope recordings/<id> --decode
-
-# optional: render cloud + trail + panels (needs Open3D)
-python tools/recorder/compose.py render recordings/<id> --out demo.mp4 --fps 10
+cd ../uofa-2026-report/realworld
+make info      ARGS=<session>                          # what's in it, and how healthy
+make export    ARGS="<session> --fps 10 --link hard"   # aligned per-tick assets
+make export    ARGS="<session> --at panorama --map replay"
+make periscope ARGS="<session> --decode"
+make replay    ARGS=<session>                          # the native Rerun viewer
 ```
+
+That project vendors frozen copies of `vat_protocol`, `vat_blockmap` and the periscope
+decoder, so it reads these recordings without this checkout — see its
+`vendor/README.md`. What follows is still written from the recorder's side, because it is
+what the on-disk format guarantees.
 
 ### Full-res after the fact (preferred)
 
@@ -228,7 +236,7 @@ make backfill ARGS="recordings/<id> --every 2"     # resumable; skips what it ha
 ```
 
 Pulls the robot's archived twins for the frames the recording already has, writing them
-into `panorama_fullres/` with `ts_src=source` (the original capture time) so `compose.py`
+into `panorama_fullres/` with `ts_src=source` (the original capture time) so the composer
 cannot tell them from live-recorded frames. Zero realtime cost, and you pick the size
 afterwards. `panorama_fullres/backfill.json` logs each run, including seqs the robot had
 already evicted from its rolling window.
@@ -239,9 +247,9 @@ already evicted from its rolling window.
 at compose time — they share the session clock, so this is a per-stream union:
 
 ```bash
-python tools/recorder/compose.py info   recordings/<cloud-id> --with recordings/<robot-id>
-python tools/recorder/compose.py export recordings/<cloud-id> --with recordings/<robot-id> \
-    --fps 10 --panorama fullres --link hard
+# in uofa-2026-report/realworld/
+make info   ARGS="<cloud-id> --with <robot-id>"
+make export ARGS="<cloud-id> --with <robot-id> --fps 10 --panorama fullres --link hard"
 ```
 
 Streams recorded on **both** sides (the transmit panorama, the fused pose) are
